@@ -83,6 +83,7 @@ type upstreamRoute struct {
 	baseURL            *url.URL
 	targetPath         string
 	responsesWebsocket bool
+	allowUpstreamAuth  bool
 }
 
 func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
@@ -146,13 +147,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/":
 		writeJSON(w, http.StatusOK, map[string]any{"message": "codex-oauth-proxy"})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
-		if !s.authorized(r) {
+		if !s.authorized(r, false) {
 			writeError(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
 		s.handleModels(w, r)
 	case routeOK:
-		if !s.authorized(r) {
+		if !s.authorized(r, route.allowUpstreamAuth) {
 			writeError(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
@@ -162,7 +163,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) authorized(r *http.Request) bool {
+func (s *Server) authorized(r *http.Request, allowUpstreamAuth bool) bool {
 	if s == nil || s.cfg == nil || len(s.cfg.APIKeys) == 0 {
 		return true
 	}
@@ -174,6 +175,34 @@ func (s *Server) authorized(r *http.Request) bool {
 		}
 		for _, token := range tokens {
 			if subtle.ConstantTimeCompare([]byte(token), []byte(key)) == 1 {
+				return true
+			}
+		}
+	}
+	if allowUpstreamAuth && s.matchesCurrentCodexAccessToken(r.Context(), tokens) {
+		return true
+	}
+	return false
+}
+
+func (s *Server) matchesCurrentCodexAccessToken(ctx context.Context, tokens []string) bool {
+	if s == nil || s.auths == nil || s.auths.Store == nil || len(tokens) == 0 {
+		return false
+	}
+	auths, err := s.auths.Store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		accessToken := strings.TrimSpace(auth.AccessToken)
+		if accessToken == "" {
+			continue
+		}
+		for _, token := range tokens {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(accessToken)) == 1 {
 				return true
 			}
 		}
@@ -252,8 +281,23 @@ func (s *Server) proxyRoute(path string) (upstreamRoute, bool) {
 	}
 	if suffix, ok := chatGPTFileEndpointSuffix(path); ok {
 		return upstreamRoute{
-			baseURL:    s.chatGPTBaseURL,
-			targetPath: targetPath(s.chatGPTBaseURL, "/backend-api", suffix),
+			baseURL:           s.chatGPTBaseURL,
+			targetPath:        targetPath(s.chatGPTBaseURL, "/backend-api", suffix),
+			allowUpstreamAuth: true,
+		}, true
+	}
+	if suffix, ok := chatGPTWhamEndpointSuffix(path); ok {
+		return upstreamRoute{
+			baseURL:           s.chatGPTBaseURL,
+			targetPath:        targetPath(s.chatGPTBaseURL, "/backend-api", suffix),
+			allowUpstreamAuth: true,
+		}, true
+	}
+	if suffix, ok := chatGPTHostedMCPEndpointSuffix(path); ok {
+		return upstreamRoute{
+			baseURL:           s.chatGPTBaseURL,
+			targetPath:        targetPath(s.chatGPTBaseURL, "/backend-api", suffix),
+			allowUpstreamAuth: true,
 		}, true
 	}
 	return upstreamRoute{}, false
@@ -322,6 +366,44 @@ func isChatGPTFileEndpointSuffix(suffix string) bool {
 	}
 	fileID := strings.TrimSuffix(strings.TrimPrefix(suffix, prefix), uploadSuffix)
 	return fileID != "" && !strings.Contains(fileID, "/")
+}
+
+func chatGPTWhamEndpointSuffix(path string) (string, bool) {
+	suffix, ok := stripPathPrefix(path, "/backend-api")
+	if !ok || !isChatGPTWhamEndpointSuffix(suffix) {
+		return "", false
+	}
+	return suffix, true
+}
+
+func isChatGPTWhamEndpointSuffix(suffix string) bool {
+	switch suffix {
+	case "/wham/usage",
+		"/wham/profiles/me",
+		"/wham/accounts/check",
+		"/wham/accounts/send_add_credits_nudge_email":
+		return true
+	default:
+		return false
+	}
+}
+
+func chatGPTHostedMCPEndpointSuffix(path string) (string, bool) {
+	suffix, ok := stripPathPrefix(path, "/backend-api")
+	if !ok || !isChatGPTHostedMCPEndpointSuffix(suffix) {
+		return "", false
+	}
+	return suffix, true
+}
+
+func isChatGPTHostedMCPEndpointSuffix(suffix string) bool {
+	switch suffix {
+	case "/wham/apps",
+		"/ps/mcp":
+		return true
+	default:
+		return false
+	}
 }
 
 func stripPathPrefix(path string, prefix string) (string, bool) {

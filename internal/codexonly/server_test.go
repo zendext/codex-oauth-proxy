@@ -348,6 +348,222 @@ func TestServerProxiesChatGPTFileEndpoints(t *testing.T) {
 	}
 }
 
+func TestServerProxiesChatGPTWhamUsageEndpoint(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"account_id": "acct_1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("WHAM endpoint was sent to codex upstream: %s", r.URL.Path)
+	}))
+	defer codexUpstream.Close()
+
+	var sawPath string
+	var sawAuthorization string
+	var sawAccount string
+	chatGPTUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		sawAuthorization = r.Header.Get("Authorization")
+		sawAccount = r.Header.Get("Chatgpt-Account-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"pro_lite","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_at":1893456000},"secondary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_at":1894060800}}}`))
+	}))
+	defer chatGPTUpstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		Port:           8317,
+		AuthDir:        authDir,
+		APIKeys:        []string{"proxy-key"},
+		CodexBaseURL:   codexUpstream.URL + "/backend-api/codex",
+		ChatGPTBaseURL: chatGPTUpstream.URL + "/backend-api",
+		RequestRetry:   1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
+	req.Header.Set("Authorization", "Bearer proxy-key")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	if sawPath != "/backend-api/wham/usage" {
+		t.Fatalf("upstream path = %q, want /backend-api/wham/usage", sawPath)
+	}
+	if sawAuthorization != "Bearer access-1" {
+		t.Fatalf("upstream Authorization = %q, want Bearer access-1", sawAuthorization)
+	}
+	if sawAccount != "acct_1" {
+		t.Fatalf("upstream Chatgpt-Account-Id = %q, want acct_1", sawAccount)
+	}
+}
+
+func TestServerProxiesChatGPTHostedMCPRoutes(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"account_id": "acct_1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("hosted MCP endpoint was sent to codex upstream: %s", r.URL.Path)
+	}))
+	defer codexUpstream.Close()
+
+	var sawPath string
+	var sawAuthorization string
+	var sawAccount string
+	var sawProtocolVersion string
+	var sawSessionID string
+	var sawAccept string
+	var sawBody string
+	chatGPTUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		sawAuthorization = r.Header.Get("Authorization")
+		sawAccount = r.Header.Get("Chatgpt-Account-Id")
+		sawProtocolVersion = r.Header.Get("MCP-Protocol-Version")
+		sawSessionID = r.Header.Get("Mcp-Session-Id")
+		sawAccept = r.Header.Get("Accept")
+		body, _ := io.ReadAll(r.Body)
+		sawBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"codex_apps","version":"test"}}}`))
+	}))
+	defer chatGPTUpstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		Port:           8317,
+		AuthDir:        authDir,
+		APIKeys:        []string{"proxy-key"},
+		CodexBaseURL:   codexUpstream.URL + "/backend-api/codex",
+		ChatGPTBaseURL: chatGPTUpstream.URL + "/backend-api",
+		RequestRetry:   1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		path     string
+		wantPath string
+	}{
+		{
+			name:     "legacy codex apps MCP",
+			path:     "/backend-api/wham/apps",
+			wantPath: "/backend-api/wham/apps",
+		},
+		{
+			name:     "hosted plugin runtime MCP",
+			path:     "/backend-api/ps/mcp",
+			wantPath: "/backend-api/ps/mcp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sawPath = ""
+			sawAuthorization = ""
+			sawAccount = ""
+			sawProtocolVersion = ""
+			sawSessionID = ""
+			sawAccept = ""
+			sawBody = ""
+
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+			req.Header.Set("Authorization", "Bearer proxy-key")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("MCP-Protocol-Version", "2025-06-18")
+			req.Header.Set("Mcp-Session-Id", "session-1")
+			resp := httptest.NewRecorder()
+
+			handler.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+			}
+			if sawPath != tt.wantPath {
+				t.Fatalf("upstream path = %q, want %q", sawPath, tt.wantPath)
+			}
+			if sawAuthorization != "Bearer access-1" {
+				t.Fatalf("upstream Authorization = %q, want Bearer access-1", sawAuthorization)
+			}
+			if sawAccount != "acct_1" {
+				t.Fatalf("upstream Chatgpt-Account-Id = %q, want acct_1", sawAccount)
+			}
+			if sawProtocolVersion != "2025-06-18" {
+				t.Fatalf("upstream MCP-Protocol-Version = %q, want 2025-06-18", sawProtocolVersion)
+			}
+			if sawSessionID != "session-1" {
+				t.Fatalf("upstream Mcp-Session-Id = %q, want session-1", sawSessionID)
+			}
+			if sawAccept != "application/json, text/event-stream" {
+				t.Fatalf("upstream Accept = %q, want application/json, text/event-stream", sawAccept)
+			}
+			if sawBody != `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` {
+				t.Fatalf("upstream body = %q", sawBody)
+			}
+		})
+	}
+}
+
+func TestServerAcceptsCodexOAuthForChatGPTBackendRoutes(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "auth.json", `{
+		"tokens": {
+			"access_token": "access-1",
+			"refresh_token": "refresh-1",
+			"account_id": "acct_1"
+		}
+	}`)
+
+	var sawPath string
+	chatGPTUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"pro_lite"}`))
+	}))
+	defer chatGPTUpstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		Port:           8317,
+		AuthDir:        authDir,
+		APIKeys:        []string{"proxy-key"},
+		CodexBaseURL:   chatGPTUpstream.URL + "/backend-api/codex",
+		ChatGPTBaseURL: chatGPTUpstream.URL + "/backend-api",
+		RequestRetry:   1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
+	req.Header.Set("Authorization", "Bearer access-1")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	if sawPath != "/backend-api/wham/usage" {
+		t.Fatalf("upstream path = %q, want /backend-api/wham/usage", sawPath)
+	}
+}
+
 func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	authDir := t.TempDir()
 	writeAuthFile(t, authDir, "codex.json", `{

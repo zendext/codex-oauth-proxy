@@ -34,27 +34,30 @@ expired tokens automatically and writes the updated token fields back to the sam
 file without changing the official Codex CLI file shape.
 
 Configure Codex CLI to use the proxy as a Responses provider. The important
-setting is `supports_websockets = true`; without it Codex falls back to HTTP SSE
-and `/status` may show the wrong limit bucket.
+settings are `supports_websockets = true` and `requires_openai_auth = true`:
+without WebSocket support Codex falls back to HTTP SSE, and without OpenAI auth
+gating Codex skips the startup `/status` rate-limit prefetch for custom
+providers.
 
 ```toml
+model_provider = "proxy"
+chatgpt_base_url = "http://127.0.0.1:8317/backend-api/"
+
 [model_providers.proxy]
 name = "OpenAI using LLM proxy"
 base_url = "http://127.0.0.1:8317/v1"
 env_key = "CLIPROXYAPI_API_KEY"
 wire_api = "responses"
 supports_websockets = true
+requires_openai_auth = true
 ```
 
 If `api-keys` is non-empty, set `CLIPROXYAPI_API_KEY` to one of those keys. For
 local-only testing with `api-keys: []`, any non-empty value is enough.
 
 For Codex file uploads used by Apps/MCP tools, point Codex's ChatGPT backend URL
-at the proxy too:
-
-```toml
-chatgpt_base_url = "http://127.0.0.1:8317/backend-api/"
-```
+at the proxy too. Codex also uses this backend URL to prefetch account rate-limit
+data for `/status`.
 
 ## Run
 
@@ -86,6 +89,12 @@ Supported routes:
 - `GET /backend-api/codex/realtime`
 - `POST /backend-api/files`
 - `POST /backend-api/files/{file_id}/uploaded`
+- `/backend-api/wham/apps` for legacy Codex Apps MCP streamable HTTP
+- `/backend-api/ps/mcp` for hosted plugin-runtime MCP streamable HTTP
+- `GET /backend-api/wham/usage`
+- `GET /backend-api/wham/profiles/me`
+- `GET /backend-api/wham/accounts/check`
+- `POST /backend-api/wham/accounts/send_add_credits_nudge_email`
 
 When `api-keys` is non-empty, protected routes require one configured proxy API
 key:
