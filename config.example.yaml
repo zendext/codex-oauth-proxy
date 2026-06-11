@@ -1,0 +1,30 @@
+# codex-oauth-proxy server bind host.
+host: "127.0.0.1"
+
+# Server port.
+port: 8317
+
+# Existing Codex auth JSON files are loaded from this directory.
+# The official Codex CLI ~/.codex/auth.json format is supported directly.
+auth-dir: "~/.codex"
+
+# API keys accepted by this local proxy. Keep empty for direct Codex CLI testing.
+api-keys: []
+
+# Optional outbound proxy. Use "direct" or "none" to bypass proxy settings.
+proxy-url: ""
+
+# Number of upstream retry attempts for future retry-aware calls.
+request-retry: 3
+
+# Codex upstream base URL.
+codex-base-url: "https://chatgpt.com/backend-api/codex"
+
+# ChatGPT backend base URL used by Codex file uploads.
+chatgpt-base-url: "https://chatgpt.com/backend-api"
+
+# Optional upstream User-Agent override. Leave empty to forward the Codex CLI UA.
+codex-user-agent: ""
+
+# Optional x-codex-beta-features fallback.
+codex-beta-features: ""

@@ -1,0 +1,39 @@
+# Binaries
+codex-oauth-proxy
+test-output
+*.exe
+
+# Configuration
+config.yaml
+.env
+
+# Generated content
+bin/*
+logs/*
+temp/*
+dist/*
+
+# Authentication data
+auths/*
+!auths/.gitkeep
+
+# Tooling metadata
+.vscode/*
+.worktrees/
+.codex/*
+.claude/*
+.gemini/*
+.serena/*
+.agent/*
+.agents/*
+.opencode/*
+.idea/*
+.beads/*
+.bmad/*
+_bmad/*
+_bmad-output/*
+
+# macOS
+.DS_Store
+._*
+.gocache/

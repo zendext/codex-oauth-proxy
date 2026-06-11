@@ -1,0 +1,20 @@
+name: codex-oauth-proxy
+
+services:
+  codex-oauth-proxy:
+    image: ${CODEX_OAUTH_PROXY_IMAGE:-codex-oauth-proxy:latest}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-none}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    container_name: codex-oauth-proxy
+    ports:
+      - "8317:8317"
+    volumes:
+      - ${CODEX_OAUTH_PROXY_CONFIG_PATH:-./config.yaml}:/codex-oauth-proxy/config.yaml
+      - ${CODEX_OAUTH_PROXY_AUTH_PATH:-./auths}:/root/.codex
+    restart: unless-stopped
