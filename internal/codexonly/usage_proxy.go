@@ -22,16 +22,18 @@ const (
 )
 
 type usageCaptureContext struct {
-	Authorization proxyAuthorization
-	AuthID        string
-	Model         string
-	StatusCode    int
-	RequestID     string
-	RetryAfter    string
-	Truncated     bool
-	Payload       []byte
-	Counters      UsageCounters
-	HasUsage      bool
+	Authorization   proxyAuthorization
+	AuthID          string
+	Model           string
+	ReasoningEffort string
+	StatusCode      int
+	RequestID       string
+	RetryAfter      string
+	Truncated       bool
+	Payload         []byte
+	Counters        UsageCounters
+	HasUsage        bool
+	DeltaOnly       bool
 }
 
 type usageCaptureReadCloser struct {
@@ -182,7 +184,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 	diagnostics := s.usageDiagnostics(capture)
 	if s.debugUsageResponseEnabled() {
 		s.debugf(
-			"usage response request_id=%s user_id=%s api_key_id=%s key_hash=%s masked_key=%s auth_id=%s model=%s status=%d total_tokens=%d has_usage=%t truncated=%t retry_after=%q",
+			"usage response request_id=%s user_id=%s api_key_id=%s key_hash=%s masked_key=%s auth_id=%s model=%s reasoning_effort=%s status=%d total_tokens=%d has_usage=%t truncated=%t retry_after=%q",
 			capture.RequestID,
 			credential.User.ID,
 			credential.APIKey.ID,
@@ -190,6 +192,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 			credential.APIKey.MaskedKey,
 			capture.AuthID,
 			normalizeUsageText(capture.Model, "unknown"),
+			normalizeUsageText(capture.ReasoningEffort, "unknown"),
 			capture.StatusCode,
 			capture.Counters.TotalTokens,
 			capture.HasUsage,
@@ -198,15 +201,17 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 		)
 	}
 	err := s.users.RecordUsage(context.Background(), UsageRecordParams{
-		Timestamp:   time.Now().UTC(),
-		User:        credential.User,
-		APIKey:      credential.APIKey,
-		Model:       capture.Model,
-		AuthID:      capture.AuthID,
-		RequestID:   capture.RequestID,
-		StatusCode:  capture.StatusCode,
-		Counters:    capture.Counters,
-		Diagnostics: diagnostics,
+		Timestamp:       time.Now().UTC(),
+		User:            credential.User,
+		APIKey:          credential.APIKey,
+		Model:           capture.Model,
+		ReasoningEffort: capture.ReasoningEffort,
+		AuthID:          capture.AuthID,
+		RequestID:       capture.RequestID,
+		StatusCode:      capture.StatusCode,
+		Counters:        capture.Counters,
+		Diagnostics:     diagnostics,
+		DeltaOnly:       capture.DeltaOnly,
 	}, s.cfg.Usage)
 	if err != nil {
 		s.debugf("usage record failed request_id=%s user_id=%s api_key_id=%s error=%q", capture.RequestID, credential.User.ID, credential.APIKey.ID, err.Error())
@@ -219,18 +224,19 @@ func (s *Server) usageDiagnostics(capture usageCaptureContext) string {
 	}
 	credential := capture.Authorization.Credential
 	payload := map[string]any{
-		"request_id":    capture.RequestID,
-		"user_id":       credential.User.ID,
-		"api_key_id":    credential.APIKey.ID,
-		"key_hash":      credential.APIKey.KeyHash,
-		"masked_key":    credential.APIKey.MaskedKey,
-		"auth_id":       capture.AuthID,
-		"model":         normalizeUsageText(capture.Model, "unknown"),
-		"status":        capture.StatusCode,
-		"retry_after":   strings.TrimSpace(capture.RetryAfter),
-		"has_usage":     capture.HasUsage,
-		"truncated":     capture.Truncated,
-		"usage_summary": capture.Counters,
+		"request_id":       capture.RequestID,
+		"user_id":          credential.User.ID,
+		"api_key_id":       credential.APIKey.ID,
+		"key_hash":         credential.APIKey.KeyHash,
+		"masked_key":       credential.APIKey.MaskedKey,
+		"auth_id":          capture.AuthID,
+		"model":            normalizeUsageText(capture.Model, "unknown"),
+		"reasoning_effort": normalizeUsageText(capture.ReasoningEffort, "unknown"),
+		"status":           capture.StatusCode,
+		"retry_after":      strings.TrimSpace(capture.RetryAfter),
+		"has_usage":        capture.HasUsage,
+		"truncated":        capture.Truncated,
+		"usage_summary":    capture.Counters,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -243,42 +249,156 @@ func (s *Server) debugUsageResponseEnabled() bool {
 	return s != nil && s.debugEnabled() && s.cfg != nil && s.cfg.Usage.DebugOpenAIResponse
 }
 
-func captureProxyRequestModel(r *http.Request) string {
+type proxyRequestUsageMetadata struct {
+	Model           string
+	ReasoningEffort string
+	SkipUsage       bool
+}
+
+func captureProxyRequestUsageMetadata(r *http.Request) proxyRequestUsageMetadata {
+	metadata := proxyRequestUsageMetadata{}
 	if r == nil || r.URL == nil {
-		return "unknown"
+		return metadata
 	}
 	if queryModel := strings.TrimSpace(r.URL.Query().Get("model")); queryModel != "" {
-		return queryModel
+		metadata.Model = queryModel
+	}
+	if queryEffort := strings.TrimSpace(r.URL.Query().Get("reasoning_effort")); queryEffort != "" {
+		metadata.ReasoningEffort = queryEffort
 	}
 	if r.Body == nil || r.Body == http.NoBody {
-		return "unknown"
+		return metadata
 	}
 	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
 	jsonCandidate := strings.Contains(contentType, "json") ||
 		(contentType == "" && (strings.Contains(r.URL.Path, "/responses") || strings.Contains(r.URL.Path, "/alpha/search")))
 	if !jsonCandidate {
-		return "unknown"
+		return metadata
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		r.Body = io.NopCloser(bytes.NewReader(nil))
-		return "unknown"
+		return metadata
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	r.GetBody = func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
-	var payload map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(body))
+	if bodyMetadata, ok := usageMetadataFromJSON(body); ok {
+		metadata = mergeUsageMetadata(metadata, bodyMetadata)
+	}
+	return metadata
+}
+
+func usageMetadataFromJSON(payload []byte) (proxyRequestUsageMetadata, bool) {
+	var value map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
-	if err = decoder.Decode(&payload); err != nil {
-		return "unknown"
+	if err := decoder.Decode(&value); err != nil {
+		return proxyRequestUsageMetadata{}, false
 	}
+	return usageMetadataFromMap(value)
+}
+
+func usageMetadataFromMap(payload map[string]any) (proxyRequestUsageMetadata, bool) {
+	var metadata proxyRequestUsageMetadata
 	if model, ok := payload["model"].(string); ok && strings.TrimSpace(model) != "" {
-		return strings.TrimSpace(model)
+		metadata.Model = strings.TrimSpace(model)
 	}
-	return "unknown"
+	if reasoning, ok := mapValue(payload["reasoning"]); ok {
+		if effort, okEffort := reasoning["effort"].(string); okEffort && strings.TrimSpace(effort) != "" {
+			metadata.ReasoningEffort = strings.TrimSpace(effort)
+		}
+	}
+	if effort, ok := payload["reasoning_effort"].(string); ok && strings.TrimSpace(effort) != "" {
+		metadata.ReasoningEffort = strings.TrimSpace(effort)
+	}
+	if effort, ok := payload["model_reasoning_effort"].(string); ok && strings.TrimSpace(effort) != "" {
+		metadata.ReasoningEffort = strings.TrimSpace(effort)
+	}
+	if generate, ok := payload["generate"].(bool); ok && !generate {
+		metadata.SkipUsage = true
+	}
+	return metadata, metadata.Model != "" || metadata.ReasoningEffort != "" || metadata.SkipUsage
+}
+
+func mergeUsageMetadata(current proxyRequestUsageMetadata, next proxyRequestUsageMetadata) proxyRequestUsageMetadata {
+	if strings.TrimSpace(next.Model) != "" {
+		current.Model = strings.TrimSpace(next.Model)
+	}
+	if strings.TrimSpace(next.ReasoningEffort) != "" {
+		current.ReasoningEffort = strings.TrimSpace(next.ReasoningEffort)
+	}
+	current.SkipUsage = next.SkipUsage
+	return current
+}
+
+type webSocketUsageEvent struct {
+	ResponseID string
+	Counters   UsageCounters
+}
+
+func webSocketUsageEventFromJSON(payload []byte) (webSocketUsageEvent, bool) {
+	counters, ok := extractUsageCounters(payload)
+	if !ok {
+		return webSocketUsageEvent{}, false
+	}
+	var responseID string
+	if value, okValue := decodeUsageJSON(payload); okValue {
+		responseID = usageResponseIDFromValue(value)
+	}
+	return webSocketUsageEvent{
+		ResponseID: responseID,
+		Counters:   counters,
+	}, true
+}
+
+func usageResponseIDFromValue(value any) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		if response, ok := mapValue(typed["response"]); ok {
+			if _, hasUsage := response["usage"]; hasUsage {
+				if id := stringValue(response["id"]); id != "" {
+					return id
+				}
+			}
+			if id := usageResponseIDFromValue(response); id != "" {
+				return id
+			}
+		}
+		if _, hasUsage := typed["usage"]; hasUsage {
+			if id := stringValue(typed["id"]); id != "" {
+				return id
+			}
+			if id := stringValue(typed["response_id"]); id != "" {
+				return id
+			}
+		}
+		if id := stringValue(typed["response_id"]); id != "" {
+			return id
+		}
+		for _, child := range typed {
+			if id := usageResponseIDFromValue(child); id != "" {
+				return id
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if id := usageResponseIDFromValue(item); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func stringValue(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(text)
 }
 
 func usageRequestID(r *http.Request, resp *http.Response) string {
@@ -312,7 +432,21 @@ func newUsageRequestID() string {
 }
 
 func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization, auth *Auth) {
-	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	metadata := proxyRequestUsageMetadata{
+		Model:           strings.TrimSpace(r.URL.Query().Get("model")),
+		ReasoningEffort: strings.TrimSpace(r.URL.Query().Get("reasoning_effort")),
+	}
+	var metadataMu sync.Mutex
+	currentMetadata := func() proxyRequestUsageMetadata {
+		metadataMu.Lock()
+		defer metadataMu.Unlock()
+		return metadata
+	}
+	updateMetadata := func(next proxyRequestUsageMetadata) {
+		metadataMu.Lock()
+		metadata = mergeUsageMetadata(metadata, next)
+		metadataMu.Unlock()
+	}
 	upstreamURL := websocketURL(route.baseURL, route.targetPath, r.URL.RawQuery)
 	header := outboundWebSocketHeader(r, auth, s.cfg, route.responsesWebsocket)
 	dialer := websocketDialer(s.httpClient)
@@ -335,11 +469,12 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 		s.debugf("proxy upstream websocket dial failed method=%s path=%s status=%d error=%q", r.Method, r.URL.Path, statusCode, err.Error())
 		if s.shouldRecordUsage(authorization) {
 			s.recordProxyUsage(usageCaptureContext{
-				Authorization: authorization,
-				AuthID:        auth.ID,
-				Model:         model,
-				StatusCode:    statusCode,
-				RequestID:     requestIDFromRequest(r),
+				Authorization:   authorization,
+				AuthID:          auth.ID,
+				Model:           metadata.Model,
+				ReasoningEffort: metadata.ReasoningEffort,
+				StatusCode:      statusCode,
+				RequestID:       requestIDFromRequest(r),
 			})
 		}
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -360,11 +495,12 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 		s.debugf("proxy client websocket upgrade failed method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
 		if s.shouldRecordUsage(authorization) {
 			s.recordProxyUsage(usageCaptureContext{
-				Authorization: authorization,
-				AuthID:        auth.ID,
-				Model:         model,
-				StatusCode:    http.StatusBadGateway,
-				RequestID:     requestIDFromRequest(r),
+				Authorization:   authorization,
+				AuthID:          auth.ID,
+				Model:           metadata.Model,
+				ReasoningEffort: metadata.ReasoningEffort,
+				StatusCode:      http.StatusBadGateway,
+				RequestID:       requestIDFromRequest(r),
 			})
 		}
 		return
@@ -372,20 +508,43 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 	defer clientConn.Close()
 
 	var recordedUsage bool
+	recordedResponses := map[string]UsageCounters{}
 	var recordedUsageMu sync.Mutex
-	recordWebSocketUsage := func(counters UsageCounters) {
+	recordWebSocketUsage := func(event webSocketUsageEvent) {
+		recordMetadata := currentMetadata()
+		if recordMetadata.SkipUsage {
+			recordedUsageMu.Lock()
+			recordedUsage = true
+			recordedUsageMu.Unlock()
+			return
+		}
+		counters := event.Counters
+		deltaOnly := false
 		recordedUsageMu.Lock()
 		recordedUsage = true
+		if event.ResponseID != "" {
+			if previous, ok := recordedResponses[event.ResponseID]; ok {
+				counters = counters.subtract(previous)
+				deltaOnly = true
+			}
+			recordedResponses[event.ResponseID] = event.Counters
+		}
+		if counters.isZero() {
+			recordedUsageMu.Unlock()
+			return
+		}
 		recordedUsageMu.Unlock()
 		if s.shouldRecordUsage(authorization) {
 			s.recordProxyUsage(usageCaptureContext{
-				Authorization: authorization,
-				AuthID:        auth.ID,
-				Model:         model,
-				StatusCode:    http.StatusSwitchingProtocols,
-				RequestID:     requestIDFromRequest(r),
-				Counters:      counters,
-				HasUsage:      true,
+				Authorization:   authorization,
+				AuthID:          auth.ID,
+				Model:           recordMetadata.Model,
+				ReasoningEffort: recordMetadata.ReasoningEffort,
+				StatusCode:      http.StatusSwitchingProtocols,
+				RequestID:       requestIDFromRequest(r),
+				Counters:        counters,
+				HasUsage:        true,
+				DeltaOnly:       deltaOnly,
 			})
 		}
 	}
@@ -403,7 +562,14 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 			closeBoth()
 			done <- struct{}{}
 		}()
-		copyWebSocketMessages(clientConn, upstreamConn, nil)
+		copyWebSocketMessages(clientConn, upstreamConn, func(messageType int, payload []byte) {
+			if messageType != websocket.TextMessage {
+				return
+			}
+			if requestMetadata, ok := usageMetadataFromJSON(payload); ok {
+				updateMetadata(requestMetadata)
+			}
+		})
 	}()
 	go func() {
 		defer func() {
@@ -414,8 +580,8 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 			if messageType != websocket.TextMessage {
 				return
 			}
-			if extracted, ok := extractUsageCounters(payload); ok {
-				recordWebSocketUsage(extracted)
+			if usageEvent, ok := webSocketUsageEventFromJSON(payload); ok {
+				recordWebSocketUsage(usageEvent)
 			}
 		})
 	}()
@@ -427,12 +593,14 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 	recordedUsageMu.Unlock()
 
 	if s.shouldRecordUsage(authorization) && !captureHasUsage {
+		recordMetadata := currentMetadata()
 		s.recordProxyUsage(usageCaptureContext{
-			Authorization: authorization,
-			AuthID:        auth.ID,
-			Model:         model,
-			StatusCode:    http.StatusSwitchingProtocols,
-			RequestID:     requestIDFromRequest(r),
+			Authorization:   authorization,
+			AuthID:          auth.ID,
+			Model:           recordMetadata.Model,
+			ReasoningEffort: recordMetadata.ReasoningEffort,
+			StatusCode:      http.StatusSwitchingProtocols,
+			RequestID:       requestIDFromRequest(r),
 		})
 	}
 }

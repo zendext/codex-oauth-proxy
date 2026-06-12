@@ -112,7 +112,7 @@ func (s *UserStore) Close() error {
 }
 
 func (s *UserStore) migrate(ctx context.Context) error {
-	statements := []string{
+	tableStatements := []string{
 		`PRAGMA foreign_keys = ON`,
 		`PRAGMA busy_timeout = 5000`,
 		`CREATE TABLE IF NOT EXISTS users (
@@ -134,9 +134,6 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			last_used_at TEXT,
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_one_active_per_user
-			ON api_keys(user_id) WHERE enabled = 1`,
-		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)`,
 		`CREATE TABLE IF NOT EXISTS usage_buckets (
 			bucket_start TEXT NOT NULL,
 			user_id TEXT NOT NULL,
@@ -144,6 +141,7 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			key_hash TEXT NOT NULL,
 			masked_key TEXT NOT NULL,
 			model TEXT NOT NULL,
+			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
 			auth_id TEXT NOT NULL,
 			request_count INTEGER NOT NULL DEFAULT 0,
 			failed_request_count INTEGER NOT NULL DEFAULT 0,
@@ -155,19 +153,18 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL,
-			PRIMARY KEY (bucket_start, user_id, api_key_id, model, auth_id),
+			PRIMARY KEY (bucket_start, user_id, api_key_id, model, reasoning_effort, auth_id),
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_user_key_time
-			ON usage_buckets(user_id, api_key_id, bucket_start)`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_time ON usage_buckets(bucket_start)`,
 		`CREATE TABLE IF NOT EXISTS usage_threshold_state (
 			window TEXT NOT NULL,
 			api_key_id TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT 'unknown',
+			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
 			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
 			updated_at TEXT NOT NULL,
-			PRIMARY KEY (window, api_key_id),
+			PRIMARY KEY (window, api_key_id, model, reasoning_effort),
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS usage_threshold_events (
@@ -185,21 +182,210 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			request_count INTEGER NOT NULL,
 			failed_request_count INTEGER NOT NULL,
 			model TEXT NOT NULL,
+			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
 			auth_id TEXT NOT NULL,
 			request_id TEXT NOT NULL,
 			diagnostics TEXT NOT NULL,
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
+	}
+	for _, statement := range tableStatements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate user store: %w", err)
+		}
+	}
+	if err := s.migrateUsageReasoningEffort(ctx); err != nil {
+		return err
+	}
+	indexStatements := []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_one_active_per_user
+			ON api_keys(user_id) WHERE enabled = 1`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_user_key_time
+			ON usage_buckets(user_id, api_key_id, bucket_start)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_time ON usage_buckets(bucket_start)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_threshold_events_time
 			ON usage_threshold_events(timestamp)`,
 	}
-	for _, statement := range statements {
+	for _, statement := range indexStatements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate user store: %w", err)
 		}
 	}
 	return nil
+}
+
+func (s *UserStore) migrateUsageReasoningEffort(ctx context.Context) error {
+	if err := s.migrateUsageBucketsReasoningEffort(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateUsageThresholdStateReasoningEffort(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateUsageThresholdEventsReasoningEffort(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *UserStore) migrateUsageBucketsReasoningEffort(ctx context.Context) error {
+	hasColumn, err := tableColumnExists(ctx, s.db, "usage_buckets", "reasoning_effort")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin usage_buckets reasoning_effort migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+
+	statements := []string{
+		`DROP TABLE IF EXISTS usage_buckets_before_reasoning_effort`,
+		`ALTER TABLE usage_buckets RENAME TO usage_buckets_before_reasoning_effort`,
+		`CREATE TABLE usage_buckets (
+			bucket_start TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			api_key_id TEXT NOT NULL,
+			key_hash TEXT NOT NULL,
+			masked_key TEXT NOT NULL,
+			model TEXT NOT NULL,
+			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			auth_id TEXT NOT NULL,
+			request_count INTEGER NOT NULL DEFAULT 0,
+			failed_request_count INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (bucket_start, user_id, api_key_id, model, reasoning_effort, auth_id),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+		)`,
+		`INSERT INTO usage_buckets (
+			bucket_start, user_id, api_key_id, key_hash, masked_key, model, reasoning_effort, auth_id,
+			request_count, failed_request_count, input_tokens, output_tokens, reasoning_tokens,
+			cached_input_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, updated_at
+		)
+		SELECT
+			bucket_start, user_id, api_key_id, MAX(key_hash), MAX(masked_key), model, 'unknown', auth_id,
+			COALESCE(SUM(request_count), 0),
+			COALESCE(SUM(failed_request_count), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(reasoning_tokens), 0),
+			COALESCE(SUM(cached_input_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_creation_tokens), 0),
+			COALESCE(SUM(total_tokens), 0),
+			MAX(updated_at)
+		FROM usage_buckets_before_reasoning_effort
+		GROUP BY bucket_start, user_id, api_key_id, model, auth_id`,
+		`DROP TABLE usage_buckets_before_reasoning_effort`,
+	}
+	for _, statement := range statements {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate usage_buckets reasoning_effort: %w", err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit usage_buckets reasoning_effort migration: %w", err)
+	}
+	return nil
+}
+
+func (s *UserStore) migrateUsageThresholdStateReasoningEffort(ctx context.Context) error {
+	hasModel, err := tableColumnExists(ctx, s.db, "usage_threshold_state", "model")
+	if err != nil {
+		return err
+	}
+	hasEffort, err := tableColumnExists(ctx, s.db, "usage_threshold_state", "reasoning_effort")
+	if err != nil {
+		return err
+	}
+	if hasModel && hasEffort {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin usage_threshold_state reasoning_effort migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+
+	statements := []string{
+		`DROP TABLE IF EXISTS usage_threshold_state_before_reasoning_effort`,
+		`ALTER TABLE usage_threshold_state RENAME TO usage_threshold_state_before_reasoning_effort`,
+		`CREATE TABLE usage_threshold_state (
+			window TEXT NOT NULL,
+			api_key_id TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT 'unknown',
+			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (window, api_key_id, model, reasoning_effort),
+			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+		)`,
+		`INSERT INTO usage_threshold_state (window, api_key_id, model, reasoning_effort, above_threshold, updated_at)
+		SELECT window, api_key_id, 'unknown', 'unknown', above_threshold, updated_at
+		FROM usage_threshold_state_before_reasoning_effort`,
+		`DROP TABLE usage_threshold_state_before_reasoning_effort`,
+	}
+	for _, statement := range statements {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate usage_threshold_state reasoning_effort: %w", err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit usage_threshold_state reasoning_effort migration: %w", err)
+	}
+	return nil
+}
+
+func (s *UserStore) migrateUsageThresholdEventsReasoningEffort(ctx context.Context) error {
+	hasColumn, err := tableColumnExists(ctx, s.db, "usage_threshold_events", "reasoning_effort")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	if _, err = s.db.ExecContext(ctx, `ALTER TABLE usage_threshold_events ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'unknown'`); err != nil {
+		return fmt.Errorf("migrate usage_threshold_events reasoning_effort: %w", err)
+	}
+	return nil
+}
+
+func tableColumnExists(ctx context.Context, db *sql.DB, table string, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, fmt.Errorf("read table info for %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err = rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, fmt.Errorf("scan table info for %s: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return false, fmt.Errorf("read table info rows for %s: %w", table, err)
+	}
+	return false, nil
 }
 
 func (s *UserStore) CreateUser(ctx context.Context, params CreateUserParams) (CreatedUserAPIKey, error) {

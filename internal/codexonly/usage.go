@@ -35,21 +35,24 @@ type UsageCounters struct {
 }
 
 type UsageRecordParams struct {
-	Timestamp   time.Time
-	User        UserRecord
-	APIKey      APIKeyRecord
-	Model       string
-	AuthID      string
-	RequestID   string
-	StatusCode  int
-	Counters    UsageCounters
-	Diagnostics string
+	Timestamp       time.Time
+	User            UserRecord
+	APIKey          APIKeyRecord
+	Model           string
+	ReasoningEffort string
+	AuthID          string
+	RequestID       string
+	StatusCode      int
+	Counters        UsageCounters
+	Diagnostics     string
+	DeltaOnly       bool
 }
 
 type UserUsageToday struct {
-	UserID   string `json:"user_id"`
-	APIKeyID string `json:"api_key_id"`
-	Date     string `json:"date"`
+	UserID   string           `json:"user_id"`
+	APIKeyID string           `json:"api_key_id"`
+	Date     string           `json:"date"`
+	Models   []UsageDimension `json:"models,omitempty"`
 	UsageCounters
 }
 
@@ -65,6 +68,13 @@ type UsageWindow struct {
 	OverThreshold   bool     `json:"over_threshold"`
 }
 
+type UsageDimension struct {
+	Model           string                 `json:"model"`
+	ReasoningEffort string                 `json:"reasoning_effort"`
+	Windows         map[string]UsageWindow `json:"windows,omitempty"`
+	UsageCounters
+}
+
 type ManagementUsageEntry struct {
 	UserID    string                 `json:"user_id"`
 	Name      string                 `json:"name"`
@@ -72,6 +82,7 @@ type ManagementUsageEntry struct {
 	KeyHash   string                 `json:"key_hash"`
 	MaskedKey string                 `json:"masked_key"`
 	Windows   map[string]UsageWindow `json:"windows"`
+	Models    []UsageDimension       `json:"models,omitempty"`
 }
 
 type UsageThresholdEvent struct {
@@ -89,6 +100,7 @@ type UsageThresholdEvent struct {
 	RequestCount       int64     `json:"request_count"`
 	FailedRequestCount int64     `json:"failed_request_count"`
 	Model              string    `json:"model,omitempty"`
+	ReasoningEffort    string    `json:"reasoning_effort,omitempty"`
 	AuthID             string    `json:"auth_id,omitempty"`
 	RequestID          string    `json:"request_id,omitempty"`
 	Diagnostics        string    `json:"diagnostics,omitempty"`
@@ -138,6 +150,7 @@ func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, c
 	}
 	params.Timestamp = timestamp
 	params.Model = normalizeUsageText(params.Model, "unknown")
+	params.ReasoningEffort = normalizeUsageText(params.ReasoningEffort, "unknown")
 	params.AuthID = normalizeUsageText(params.AuthID, "unknown")
 	params.RequestID = strings.TrimSpace(params.RequestID)
 	if params.RequestID == "" {
@@ -151,7 +164,9 @@ func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, c
 
 	requestCount := int64(1)
 	failedRequestCount := int64(0)
-	if params.StatusCode >= 400 || params.StatusCode == 0 {
+	if params.DeltaOnly {
+		requestCount = 0
+	} else if params.StatusCode >= 400 || params.StatusCode == 0 {
 		failedRequestCount = 1
 	}
 	bucketStart := usageBucketStart(timestamp)
@@ -165,11 +180,11 @@ func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, c
 
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO usage_buckets (
-			bucket_start, user_id, api_key_id, key_hash, masked_key, model, auth_id,
+			bucket_start, user_id, api_key_id, key_hash, masked_key, model, reasoning_effort, auth_id,
 			request_count, failed_request_count, input_tokens, output_tokens, reasoning_tokens,
 			cached_input_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(bucket_start, user_id, api_key_id, model, auth_id) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(bucket_start, user_id, api_key_id, model, reasoning_effort, auth_id) DO UPDATE SET
 			key_hash = excluded.key_hash,
 			masked_key = excluded.masked_key,
 			request_count = usage_buckets.request_count + excluded.request_count,
@@ -188,6 +203,7 @@ func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, c
 		params.APIKey.KeyHash,
 		params.APIKey.MaskedKey,
 		params.Model,
+		params.ReasoningEffort,
 		params.AuthID,
 		requestCount,
 		failedRequestCount,
@@ -230,10 +246,15 @@ func (s *UserStore) GetTodayUsage(ctx context.Context, userID string, apiKeyID s
 	if err != nil {
 		return UserUsageToday{}, err
 	}
+	models, err := aggregateUsageDimensionsRange(ctx, s.db, strings.TrimSpace(userID), strings.TrimSpace(apiKeyID), dayStart, dayEnd)
+	if err != nil {
+		return UserUsageToday{}, err
+	}
 	return UserUsageToday{
 		UserID:        strings.TrimSpace(userID),
 		APIKeyID:      strings.TrimSpace(apiKeyID),
 		Date:          dayStart.Format("2006-01-02"),
+		Models:        models,
 		UsageCounters: counters,
 	}, nil
 }
@@ -297,6 +318,11 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 			}
 			entry.Windows[spec.name] = buildUsageWindow(counters, spec.referenceTokens, usageAlertThreshold(cfg))
 		}
+		models, errModels := s.usageDimensionsSnapshot(ctx, entry.UserID, entry.APIKeyID, sevenDayStart, windowEnd, now, cfg)
+		if errModels != nil {
+			return nil, errModels
+		}
+		entry.Models = models
 		entries = append(entries, entry)
 	}
 	return entries, nil
@@ -315,7 +341,7 @@ func (s *UserStore) ListUsageEvents(ctx context.Context, count int) ([]UsageThre
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, timestamp, window, user_id, api_key_id, key_hash, masked_key, ratio,
 			threshold, total_tokens, reference_tokens, request_count, failed_request_count,
-			model, auth_id, request_id, diagnostics
+			model, reasoning_effort, auth_id, request_id, diagnostics
 		FROM usage_threshold_events
 		ORDER BY timestamp DESC, window DESC, id DESC
 		LIMIT ?`,
@@ -345,6 +371,7 @@ func (s *UserStore) ListUsageEvents(ctx context.Context, count int) ([]UsageThre
 			&event.RequestCount,
 			&event.FailedRequestCount,
 			&event.Model,
+			&event.ReasoningEffort,
 			&event.AuthID,
 			&event.RequestID,
 			&event.Diagnostics,
@@ -372,7 +399,7 @@ func (s *UserStore) recordThresholdEvents(ctx context.Context, tx *sql.Tx, param
 			continue
 		}
 		start := usageWindowStart(params.Timestamp, spec.bucketCount)
-		counters, err := aggregateUsageRangeTx(ctx, tx, params.User.ID, params.APIKey.ID, start, windowEnd)
+		counters, err := aggregateUsageRangeTx(ctx, tx, params.User.ID, params.APIKey.ID, start, windowEnd, params.Model, params.ReasoningEffort)
 		if err != nil {
 			return err
 		}
@@ -382,7 +409,7 @@ func (s *UserStore) recordThresholdEvents(ctx context.Context, tx *sql.Tx, param
 			ratio = float64(counters.TotalTokens) / float64(spec.referenceTokens)
 			overThreshold = ratio >= threshold
 		}
-		previouslyOver, err := thresholdState(ctx, tx, spec.name, params.APIKey.ID)
+		previouslyOver, err := thresholdState(ctx, tx, spec.name, params.APIKey.ID, params.Model, params.ReasoningEffort)
 		if err != nil {
 			return err
 		}
@@ -391,7 +418,7 @@ func (s *UserStore) recordThresholdEvents(ctx context.Context, tx *sql.Tx, param
 				return err
 			}
 		}
-		if err = upsertThresholdState(ctx, tx, spec.name, params.APIKey.ID, overThreshold, params.Timestamp); err != nil {
+		if err = upsertThresholdState(ctx, tx, spec.name, params.APIKey.ID, params.Model, params.ReasoningEffort, overThreshold, params.Timestamp); err != nil {
 			return err
 		}
 	}
@@ -406,9 +433,9 @@ func insertUsageThresholdEvent(ctx context.Context, tx *sql.Tx, params UsageReco
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO usage_threshold_events (
 			id, timestamp, window, user_id, api_key_id, key_hash, masked_key, ratio, threshold,
-			total_tokens, reference_tokens, request_count, failed_request_count, model, auth_id,
-			request_id, diagnostics
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			total_tokens, reference_tokens, request_count, failed_request_count, model, reasoning_effort,
+			auth_id, request_id, diagnostics
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id,
 		formatDBTime(params.Timestamp),
 		spec.name,
@@ -423,6 +450,7 @@ func insertUsageThresholdEvent(ctx context.Context, tx *sql.Tx, params UsageReco
 		counters.RequestCount,
 		counters.FailedRequestCount,
 		params.Model,
+		params.ReasoningEffort,
 		params.AuthID,
 		params.RequestID,
 		params.Diagnostics,
@@ -433,12 +461,14 @@ func insertUsageThresholdEvent(ctx context.Context, tx *sql.Tx, params UsageReco
 	return nil
 }
 
-func thresholdState(ctx context.Context, tx *sql.Tx, window string, apiKeyID string) (bool, error) {
+func thresholdState(ctx context.Context, tx *sql.Tx, window string, apiKeyID string, model string, reasoningEffort string) (bool, error) {
 	var above int
 	err := tx.QueryRowContext(ctx,
-		`SELECT above_threshold FROM usage_threshold_state WHERE window = ? AND api_key_id = ?`,
+		`SELECT above_threshold FROM usage_threshold_state WHERE window = ? AND api_key_id = ? AND model = ? AND reasoning_effort = ?`,
 		window,
 		apiKeyID,
+		model,
+		reasoningEffort,
 	).Scan(&above)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -449,15 +479,17 @@ func thresholdState(ctx context.Context, tx *sql.Tx, window string, apiKeyID str
 	return above == 1, nil
 }
 
-func upsertThresholdState(ctx context.Context, tx *sql.Tx, window string, apiKeyID string, overThreshold bool, timestamp time.Time) error {
+func upsertThresholdState(ctx context.Context, tx *sql.Tx, window string, apiKeyID string, model string, reasoningEffort string, overThreshold bool, timestamp time.Time) error {
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO usage_threshold_state (window, api_key_id, above_threshold, updated_at)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(window, api_key_id) DO UPDATE SET
+		`INSERT INTO usage_threshold_state (window, api_key_id, model, reasoning_effort, above_threshold, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(window, api_key_id, model, reasoning_effort) DO UPDATE SET
 			above_threshold = excluded.above_threshold,
 			updated_at = excluded.updated_at`,
 		window,
 		apiKeyID,
+		model,
+		reasoningEffort,
 		boolInt(overThreshold),
 		formatDBTime(timestamp),
 	)
@@ -480,21 +512,24 @@ func pruneUsageData(ctx context.Context, tx *sql.Tx, now time.Time, cfg UsageCon
 }
 
 func (s *UserStore) aggregateUsageRange(ctx context.Context, userID string, apiKeyID string, start time.Time, end time.Time) (UsageCounters, error) {
-	return aggregateUsageRangeDB(ctx, s.db, userID, apiKeyID, start, end)
+	return aggregateUsageRangeDB(ctx, s.db, userID, apiKeyID, start, end, "", "")
 }
 
-func aggregateUsageRangeTx(ctx context.Context, tx *sql.Tx, userID string, apiKeyID string, start time.Time, end time.Time) (UsageCounters, error) {
-	return aggregateUsageRangeDB(ctx, tx, userID, apiKeyID, start, end)
+func aggregateUsageRangeTx(ctx context.Context, tx *sql.Tx, userID string, apiKeyID string, start time.Time, end time.Time, model string, reasoningEffort string) (UsageCounters, error) {
+	return aggregateUsageRangeDB(ctx, tx, userID, apiKeyID, start, end, model, reasoningEffort)
 }
 
 type usageQueryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-func aggregateUsageRangeDB(ctx context.Context, queryer usageQueryer, userID string, apiKeyID string, start time.Time, end time.Time) (UsageCounters, error) {
+type usageRowsQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func aggregateUsageRangeDB(ctx context.Context, queryer usageQueryer, userID string, apiKeyID string, start time.Time, end time.Time, model string, reasoningEffort string) (UsageCounters, error) {
 	var counters UsageCounters
-	err := queryer.QueryRowContext(ctx,
-		`SELECT
+	query := `SELECT
 			COALESCE(SUM(request_count), 0),
 			COALESCE(SUM(failed_request_count), 0),
 			COALESCE(SUM(input_tokens), 0),
@@ -505,12 +540,22 @@ func aggregateUsageRangeDB(ctx context.Context, queryer usageQueryer, userID str
 			COALESCE(SUM(cache_creation_tokens), 0),
 			COALESCE(SUM(total_tokens), 0)
 		FROM usage_buckets
-		WHERE user_id = ? AND api_key_id = ? AND bucket_start >= ? AND bucket_start < ?`,
+		WHERE user_id = ? AND api_key_id = ? AND bucket_start >= ? AND bucket_start < ?`
+	args := []any{
 		strings.TrimSpace(userID),
 		strings.TrimSpace(apiKeyID),
 		formatDBTime(start.UTC()),
 		formatDBTime(end.UTC()),
-	).Scan(
+	}
+	if strings.TrimSpace(model) != "" {
+		query += ` AND model = ?`
+		args = append(args, strings.TrimSpace(model))
+	}
+	if strings.TrimSpace(reasoningEffort) != "" {
+		query += ` AND reasoning_effort = ?`
+		args = append(args, strings.TrimSpace(reasoningEffort))
+	}
+	err := queryer.QueryRowContext(ctx, query, args...).Scan(
 		&counters.RequestCount,
 		&counters.FailedRequestCount,
 		&counters.InputTokens,
@@ -525,6 +570,109 @@ func aggregateUsageRangeDB(ctx context.Context, queryer usageQueryer, userID str
 		return UsageCounters{}, fmt.Errorf("aggregate usage: %w", err)
 	}
 	return counters, nil
+}
+
+func (s *UserStore) usageDimensionsSnapshot(ctx context.Context, userID string, apiKeyID string, start time.Time, end time.Time, now time.Time, cfg UsageConfig) ([]UsageDimension, error) {
+	dimensions, err := listUsageDimensionKeys(ctx, s.db, userID, apiKeyID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	for i := range dimensions {
+		dimensions[i].Windows = map[string]UsageWindow{}
+		for _, spec := range usageWindowSpecs(cfg) {
+			windowStart := usageWindowStart(now, spec.bucketCount)
+			counters, errAggregate := aggregateUsageRangeDB(ctx, s.db, userID, apiKeyID, windowStart, end, dimensions[i].Model, dimensions[i].ReasoningEffort)
+			if errAggregate != nil {
+				return nil, errAggregate
+			}
+			dimensions[i].Windows[spec.name] = buildUsageWindow(counters, spec.referenceTokens, usageAlertThreshold(cfg))
+		}
+	}
+	return dimensions, nil
+}
+
+func aggregateUsageDimensionsRange(ctx context.Context, queryer usageRowsQueryer, userID string, apiKeyID string, start time.Time, end time.Time) ([]UsageDimension, error) {
+	rows, err := queryer.QueryContext(ctx,
+		`SELECT
+			model,
+			reasoning_effort,
+			COALESCE(SUM(request_count), 0),
+			COALESCE(SUM(failed_request_count), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(reasoning_tokens), 0),
+			COALESCE(SUM(cached_input_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_creation_tokens), 0),
+			COALESCE(SUM(total_tokens), 0)
+		FROM usage_buckets
+		WHERE user_id = ? AND api_key_id = ? AND bucket_start >= ? AND bucket_start < ?
+		GROUP BY model, reasoning_effort
+		ORDER BY model ASC, reasoning_effort ASC`,
+		strings.TrimSpace(userID),
+		strings.TrimSpace(apiKeyID),
+		formatDBTime(start.UTC()),
+		formatDBTime(end.UTC()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate usage dimensions: %w", err)
+	}
+	defer rows.Close()
+
+	var dimensions []UsageDimension
+	for rows.Next() {
+		var dimension UsageDimension
+		if errScan := rows.Scan(
+			&dimension.Model,
+			&dimension.ReasoningEffort,
+			&dimension.RequestCount,
+			&dimension.FailedRequestCount,
+			&dimension.InputTokens,
+			&dimension.OutputTokens,
+			&dimension.ReasoningTokens,
+			&dimension.CachedInputTokens,
+			&dimension.CacheReadTokens,
+			&dimension.CacheCreationTokens,
+			&dimension.TotalTokens,
+		); errScan != nil {
+			return nil, fmt.Errorf("scan usage dimension: %w", errScan)
+		}
+		dimensions = append(dimensions, dimension)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("aggregate usage dimension rows: %w", err)
+	}
+	return dimensions, nil
+}
+
+func listUsageDimensionKeys(ctx context.Context, queryer usageRowsQueryer, userID string, apiKeyID string, start time.Time, end time.Time) ([]UsageDimension, error) {
+	rows, err := queryer.QueryContext(ctx,
+		`SELECT DISTINCT model, reasoning_effort
+		FROM usage_buckets
+		WHERE user_id = ? AND api_key_id = ? AND bucket_start >= ? AND bucket_start < ?
+		ORDER BY model ASC, reasoning_effort ASC`,
+		strings.TrimSpace(userID),
+		strings.TrimSpace(apiKeyID),
+		formatDBTime(start.UTC()),
+		formatDBTime(end.UTC()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list usage dimensions: %w", err)
+	}
+	defer rows.Close()
+
+	var dimensions []UsageDimension
+	for rows.Next() {
+		var dimension UsageDimension
+		if errScan := rows.Scan(&dimension.Model, &dimension.ReasoningEffort); errScan != nil {
+			return nil, fmt.Errorf("scan usage dimension key: %w", errScan)
+		}
+		dimensions = append(dimensions, dimension)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("list usage dimension rows: %w", err)
+	}
+	return dimensions, nil
 }
 
 func usageWindowSpecs(cfg UsageConfig) []usageWindowSpec {
@@ -579,6 +727,32 @@ func (c UsageCounters) normalized() UsageCounters {
 		c.TotalTokens = c.InputTokens + c.OutputTokens
 	}
 	return c
+}
+
+func (c UsageCounters) subtract(other UsageCounters) UsageCounters {
+	return UsageCounters{
+		RequestCount:        c.RequestCount - other.RequestCount,
+		FailedRequestCount:  c.FailedRequestCount - other.FailedRequestCount,
+		InputTokens:         c.InputTokens - other.InputTokens,
+		OutputTokens:        c.OutputTokens - other.OutputTokens,
+		ReasoningTokens:     c.ReasoningTokens - other.ReasoningTokens,
+		CachedInputTokens:   c.CachedInputTokens - other.CachedInputTokens,
+		CacheReadTokens:     c.CacheReadTokens - other.CacheReadTokens,
+		CacheCreationTokens: c.CacheCreationTokens - other.CacheCreationTokens,
+		TotalTokens:         c.TotalTokens - other.TotalTokens,
+	}
+}
+
+func (c UsageCounters) isZero() bool {
+	return c.RequestCount == 0 &&
+		c.FailedRequestCount == 0 &&
+		c.InputTokens == 0 &&
+		c.OutputTokens == 0 &&
+		c.ReasoningTokens == 0 &&
+		c.CachedInputTokens == 0 &&
+		c.CacheReadTokens == 0 &&
+		c.CacheCreationTokens == 0 &&
+		c.TotalTokens == 0
 }
 
 func extractUsageCounters(payload []byte) (UsageCounters, bool) {

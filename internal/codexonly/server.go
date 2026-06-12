@@ -615,7 +615,7 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 		s.proxyCodexWebSocket(w, r, route, authorization, auth)
 		return
 	}
-	model := captureProxyRequestModel(r)
+	metadata := captureProxyRequestUsageMetadata(r)
 	s.debugf(
 		"proxy upstream request method=%s path=%s target_scheme=%s target_host=%s target_path=%s websocket=%t allow_upstream_auth=%t auth_id=%s account_id_present=%t",
 		r.Method,
@@ -650,16 +650,17 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 			if s.shouldRecordUsage(authorization) {
 				capture := newUsageCaptureReadCloser(resp.Body, maxUsageCaptureBytes, func(payload []byte, truncated bool, counters UsageCounters, hasUsage bool) {
 					s.recordProxyUsageFromPayload(r.Context(), usageCaptureContext{
-						Authorization: authorization,
-						AuthID:        auth.ID,
-						Model:         model,
-						StatusCode:    resp.StatusCode,
-						RequestID:     usageRequestID(r, resp),
-						RetryAfter:    resp.Header.Get("Retry-After"),
-						Truncated:     truncated,
-						Payload:       payload,
-						Counters:      counters,
-						HasUsage:      hasUsage,
+						Authorization:   authorization,
+						AuthID:          auth.ID,
+						Model:           metadata.Model,
+						ReasoningEffort: metadata.ReasoningEffort,
+						StatusCode:      resp.StatusCode,
+						RequestID:       usageRequestID(r, resp),
+						RetryAfter:      resp.Header.Get("Retry-After"),
+						Truncated:       truncated,
+						Payload:         payload,
+						Counters:        counters,
+						HasUsage:        hasUsage,
 					})
 				})
 				resp.Body = capture
@@ -677,11 +678,12 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 			)
 			if s.shouldRecordUsage(authorization) {
 				s.recordProxyUsageFromPayload(req.Context(), usageCaptureContext{
-					Authorization: authorization,
-					AuthID:        auth.ID,
-					Model:         model,
-					StatusCode:    http.StatusBadGateway,
-					RequestID:     requestIDFromRequest(req),
+					Authorization:   authorization,
+					AuthID:          auth.ID,
+					Model:           metadata.Model,
+					ReasoningEffort: metadata.ReasoningEffort,
+					StatusCode:      http.StatusBadGateway,
+					RequestID:       requestIDFromRequest(req),
 				})
 			}
 			writeError(rw, http.StatusBadGateway, proxyErr.Error())
