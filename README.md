@@ -7,9 +7,6 @@ credentials stored on disk.
 
 Codex CLI is the primary target. The proxy also provides API-only managed-user
 endpoints and a small Responses-compatible public API surface for custom agents.
-It is not a complete OpenAI-compatible gateway: it does not implement a web UI,
-provider translation, SDK embedding, plugin hosting, Chat Completions, or raw
-Images API compatibility routes.
 
 ## Build
 
@@ -19,75 +16,45 @@ go build -o codex-oauth-proxy ./cmd/server
 
 ## Docker
 
-Build the local Docker image:
-
-```bash
-docker build -t codex-oauth-proxy:dev .
-```
-
-For Docker, set `host: "0.0.0.0"` in the mounted `config.yaml` so the
-published port can reach the server inside the container. For non-root
-deployments, also set `auth-dir: "/codex-oauth-proxy/auths"` and mount a
-writable host directory there.
-
-Run with a mounted config file and Codex auth directory:
-
 ```bash
 docker run --rm -p 8317:8317 \
   -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
   -v "$PWD/auths:/root/.codex" \
-  codex-oauth-proxy:dev
+  zendext/codex-oauth-proxy:latest
 ```
 
-To avoid root-owned auth and database files on the host, run the container with
-the host UID/GID and mount `auth-dir` outside `/root`:
-
 ```bash
-docker run --rm --user "$(id -u):$(id -g)" -p 8317:8317 \
-  -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
-  -v "$PWD/auths:/codex-oauth-proxy/auths" \
-  codex-oauth-proxy:dev
-```
-
-Or use Docker Compose:
-
-```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 ## Configure
 
 Create `config.yaml` from `config.example.yaml`.
 
-```yaml
-host: "127.0.0.1"
-port: 8317
-auth-dir: "~/.codex"
-debug: false
-admin-api-key: ""
-database:
-  path: ""
-usage:
-  enabled: true
-  five-hour-reference-tokens: 0
-  weekly-reference-tokens: 0
-  alert-threshold: 0.8
-  event-retention-days: 30
-  debug-openai-response: false
-proxy-url: ""
-request-retry: 3
-codex-base-url: "https://chatgpt.com/backend-api/codex"
-chatgpt-base-url: "https://chatgpt.com/backend-api"
-codex-user-agent: ""
-codex-beta-features: ""
-codex-refresh-token-url: ""
-```
+| Field | Default | Description |
+| --- | --- | --- |
+| `host` | `127.0.0.1` | Bind host. Use `0.0.0.0` in containers. |
+| `port` | `8317` | Bind port. |
+| `auth-dir` | `~/.codex` | Codex auth directory. Supports official `auth.json` and flat token JSON files. |
+| `debug` | `false` | Enable masked request/proxy debug logs. |
+| `admin-api-key` | empty | Enables `/v0/management` when set. |
+| `database.path` | empty | SQLite path. Empty resolves to `<auth-dir>/codex-oauth-proxy.db`. |
+| `usage.enabled` | `true` | Track per-user token usage for managed API keys. |
+| `usage.five-hour-reference-tokens` | `0` | Reference capacity for 5-hour usage ratios. |
+| `usage.weekly-reference-tokens` | `0` | Reference capacity for weekly usage ratios. |
+| `usage.alert-threshold` | `0.8` | Threshold-event ratio. |
+| `usage.event-retention-days` | `30` | Threshold-event retention. |
+| `usage.debug-openai-response` | `false` | Log safe usage metadata from upstream responses. |
+| `proxy-url` | empty | Optional outbound proxy. Use `direct` or `none` to bypass proxy settings. |
+| `request-retry` | `3` | Upstream retry attempts for retry-aware calls. |
+| `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Codex upstream base URL. |
+| `chatgpt-base-url` | `https://chatgpt.com/backend-api` | ChatGPT backend base URL for Codex compatibility calls. |
+| `codex-user-agent` | empty | Optional upstream User-Agent override. |
+| `codex-beta-features` | empty | Optional `x-codex-beta-features` fallback. |
+| `codex-refresh-token-url` | empty | Optional OAuth refresh endpoint override. |
 
-Auth files are read from `auth-dir`. By default the proxy can use the official
-Codex CLI `~/.codex/auth.json` file directly. It also supports flat JSON files
-with `type: "codex"`, `access_token`, and `refresh_token`. The server refreshes
-expired tokens automatically and writes the updated token fields back to the same
-file without changing the official Codex CLI file shape.
+Expired OAuth tokens are refreshed automatically and written back to the same
+auth file.
 
 Configure Codex CLI to use the proxy as a Responses provider. Use
 `supports_websockets = true` for realtime routes and
@@ -108,35 +75,18 @@ supports_websockets = true
 requires_openai_auth = false
 ```
 
-Set `admin-api-key` to enable API-only user management under `/v0/management`.
-Managed users and their generated API keys are stored in SQLite. If
-`database.path` is empty, the database is created at
-`<auth-dir>/codex-oauth-proxy.db`.
+Set `admin-api-key` to enable `/v0/management`. Generated user API keys
+authenticate proxy routes and `/v0/user`; set `COP_API_KEY` when running Codex
+through this proxy.
 
-Managed user API keys authenticate Codex proxy routes and `/v0/user`
-endpoints. Set `COP_API_KEY` to a generated managed user API key when running
-Codex through this proxy.
+Usage tracking stores 10-minute UTC buckets for managed user API keys. User
+totals are exposed at `/v0/user/usage/today`; management snapshots and threshold
+events are exposed at `/v0/management/usage` and
+`/v0/management/usage/events`.
 
-Usage tracking is enabled by default for proxy requests authenticated by managed
-user API keys. It stores 10-minute UTC buckets in the same SQLite database and
-exposes today's user totals at `/v0/user/usage/today`, plus management snapshots
-and threshold events at `/v0/management/usage` and
-`/v0/management/usage/events`. Backend compatibility routes that authenticate
-with the current upstream Codex OAuth access token, such as Codex file uploads,
-account/status calls, and hosted MCP pass-through, are not included in per-user
-usage totals.
-
-Set `debug: true` while diagnosing Codex Desktop or custom-provider setup. Debug
-logs show request arrival, route selection, token header sources, authentication
-decisions, upstream targets, upstream response status, and final response status.
-Full API keys, OAuth access tokens, and refresh tokens are not logged.
-Set both `debug: true` and `usage.debug-openai-response: true` for safe usage
-diagnostics that include request IDs, status, key metadata, auth ID, model, and
-token summaries without logging response bodies or WebSocket frame bodies.
-
-For Codex file uploads used by Apps/MCP tools, point Codex's ChatGPT backend URL
-at the proxy too. Codex also uses this backend URL to prefetch account rate-limit
-data for `/status`.
+Set `debug: true` for masked request/proxy logs. Add
+`usage.debug-openai-response: true` for request IDs, model, key metadata, and
+token summaries; secrets and response bodies are not logged.
 
 ## Run
 
@@ -223,25 +173,3 @@ Required GitHub repository secrets:
 
 Docker Hub image tags are published under `zendext/codex-oauth-proxy` with the
 release tag, semver aliases, and `latest`.
-
-Pull and run a published release. For this example, set
-`auth-dir: "/codex-oauth-proxy/auths"` in `config.yaml`.
-
-```bash
-docker pull zendext/codex-oauth-proxy:v0.1.0
-docker run --rm --user "$(id -u):$(id -g)" -p 8317:8317 \
-  -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
-  -v "$PWD/auths:/codex-oauth-proxy/auths" \
-  zendext/codex-oauth-proxy:v0.1.0
-```
-
-## Root Files
-
-The root directory is intentionally small:
-
-- `cmd/` and `internal/codexonly/` contain the server.
-- `config.example.yaml` documents the runtime configuration.
-- `Dockerfile`, `docker-compose.yml`, and `docker-build.*` are optional Docker
-  helpers.
-- `auths/.gitkeep` keeps a default local auth mount directory for Docker users.
-- `.github/workflows/release.yml` publishes tagged releases and Docker images.
