@@ -45,3 +45,6 @@ codex-user-agent: ""
 
 # Optional x-codex-beta-features fallback.
 codex-beta-features: ""
+
+# Optional Codex OAuth refresh token endpoint override.
+codex-refresh-token-url: ""

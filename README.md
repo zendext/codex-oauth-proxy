@@ -1,11 +1,15 @@
 # codex-oauth-proxy
 
-`codex-oauth-proxy` is a small local proxy for the Codex CLI. It forwards Codex
-CLI traffic to ChatGPT/Codex backend endpoints using existing Codex OAuth
+`codex-oauth-proxy` is a Codex OAuth-backed proxy for the Codex CLI and clients
+that can use the OpenAI Responses API wire format. It forwards supported Codex
+traffic to ChatGPT/Codex backend endpoints using existing Codex OAuth
 credentials stored on disk.
 
-It does not implement a web UI, provider translation, SDK embedding, plugin
-hosting, or non-Codex provider compatibility routes.
+Codex CLI is the primary target. The proxy also provides API-only managed-user
+endpoints and a small Responses-compatible public API surface for custom agents.
+It is not a complete OpenAI-compatible gateway: it does not implement a web UI,
+provider translation, SDK embedding, plugin hosting, Chat Completions, or raw
+Images API compatibility routes.
 
 ## Build
 
@@ -22,7 +26,9 @@ docker build -t codex-oauth-proxy:dev .
 ```
 
 For Docker, set `host: "0.0.0.0"` in the mounted `config.yaml` so the
-published port can reach the server inside the container.
+published port can reach the server inside the container. For non-root
+deployments, also set `auth-dir: "/codex-oauth-proxy/auths"` and mount a
+writable host directory there.
 
 Run with a mounted config file and Codex auth directory:
 
@@ -30,6 +36,16 @@ Run with a mounted config file and Codex auth directory:
 docker run --rm -p 8317:8317 \
   -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
   -v "$PWD/auths:/root/.codex" \
+  codex-oauth-proxy:dev
+```
+
+To avoid root-owned auth and database files on the host, run the container with
+the host UID/GID and mount `auth-dir` outside `/root`:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -p 8317:8317 \
+  -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
+  -v "$PWD/auths:/codex-oauth-proxy/auths" \
   codex-oauth-proxy:dev
 ```
 
@@ -59,8 +75,12 @@ usage:
   event-retention-days: 30
   debug-openai-response: false
 proxy-url: ""
+request-retry: 3
 codex-base-url: "https://chatgpt.com/backend-api/codex"
 chatgpt-base-url: "https://chatgpt.com/backend-api"
+codex-user-agent: ""
+codex-beta-features: ""
+codex-refresh-token-url: ""
 ```
 
 Auth files are read from `auth-dir`. By default the proxy can use the official
@@ -72,7 +92,8 @@ file without changing the official Codex CLI file shape.
 Configure Codex CLI to use the proxy as a Responses provider. Use
 `supports_websockets = true` for realtime routes and
 `requires_openai_auth = false` so Codex sends the managed user API key from
-`COP_API_KEY` to this proxy.
+`COP_API_KEY` to this proxy. The `chatgpt_base_url` value below is for Codex
+client compatibility only; `/backend-api/*` is not a public API surface.
 
 ```toml
 model_provider = "proxy"
@@ -100,8 +121,10 @@ Usage tracking is enabled by default for proxy requests authenticated by managed
 user API keys. It stores 10-minute UTC buckets in the same SQLite database and
 exposes today's user totals at `/v0/user/usage/today`, plus management snapshots
 and threshold events at `/v0/management/usage` and
-`/v0/management/usage/events`. Requests allowed only through upstream Codex
-access-token compatibility routes are not included in per-user usage totals.
+`/v0/management/usage/events`. Backend compatibility routes that authenticate
+with the current upstream Codex OAuth access token, such as Codex file uploads,
+account/status calls, and hosted MCP pass-through, are not included in per-user
+usage totals.
 
 Set `debug: true` while diagnosing Codex Desktop or custom-provider setup. Debug
 logs show request arrival, route selection, token header sources, authentication
@@ -121,8 +144,9 @@ data for `/status`.
 ./codex-oauth-proxy --config config.yaml
 ```
 
-Supported routes:
+Public API routes:
 
+- `GET /`
 - `GET /healthz`
 - `POST /v0/management/users`
 - `GET /v0/management/users`
@@ -139,28 +163,14 @@ Supported routes:
 - `GET /v1/responses`
 - `POST /v1/responses/compact`
 - `POST /v1/alpha/search`
-- `POST /v1/images/generations`
-- `POST /v1/images/edits`
 - `POST /v1/memories/trace_summarize`
 - `POST /v1/realtime/calls`
 - `GET /v1/realtime`
-- `POST /backend-api/codex/responses`
-- `GET /backend-api/codex/responses`
-- `POST /backend-api/codex/responses/compact`
-- `POST /backend-api/codex/alpha/search`
-- `POST /backend-api/codex/images/generations`
-- `POST /backend-api/codex/images/edits`
-- `POST /backend-api/codex/memories/trace_summarize`
-- `POST /backend-api/codex/realtime/calls`
-- `GET /backend-api/codex/realtime`
-- `POST /backend-api/files`
-- `POST /backend-api/files/{file_id}/uploaded`
-- `/backend-api/wham/apps` for legacy Codex Apps MCP streamable HTTP
-- `/backend-api/ps/mcp` for hosted plugin-runtime MCP streamable HTTP
-- `GET /backend-api/wham/usage`
-- `GET /backend-api/wham/profiles/me`
-- `GET /backend-api/wham/accounts/check`
-- `POST /backend-api/wham/accounts/send_add_credits_nudge_email`
+
+Image generation is available only through `/v1/responses` by using the upstream
+Responses API `image_generation` tool, normally with `stream: true`. Raw
+`/v1/images/*` and `/backend-api/*` endpoints are not public API and should not
+be used by general clients.
 
 Protected proxy routes require a managed user API key:
 
@@ -214,13 +224,14 @@ Required GitHub repository secrets:
 Docker Hub image tags are published under `zendext/codex-oauth-proxy` with the
 release tag, semver aliases, and `latest`.
 
-Pull and run a published release:
+Pull and run a published release. For this example, set
+`auth-dir: "/codex-oauth-proxy/auths"` in `config.yaml`.
 
 ```bash
 docker pull zendext/codex-oauth-proxy:v0.1.0
-docker run --rm -p 8317:8317 \
+docker run --rm --user "$(id -u):$(id -g)" -p 8317:8317 \
   -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
-  -v "$PWD/auths:/root/.codex" \
+  -v "$PWD/auths:/codex-oauth-proxy/auths" \
   zendext/codex-oauth-proxy:v0.1.0
 ```
 
