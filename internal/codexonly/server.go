@@ -648,7 +648,7 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 				route.targetPath,
 			)
 			if s.shouldRecordUsage(authorization) {
-				capture := newUsageCaptureReadCloser(resp.Body, maxUsageCaptureBytes, func(payload []byte, truncated bool) {
+				capture := newUsageCaptureReadCloser(resp.Body, maxUsageCaptureBytes, func(payload []byte, truncated bool, counters UsageCounters, hasUsage bool) {
 					s.recordProxyUsageFromPayload(r.Context(), usageCaptureContext{
 						Authorization: authorization,
 						AuthID:        auth.ID,
@@ -658,6 +658,8 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 						RetryAfter:    resp.Header.Get("Retry-After"),
 						Truncated:     truncated,
 						Payload:       payload,
+						Counters:      counters,
+						HasUsage:      hasUsage,
 					})
 				})
 				resp.Body = capture

@@ -16,7 +16,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const maxUsageCaptureBytes = 2 << 20
+const (
+	maxUsageCaptureBytes     = 2 << 20
+	maxUsageCaptureLineBytes = 1 << 20
+)
 
 type usageCaptureContext struct {
 	Authorization proxyAuthorization
@@ -36,11 +39,15 @@ type usageCaptureReadCloser struct {
 	limit     int
 	buf       bytes.Buffer
 	truncated bool
-	finish    func([]byte, bool)
+	lineBuf   bytes.Buffer
+	lineSkip  bool
+	counters  UsageCounters
+	hasUsage  bool
+	finish    func([]byte, bool, UsageCounters, bool)
 	once      sync.Once
 }
 
-func newUsageCaptureReadCloser(body io.ReadCloser, limit int, finish func([]byte, bool)) *usageCaptureReadCloser {
+func newUsageCaptureReadCloser(body io.ReadCloser, limit int, finish func([]byte, bool, UsageCounters, bool)) *usageCaptureReadCloser {
 	return &usageCaptureReadCloser{
 		body:   body,
 		limit:  limit,
@@ -66,10 +73,12 @@ func (c *usageCaptureReadCloser) Close() error {
 }
 
 func (c *usageCaptureReadCloser) capture(chunk []byte) {
-	if c.limit <= 0 || len(chunk) == 0 || c.buf.Len() >= c.limit {
-		if len(chunk) > 0 {
-			c.truncated = true
-		}
+	if len(chunk) == 0 {
+		return
+	}
+	c.captureUsageLines(chunk)
+	if c.limit <= 0 || c.buf.Len() >= c.limit {
+		c.truncated = true
 		return
 	}
 	remaining := c.limit - c.buf.Len()
@@ -83,10 +92,64 @@ func (c *usageCaptureReadCloser) capture(chunk []byte) {
 
 func (c *usageCaptureReadCloser) finishOnce() {
 	c.once.Do(func() {
+		c.flushUsageLine()
 		if c.finish != nil {
-			c.finish(c.buf.Bytes(), c.truncated)
+			c.finish(c.buf.Bytes(), c.truncated, c.counters, c.hasUsage)
 		}
 	})
+}
+
+func (c *usageCaptureReadCloser) captureUsageLines(chunk []byte) {
+	for len(chunk) > 0 {
+		newline := bytes.IndexByte(chunk, '\n')
+		if newline < 0 {
+			c.appendUsageLine(chunk)
+			return
+		}
+		c.appendUsageLine(chunk[:newline])
+		c.flushUsageLine()
+		chunk = chunk[newline+1:]
+	}
+}
+
+func (c *usageCaptureReadCloser) appendUsageLine(part []byte) {
+	if c.lineSkip {
+		return
+	}
+	if c.lineBuf.Len()+len(part) > maxUsageCaptureLineBytes {
+		c.lineBuf.Reset()
+		c.lineSkip = true
+		return
+	}
+	_, _ = c.lineBuf.Write(part)
+}
+
+func (c *usageCaptureReadCloser) flushUsageLine() {
+	if c.lineSkip {
+		c.lineBuf.Reset()
+		c.lineSkip = false
+		return
+	}
+	line := bytes.TrimSpace(c.lineBuf.Bytes())
+	c.lineBuf.Reset()
+	if len(line) == 0 {
+		return
+	}
+	if bytes.HasPrefix(line, []byte("data:")) {
+		line = bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+	} else if !bytes.HasPrefix(line, []byte("{")) && !bytes.HasPrefix(line, []byte("[")) {
+		return
+	}
+	if bytes.Equal(line, []byte("[DONE]")) {
+		return
+	}
+	if !bytes.Contains(line, []byte(`"usage"`)) {
+		return
+	}
+	if counters, ok := extractUsageCounters(line); ok {
+		c.counters = counters
+		c.hasUsage = true
+	}
 }
 
 func (s *Server) shouldRecordUsage(authorization proxyAuthorization) bool {
@@ -100,9 +163,11 @@ func (s *Server) recordProxyUsageFromPayload(_ context.Context, capture usageCap
 	if !s.shouldRecordUsage(capture.Authorization) {
 		return
 	}
-	counters, hasUsage := extractUsageCounters(capture.Payload)
-	capture.Counters = counters
-	capture.HasUsage = hasUsage
+	if !capture.HasUsage {
+		counters, hasUsage := extractUsageCounters(capture.Payload)
+		capture.Counters = counters
+		capture.HasUsage = hasUsage
+	}
 	s.recordProxyUsage(capture)
 }
 
@@ -306,9 +371,24 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 	}
 	defer clientConn.Close()
 
-	var counters UsageCounters
-	var hasUsage bool
-	var countersMu sync.Mutex
+	var recordedUsage bool
+	var recordedUsageMu sync.Mutex
+	recordWebSocketUsage := func(counters UsageCounters) {
+		recordedUsageMu.Lock()
+		recordedUsage = true
+		recordedUsageMu.Unlock()
+		if s.shouldRecordUsage(authorization) {
+			s.recordProxyUsage(usageCaptureContext{
+				Authorization: authorization,
+				AuthID:        auth.ID,
+				Model:         model,
+				StatusCode:    http.StatusSwitchingProtocols,
+				RequestID:     requestIDFromRequest(r),
+				Counters:      counters,
+				HasUsage:      true,
+			})
+		}
+	}
 	done := make(chan struct{}, 2)
 	var closeOnce sync.Once
 	closeBoth := func() {
@@ -335,30 +415,24 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 				return
 			}
 			if extracted, ok := extractUsageCounters(payload); ok {
-				countersMu.Lock()
-				counters = extracted
-				hasUsage = true
-				countersMu.Unlock()
+				recordWebSocketUsage(extracted)
 			}
 		})
 	}()
 	<-done
 	<-done
 
-	countersMu.Lock()
-	captureCounters := counters
-	captureHasUsage := hasUsage
-	countersMu.Unlock()
+	recordedUsageMu.Lock()
+	captureHasUsage := recordedUsage
+	recordedUsageMu.Unlock()
 
-	if s.shouldRecordUsage(authorization) {
+	if s.shouldRecordUsage(authorization) && !captureHasUsage {
 		s.recordProxyUsage(usageCaptureContext{
 			Authorization: authorization,
 			AuthID:        auth.ID,
 			Model:         model,
 			StatusCode:    http.StatusSwitchingProtocols,
 			RequestID:     requestIDFromRequest(r),
-			Counters:      captureCounters,
-			HasUsage:      captureHasUsage,
 		})
 	}
 }

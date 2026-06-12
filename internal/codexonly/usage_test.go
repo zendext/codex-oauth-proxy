@@ -296,6 +296,47 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 	}
 }
 
+func TestServerRecordsLongSSEUsageBeyondCaptureLimit(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"account_id": "acct_1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		longDelta := strings.Repeat("x", maxUsageCaptureBytes+1024)
+		_, _ = fmt.Fprintf(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":%q}\n\n", longDelta)
+		_, _ = w.Write([]byte(`event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16}}}
+
+`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:      authDir,
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL: upstream.URL + "/backend-api/codex",
+		RequestRetry: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	created := createManagedUser(t, handler, "admin-key", "Alice")
+
+	proxyResp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.3-codex","input":"hello"}`, created.PlaintextAPIKey)
+	if proxyResp.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200, body: %s", proxyResp.Code, proxyResp.Body.String())
+	}
+
+	waitForUsageTotal(t, handler, created.PlaintextAPIKey, 16)
+}
+
 func TestManagementUsageEventsRejectsNonPositiveCount(t *testing.T) {
 	handler := newUserManagementTestHandler(t, &Config{AdminAPIKey: "admin-key"})
 
@@ -305,7 +346,7 @@ func TestManagementUsageEventsRejectsNonPositiveCount(t *testing.T) {
 	}
 }
 
-func TestServerRecordsWebSocketUsageAndProxiesFrames(t *testing.T) {
+func TestServerRecordsMultipleWebSocketUsageFramesAndProxiesFrames(t *testing.T) {
 	authDir := t.TempDir()
 	writeAuthFile(t, authDir, "codex.json", `{
 		"type": "codex",
@@ -336,9 +377,15 @@ func TestServerRecordsWebSocketUsageAndProxiesFrames(t *testing.T) {
 			t.Errorf("upstream echo failed: %v", err)
 			return
 		}
-		usageFrame := []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":6,"total_tokens":13}}}`)
-		if err = conn.WriteMessage(websocket.TextMessage, usageFrame); err != nil {
-			t.Errorf("upstream usage write failed: %v", err)
+		usageFrames := [][]byte{
+			[]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":6,"total_tokens":13}}}`),
+			[]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":7,"total_tokens":17}}}`),
+		}
+		for _, usageFrame := range usageFrames {
+			if err = conn.WriteMessage(websocket.TextMessage, usageFrame); err != nil {
+				t.Errorf("upstream usage write failed: %v", err)
+				return
+			}
 		}
 	}))
 	defer upstream.Close()
@@ -374,18 +421,20 @@ func TestServerRecordsWebSocketUsageAndProxiesFrames(t *testing.T) {
 	if string(echo) != `{"type":"client.ping"}` {
 		t.Fatalf("echo frame = %q, want client ping", string(echo))
 	}
-	_, usageFrame, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read usage websocket: %v", err)
-	}
-	if !strings.Contains(string(usageFrame), "response.completed") {
-		t.Fatalf("usage frame = %q, want response.completed", string(usageFrame))
+	for i := 0; i < 2; i++ {
+		_, usageFrame, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read usage websocket #%d: %v", i+1, err)
+		}
+		if !strings.Contains(string(usageFrame), "response.completed") {
+			t.Fatalf("usage frame #%d = %q, want response.completed", i+1, string(usageFrame))
+		}
 	}
 	if err = conn.Close(); err != nil {
 		t.Fatalf("close websocket: %v", err)
 	}
 
-	waitForUsageTotal(t, handler, created.PlaintextAPIKey, 13)
+	waitForUsageTotal(t, handler, created.PlaintextAPIKey, 30)
 
 	if sawAuthorization != "Bearer access-1" {
 		t.Fatalf("upstream Authorization = %q, want Bearer access-1", sawAuthorization)
