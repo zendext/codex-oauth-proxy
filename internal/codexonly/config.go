@@ -24,6 +24,7 @@ type Config struct {
 	Debug                bool           `yaml:"debug"`
 	AdminAPIKey          string         `yaml:"admin-api-key"`
 	Database             DatabaseConfig `yaml:"database"`
+	Usage                UsageConfig    `yaml:"usage"`
 	ProxyURL             string         `yaml:"proxy-url"`
 	RequestRetry         int            `yaml:"request-retry"`
 	CodexBaseURL         string         `yaml:"codex-base-url"`
@@ -35,6 +36,15 @@ type Config struct {
 
 type DatabaseConfig struct {
 	Path string `yaml:"path"`
+}
+
+type UsageConfig struct {
+	Enabled                 *bool   `yaml:"enabled"`
+	FiveHourReferenceTokens int64   `yaml:"five-hour-reference-tokens"`
+	WeeklyReferenceTokens   int64   `yaml:"weekly-reference-tokens"`
+	AlertThreshold          float64 `yaml:"alert-threshold"`
+	EventRetentionDays      int     `yaml:"event-retention-days"`
+	DebugOpenAIResponse     bool    `yaml:"debug-openai-response"`
 }
 
 func LoadConfig(path string) (*Config, error) {

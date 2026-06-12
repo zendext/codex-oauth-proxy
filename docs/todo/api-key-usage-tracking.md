@@ -1,5 +1,11 @@
 # API Key Usage Tracking TODO
 
+Status: implemented.
+
+Implemented coverage includes managed-user usage buckets, today's user usage
+API, management usage snapshots, threshold events, HTTP/SSE usage extraction,
+WebSocket text-frame usage extraction, and safe debug diagnostics.
+
 ## Goal
 
 Track Codex OAuth proxy usage by stored user API key after the User and API Key

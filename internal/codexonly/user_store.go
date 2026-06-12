@@ -137,6 +137,62 @@ func (s *UserStore) migrate(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_one_active_per_user
 			ON api_keys(user_id) WHERE enabled = 1`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)`,
+		`CREATE TABLE IF NOT EXISTS usage_buckets (
+			bucket_start TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			api_key_id TEXT NOT NULL,
+			key_hash TEXT NOT NULL,
+			masked_key TEXT NOT NULL,
+			model TEXT NOT NULL,
+			auth_id TEXT NOT NULL,
+			request_count INTEGER NOT NULL DEFAULT 0,
+			failed_request_count INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (bucket_start, user_id, api_key_id, model, auth_id),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_user_key_time
+			ON usage_buckets(user_id, api_key_id, bucket_start)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_time ON usage_buckets(bucket_start)`,
+		`CREATE TABLE IF NOT EXISTS usage_threshold_state (
+			window TEXT NOT NULL,
+			api_key_id TEXT NOT NULL,
+			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (window, api_key_id),
+			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS usage_threshold_events (
+			id TEXT PRIMARY KEY,
+			timestamp TEXT NOT NULL,
+			window TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			api_key_id TEXT NOT NULL,
+			key_hash TEXT NOT NULL,
+			masked_key TEXT NOT NULL,
+			ratio REAL NOT NULL,
+			threshold REAL NOT NULL,
+			total_tokens INTEGER NOT NULL,
+			reference_tokens INTEGER NOT NULL,
+			request_count INTEGER NOT NULL,
+			failed_request_count INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			auth_id TEXT NOT NULL,
+			request_id TEXT NOT NULL,
+			diagnostics TEXT NOT NULL,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_threshold_events_time
+			ON usage_threshold_events(timestamp)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {

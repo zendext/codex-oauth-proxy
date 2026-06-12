@@ -19,6 +19,15 @@ admin-api-key: ""
 database:
   path: ""
 
+# Local usage accounting for managed user API keys.
+usage:
+  enabled: true
+  five-hour-reference-tokens: 0
+  weekly-reference-tokens: 0
+  alert-threshold: 0.8
+  event-retention-days: 30
+  debug-openai-response: false
+
 # Optional outbound proxy. Use "direct" or "none" to bypass proxy settings.
 proxy-url: ""
 

@@ -25,6 +25,13 @@ debug: false
 admin-api-key: ""
 database:
   path: ""
+usage:
+  enabled: true
+  five-hour-reference-tokens: 0
+  weekly-reference-tokens: 0
+  alert-threshold: 0.8
+  event-retention-days: 30
+  debug-openai-response: false
 proxy-url: ""
 codex-base-url: "https://chatgpt.com/backend-api/codex"
 chatgpt-base-url: "https://chatgpt.com/backend-api"
@@ -63,10 +70,20 @@ Managed user API keys authenticate Codex proxy routes and `/v0/user`
 endpoints. Set `COP_API_KEY` to a generated managed user API key when running
 Codex through this proxy.
 
+Usage tracking is enabled by default for proxy requests authenticated by managed
+user API keys. It stores 10-minute UTC buckets in the same SQLite database and
+exposes today's user totals at `/v0/user/usage/today`, plus management snapshots
+and threshold events at `/v0/management/usage` and
+`/v0/management/usage/events`. Requests allowed only through upstream Codex
+access-token compatibility routes are not included in per-user usage totals.
+
 Set `debug: true` while diagnosing Codex Desktop or custom-provider setup. Debug
 logs show request arrival, route selection, token header sources, authentication
 decisions, upstream targets, upstream response status, and final response status.
 Full API keys, OAuth access tokens, and refresh tokens are not logged.
+Set both `debug: true` and `usage.debug-openai-response: true` for safe usage
+diagnostics that include request IDs, status, key metadata, auth ID, model, and
+token summaries without logging response bodies or WebSocket frame bodies.
 
 For Codex file uploads used by Apps/MCP tools, point Codex's ChatGPT backend URL
 at the proxy too. Codex also uses this backend URL to prefetch account rate-limit
@@ -86,8 +103,11 @@ Supported routes:
 - `GET /v0/management/users/{user_id}`
 - `PATCH /v0/management/users/{user_id}`
 - `POST /v0/management/users/{user_id}/api-key/reset`
+- `GET /v0/management/usage`
+- `GET /v0/management/usage/events`
 - `GET /v0/user/api-key`
 - `POST /v0/user/api-key/reset`
+- `GET /v0/user/usage/today`
 - `GET /v1/models`
 - `POST /v1/responses`
 - `GET /v1/responses`

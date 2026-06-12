@@ -94,6 +94,10 @@ type upstreamRoute struct {
 	allowUpstreamAuth  bool
 }
 
+type proxyAuthorization struct {
+	Credential *AuthenticatedAPIKey
+}
+
 func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
 	if cfg == nil {
 		cfg = &Config{}
@@ -242,17 +246,18 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 		)
 		s.handleUserAPI(w, r, credential)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
-		if err := s.authorizeProxy(r, false); err != nil {
+		if _, err := s.authorizeProxy(r, false); err != nil {
 			writeAuthError(w, err)
 			return
 		}
 		s.handleModels(w, r)
 	case routeOK:
-		if err := s.authorizeProxy(r, route.allowUpstreamAuth); err != nil {
+		authorization, err := s.authorizeProxy(r, route.allowUpstreamAuth)
+		if err != nil {
 			writeAuthError(w, err)
 			return
 		}
-		s.proxyCodex(w, r, route)
+		s.proxyCodex(w, r, route, authorization)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
@@ -299,7 +304,7 @@ func (s *Server) authenticateUserAPIKeyFromTokens(ctx context.Context, tokens []
 	return AuthenticatedAPIKey{}, ErrInvalidAPIKey
 }
 
-func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) error {
+func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) (proxyAuthorization, error) {
 	tokens := candidateProxyTokens(r)
 	if credential, err := s.authenticateUserAPIKeyFromTokens(r.Context(), tokens); err == nil {
 		s.debugf(
@@ -310,7 +315,7 @@ func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) error {
 			credential.APIKey.ID,
 			tokenSourceSummary(r),
 		)
-		return nil
+		return proxyAuthorization{Credential: &credential}, nil
 	} else if errors.Is(err, ErrDisabledCredential) {
 		s.debugf(
 			"proxy auth failed method=%s path=%s reason=disabled_credential token_sources=%s",
@@ -318,7 +323,7 @@ func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) error {
 			r.URL.Path,
 			tokenSourceSummary(r),
 		)
-		return err
+		return proxyAuthorization{}, err
 	}
 	if allowUpstreamAuth && s.matchesCurrentCodexAccessToken(r.Context(), tokens) {
 		s.debugf(
@@ -327,7 +332,7 @@ func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) error {
 			r.URL.Path,
 			tokenSourceSummary(r),
 		)
-		return nil
+		return proxyAuthorization{}, nil
 	}
 	s.debugf(
 		"proxy auth failed method=%s path=%s reason=invalid_api_key allow_upstream_auth=%t token_sources=%s",
@@ -336,7 +341,7 @@ func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) error {
 		allowUpstreamAuth,
 		tokenSourceSummary(r),
 	)
-	return ErrInvalidAPIKey
+	return proxyAuthorization{}, ErrInvalidAPIKey
 }
 
 func (s *Server) matchesCurrentCodexAccessToken(ctx context.Context, tokens []string) bool {
@@ -395,6 +400,33 @@ type updateUserRequest struct {
 func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v0/management")
 	switch {
+	case path == "/usage" && r.Method == http.MethodGet:
+		filter := UsageSnapshotFilter{
+			UserID:   strings.TrimSpace(r.URL.Query().Get("user_id")),
+			APIKeyID: strings.TrimSpace(r.URL.Query().Get("api_key_id")),
+		}
+		usage, err := s.users.GetUsageSnapshot(r.Context(), filter, time.Now().UTC(), s.cfg.Usage)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"usage": usage})
+	case path == "/usage/events" && r.Method == http.MethodGet:
+		count := 100
+		if raw := strings.TrimSpace(r.URL.Query().Get("count")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid count")
+				return
+			}
+			count = parsed
+		}
+		events, err := s.users.ListUsageEvents(r.Context(), count)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": events})
 	case path == "/users" && r.Method == http.MethodPost:
 		var req createUserRequest
 		if !decodeJSONRequest(w, r, &req) {
@@ -482,6 +514,13 @@ func (s *Server) handleUserAPI(w http.ResponseWriter, r *http.Request, credentia
 			return
 		}
 		writeJSON(w, http.StatusOK, created)
+	case r.URL.Path == "/v0/user/usage/today" && r.Method == http.MethodGet:
+		usage, err := s.users.GetTodayUsage(r.Context(), credential.User.ID, credential.APIKey.ID, time.Now().UTC())
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, usage)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
@@ -565,13 +604,18 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute) {
+func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization) {
 	auth, err := s.auths.Select(r.Context())
 	if err != nil {
 		s.debugf("proxy upstream auth unavailable method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	if route.responsesWebsocket && websocketRequested(r) {
+		s.proxyCodexWebSocket(w, r, route, authorization, auth)
+		return
+	}
+	model := captureProxyRequestModel(r)
 	s.debugf(
 		"proxy upstream request method=%s path=%s target_scheme=%s target_host=%s target_path=%s websocket=%t allow_upstream_auth=%t auth_id=%s account_id_present=%t",
 		r.Method,
@@ -603,6 +647,21 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 				route.baseURL.Host,
 				route.targetPath,
 			)
+			if s.shouldRecordUsage(authorization) {
+				capture := newUsageCaptureReadCloser(resp.Body, maxUsageCaptureBytes, func(payload []byte, truncated bool) {
+					s.recordProxyUsageFromPayload(r.Context(), usageCaptureContext{
+						Authorization: authorization,
+						AuthID:        auth.ID,
+						Model:         model,
+						StatusCode:    resp.StatusCode,
+						RequestID:     usageRequestID(r, resp),
+						RetryAfter:    resp.Header.Get("Retry-After"),
+						Truncated:     truncated,
+						Payload:       payload,
+					})
+				})
+				resp.Body = capture
+			}
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
@@ -614,6 +673,15 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 				route.targetPath,
 				proxyErr.Error(),
 			)
+			if s.shouldRecordUsage(authorization) {
+				s.recordProxyUsageFromPayload(req.Context(), usageCaptureContext{
+					Authorization: authorization,
+					AuthID:        auth.ID,
+					Model:         model,
+					StatusCode:    http.StatusBadGateway,
+					RequestID:     requestIDFromRequest(req),
+				})
+			}
 			writeError(rw, http.StatusBadGateway, proxyErr.Error())
 		},
 	}
