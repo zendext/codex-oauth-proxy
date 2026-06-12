@@ -173,3 +173,7 @@ Required GitHub repository secrets:
 
 Docker Hub image tags are published under `zendext/codex-oauth-proxy` with the
 release tag, semver aliases, and `latest`.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

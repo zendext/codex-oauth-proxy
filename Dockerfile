@@ -27,6 +27,7 @@ ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.title="codex-oauth-proxy" \
       org.opencontainers.image.description="Local Codex OAuth proxy for Codex CLI traffic" \
       org.opencontainers.image.source="https://github.com/zendext/codex-oauth-proxy" \
+      org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILD_DATE}"
