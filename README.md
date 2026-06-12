@@ -13,6 +13,32 @@ hosting, or non-Codex provider compatibility routes.
 go build -o codex-oauth-proxy ./cmd/server
 ```
 
+## Docker
+
+Build the local Docker image:
+
+```bash
+docker build -t codex-oauth-proxy:dev .
+```
+
+For Docker, set `host: "0.0.0.0"` in the mounted `config.yaml` so the
+published port can reach the server inside the container.
+
+Run with a mounted config file and Codex auth directory:
+
+```bash
+docker run --rm -p 8317:8317 \
+  -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
+  -v "$PWD/auths:/root/.codex" \
+  codex-oauth-proxy:dev
+```
+
+Or use Docker Compose:
+
+```bash
+docker compose up -d --build
+```
+
 ## Configure
 
 Create `config.yaml` from `config.example.yaml`.
@@ -163,6 +189,41 @@ go test ./...
 go build -o test-output ./cmd/server && rm test-output
 ```
 
+## Release
+
+Pushing a version tag that starts with `v` runs
+`.github/workflows/release.yml`.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow:
+
+- runs `go test -count=1 ./...`
+- builds `codex-oauth-proxy-linux-amd64`
+- uploads the binary and its SHA-256 file to the GitHub Release
+- builds and pushes a `linux/amd64` Docker image to Docker Hub
+
+Required GitHub repository secrets:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+Docker Hub image tags are published under `zendext/codex-oauth-proxy` with the
+release tag, semver aliases, and `latest`.
+
+Pull and run a published release:
+
+```bash
+docker pull zendext/codex-oauth-proxy:v0.1.0
+docker run --rm -p 8317:8317 \
+  -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
+  -v "$PWD/auths:/root/.codex" \
+  zendext/codex-oauth-proxy:v0.1.0
+```
+
 ## Root Files
 
 The root directory is intentionally small:
@@ -172,4 +233,4 @@ The root directory is intentionally small:
 - `Dockerfile`, `docker-compose.yml`, and `docker-build.*` are optional Docker
   helpers.
 - `auths/.gitkeep` keeps a default local auth mount directory for Docker users.
-- `.github/workflows/pr-test-build.yml` runs the minimal Go CI check.
+- `.github/workflows/release.yml` publishes tagged releases and Docker images.
