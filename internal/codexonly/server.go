@@ -6,11 +6,13 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -74,6 +76,7 @@ func (m *AuthManager) Select(ctx context.Context) (*Auth, error) {
 type Server struct {
 	cfg            *Config
 	auths          *AuthManager
+	users          *UserStore
 	httpClient     *http.Client
 	baseURL        *url.URL
 	chatGPTBaseURL *url.URL
@@ -130,9 +133,19 @@ func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
 	if _, err = manager.Store.Load(ctx); err != nil {
 		return nil, err
 	}
+	databasePath, err := ResolveDatabasePath(cfg.Database.Path, cfg.AuthDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Database.Path = databasePath
+	userStore, err := OpenUserStore(ctx, cfg.Database.Path)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		cfg:            cfg,
 		auths:          manager,
+		users:          userStore,
 		httpClient:     client,
 		baseURL:        upstream,
 		chatGPTBaseURL: chatGPTUpstream,
@@ -146,15 +159,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	case r.URL.Path == "/":
 		writeJSON(w, http.StatusOK, map[string]any{"message": "codex-oauth-proxy"})
+	case strings.HasPrefix(r.URL.Path, "/v0/management/"):
+		if !s.managementAPIEnabled() {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !s.authorizedAdmin(r) {
+			writeError(w, http.StatusUnauthorized, "invalid admin API key")
+			return
+		}
+		s.handleManagement(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v0/user/"):
+		credential, err := s.authenticateUserAPIKey(r)
+		if err != nil {
+			writeAuthError(w, err)
+			return
+		}
+		s.handleUserAPI(w, r, credential)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
-		if !s.authorized(r, false) {
-			writeError(w, http.StatusUnauthorized, "invalid API key")
+		if err := s.authorizeProxy(r, false); err != nil {
+			writeAuthError(w, err)
 			return
 		}
 		s.handleModels(w, r)
 	case routeOK:
-		if !s.authorized(r, route.allowUpstreamAuth) {
-			writeError(w, http.StatusUnauthorized, "invalid API key")
+		if err := s.authorizeProxy(r, route.allowUpstreamAuth); err != nil {
+			writeAuthError(w, err)
 			return
 		}
 		s.proxyCodex(w, r, route)
@@ -163,11 +193,70 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) authorized(r *http.Request, allowUpstreamAuth bool) bool {
+func (s *Server) managementAPIEnabled() bool {
+	return s != nil && s.cfg != nil && strings.TrimSpace(s.cfg.AdminAPIKey) != ""
+}
+
+func (s *Server) authorizedAdmin(r *http.Request) bool {
+	if !s.managementAPIEnabled() {
+		return false
+	}
+	adminKey := strings.TrimSpace(s.cfg.AdminAPIKey)
+	for _, token := range candidateProxyTokens(r) {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(adminKey)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) authenticateUserAPIKey(r *http.Request) (AuthenticatedAPIKey, error) {
+	return s.authenticateUserAPIKeyFromTokens(r.Context(), candidateProxyTokens(r))
+}
+
+func (s *Server) authenticateUserAPIKeyFromTokens(ctx context.Context, tokens []string) (AuthenticatedAPIKey, error) {
+	if s == nil || s.users == nil {
+		return AuthenticatedAPIKey{}, ErrInvalidAPIKey
+	}
+	var disabledErr error
+	for _, token := range tokens {
+		credential, err := s.users.AuthenticateAPIKey(ctx, token)
+		if err == nil {
+			return credential, nil
+		}
+		if errors.Is(err, ErrDisabledCredential) {
+			disabledErr = err
+		}
+	}
+	if disabledErr != nil {
+		return AuthenticatedAPIKey{}, disabledErr
+	}
+	return AuthenticatedAPIKey{}, ErrInvalidAPIKey
+}
+
+func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) error {
 	if s == nil || s.cfg == nil || len(s.cfg.APIKeys) == 0 {
-		return true
+		return nil
 	}
 	tokens := candidateProxyTokens(r)
+	if s.staticProxyKeyMatches(tokens) {
+		return nil
+	}
+	if _, err := s.authenticateUserAPIKeyFromTokens(r.Context(), tokens); err == nil {
+		return nil
+	} else if errors.Is(err, ErrDisabledCredential) {
+		return err
+	}
+	if allowUpstreamAuth && s.matchesCurrentCodexAccessToken(r.Context(), tokens) {
+		return nil
+	}
+	return ErrInvalidAPIKey
+}
+
+func (s *Server) staticProxyKeyMatches(tokens []string) bool {
+	if s == nil || s.cfg == nil {
+		return false
+	}
 	for _, key := range s.cfg.APIKeys {
 		key = strings.TrimSpace(key)
 		if key == "" {
@@ -178,9 +267,6 @@ func (s *Server) authorized(r *http.Request, allowUpstreamAuth bool) bool {
 				return true
 			}
 		}
-	}
-	if allowUpstreamAuth && s.matchesCurrentCodexAccessToken(r.Context(), tokens) {
-		return true
 	}
 	return false
 }
@@ -226,6 +312,162 @@ func candidateProxyTokens(r *http.Request) []string {
 		tokens = append(tokens, apiKey)
 	}
 	return tokens
+}
+
+type createUserRequest struct {
+	Name    string `json:"name"`
+	Enabled *bool  `json:"enabled"`
+}
+
+type updateUserRequest struct {
+	Name    *string `json:"name"`
+	Enabled *bool   `json:"enabled"`
+}
+
+func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/v0/management")
+	switch {
+	case path == "/users" && r.Method == http.MethodPost:
+		var req createUserRequest
+		if !decodeJSONRequest(w, r, &req) {
+			return
+		}
+		created, err := s.users.CreateUser(r.Context(), CreateUserParams{Name: req.Name, Enabled: req.Enabled})
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	case path == "/users" && r.Method == http.MethodGet:
+		enabled, ok := enabledFilter(w, r)
+		if !ok {
+			return
+		}
+		users, err := s.users.ListUsers(r.Context(), enabled)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"users": users})
+	case strings.HasPrefix(path, "/users/"):
+		s.handleManagementUser(w, r, strings.TrimPrefix(path, "/users/"))
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *Server) handleManagementUser(w http.ResponseWriter, r *http.Request, suffix string) {
+	if strings.HasSuffix(suffix, "/api-key/reset") {
+		userID := strings.TrimSuffix(suffix, "/api-key/reset")
+		if userID == "" || strings.Contains(userID, "/") {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		created, err := s.users.ResetUserAPIKey(r.Context(), userID)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, created)
+		return
+	}
+	if suffix == "" || strings.Contains(suffix, "/") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		user, err := s.users.GetUser(r.Context(), suffix)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, user)
+	case http.MethodPatch:
+		var req updateUserRequest
+		if !decodeJSONRequest(w, r, &req) {
+			return
+		}
+		user, err := s.users.UpdateUser(r.Context(), suffix, UpdateUserParams{Name: req.Name, Enabled: req.Enabled})
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, user)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *Server) handleUserAPI(w http.ResponseWriter, r *http.Request, credential AuthenticatedAPIKey) {
+	switch {
+	case r.URL.Path == "/v0/user/api-key" && r.Method == http.MethodGet:
+		writeJSON(w, http.StatusOK, UserWithAPIKey{User: credential.User, APIKey: &credential.APIKey})
+	case r.URL.Path == "/v0/user/api-key/reset" && r.Method == http.MethodPost:
+		created, err := s.users.ResetUserAPIKey(r.Context(), credential.User.ID)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, created)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func enabledFilter(w http.ResponseWriter, r *http.Request) (*bool, bool) {
+	raw := strings.TrimSpace(r.URL.Query().Get("enabled"))
+	if raw == "" {
+		return nil, true
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid enabled filter")
+		return nil, false
+	}
+	return &value, true
+}
+
+func decodeJSONRequest(w http.ResponseWriter, r *http.Request, target any) bool {
+	if r.Body == nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		return false
+	}
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(target); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		return false
+	}
+	return true
+}
+
+func writeAuthError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrDisabledCredential) {
+		writeError(w, http.StatusForbidden, "disabled credential")
+		return
+	}
+	writeError(w, http.StatusUnauthorized, "invalid API key")
+}
+
+func writeStoreError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrInvalidInput):
+		writeError(w, http.StatusBadRequest, "invalid request")
+	case errors.Is(err, ErrDuplicateUserName):
+		writeError(w, http.StatusConflict, "duplicate user name")
+	case errors.Is(err, ErrUserNotFound):
+		writeError(w, http.StatusNotFound, "user not found")
+	case errors.Is(err, ErrDisabledCredential):
+		writeError(w, http.StatusForbidden, "disabled credential")
+	case errors.Is(err, ErrInvalidAPIKey):
+		writeError(w, http.StatusUnauthorized, "invalid API key")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal server error")
+	}
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {

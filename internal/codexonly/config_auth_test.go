@@ -41,8 +41,48 @@ func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 	if cfg.CodexUserAgent != "" {
 		t.Fatalf("CodexUserAgent = %q, want empty default", cfg.CodexUserAgent)
 	}
+	if cfg.AdminAPIKey != "" {
+		t.Fatalf("AdminAPIKey = %q, want empty default", cfg.AdminAPIKey)
+	}
+	if cfg.Database.Path != "" {
+		t.Fatalf("Database.Path = %q, want empty default", cfg.Database.Path)
+	}
 	if cfg.ChatGPTBaseURL != DefaultChatGPTBaseURL {
 		t.Fatalf("ChatGPTBaseURL = %q, want %q", cfg.ChatGPTBaseURL, DefaultChatGPTBaseURL)
+	}
+}
+
+func TestLoadConfigParsesManagementDatabaseSettings(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("admin-api-key: admin-secret\ndatabase:\n  path: /tmp/proxy.db\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+
+	if cfg.AdminAPIKey != "admin-secret" {
+		t.Fatalf("AdminAPIKey = %q, want admin-secret", cfg.AdminAPIKey)
+	}
+	if cfg.Database.Path != "/tmp/proxy.db" {
+		t.Fatalf("Database.Path = %q, want /tmp/proxy.db", cfg.Database.Path)
+	}
+}
+
+func TestResolveDatabasePathDefaultsUnderAuthDir(t *testing.T) {
+	authDir := t.TempDir()
+
+	path, err := ResolveDatabasePath("", authDir)
+	if err != nil {
+		t.Fatalf("ResolveDatabasePath returned error: %v", err)
+	}
+
+	want := filepath.Join(authDir, "codex-oauth-proxy.db")
+	if path != want {
+		t.Fatalf("database path = %q, want %q", path, want)
 	}
 }
 

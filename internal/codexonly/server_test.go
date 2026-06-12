@@ -1,8 +1,10 @@
 package codexonly
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -689,6 +691,221 @@ func TestServerAcceptsXAPIKeyWithUnrelatedAuthorization(t *testing.T) {
 	}
 }
 
+func TestManagementAPIDisabledWithoutAdminAPIKey(t *testing.T) {
+	handler := newUserManagementTestHandler(t, &Config{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/users", nil)
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body: %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestManagementAPICreatesAndListsUsers(t *testing.T) {
+	handler := newUserManagementTestHandler(t, &Config{
+		AdminAPIKey: "admin-key",
+		APIKeys:     []string{"static-proxy-key"},
+	})
+
+	staticReq := httptest.NewRequest(http.MethodPost, "/v0/management/users", strings.NewReader(`{"name":"Alice"}`))
+	staticReq.Header.Set("Authorization", "Bearer static-proxy-key")
+	staticResp := httptest.NewRecorder()
+	handler.ServeHTTP(staticResp, staticReq)
+	if staticResp.Code != http.StatusUnauthorized {
+		t.Fatalf("static proxy key status = %d, want 401", staticResp.Code)
+	}
+
+	createdResp := doJSONRequest(t, handler, http.MethodPost, "/v0/management/users", `{"name":" Alice "}`, "admin-key")
+	if createdResp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201, body: %s", createdResp.Code, createdResp.Body.String())
+	}
+	var created CreatedUserAPIKey
+	decodeResponse(t, createdResp, &created)
+	if created.User.Name != "Alice" {
+		t.Fatalf("created user name = %q, want Alice", created.User.Name)
+	}
+	if created.PlaintextAPIKey == "" || !strings.HasPrefix(created.PlaintextAPIKey, "cop_") {
+		t.Fatalf("plaintext API key = %q, want cop_ prefix", created.PlaintextAPIKey)
+	}
+
+	duplicateResp := doJSONRequest(t, handler, http.MethodPost, "/v0/management/users", `{"name":"alice"}`, "admin-key")
+	if duplicateResp.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d, want 409, body: %s", duplicateResp.Code, duplicateResp.Body.String())
+	}
+
+	listResp := doJSONRequest(t, handler, http.MethodGet, "/v0/management/users", "", "admin-key")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200, body: %s", listResp.Code, listResp.Body.String())
+	}
+	if strings.Contains(listResp.Body.String(), created.PlaintextAPIKey) {
+		t.Fatalf("list response leaked plaintext API key: %s", listResp.Body.String())
+	}
+	var list struct {
+		Users []UserWithAPIKey `json:"users"`
+	}
+	decodeResponse(t, listResp, &list)
+	if len(list.Users) != 1 {
+		t.Fatalf("list user count = %d, want 1", len(list.Users))
+	}
+	if list.Users[0].APIKey == nil || list.Users[0].APIKey.MaskedKey == "" {
+		t.Fatalf("listed API key metadata = %#v, want masked key", list.Users[0].APIKey)
+	}
+
+	getResp := doJSONRequest(t, handler, http.MethodGet, "/v0/management/users/"+created.User.ID, "", "admin-key")
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want 200, body: %s", getResp.Code, getResp.Body.String())
+	}
+	var got UserWithAPIKey
+	decodeResponse(t, getResp, &got)
+	if got.User.ID != created.User.ID {
+		t.Fatalf("got user ID = %q, want %q", got.User.ID, created.User.ID)
+	}
+}
+
+func TestUserAPIKeySelfService(t *testing.T) {
+	handler := newUserManagementTestHandler(t, &Config{
+		AdminAPIKey: "admin-key",
+		APIKeys:     []string{"static-proxy-key"},
+	})
+	created := createManagedUser(t, handler, "admin-key", "Alice")
+
+	staticResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", "static-proxy-key")
+	if staticResp.Code != http.StatusUnauthorized {
+		t.Fatalf("static proxy key user API status = %d, want 401", staticResp.Code)
+	}
+
+	getResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", created.PlaintextAPIKey)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("user get status = %d, want 200, body: %s", getResp.Code, getResp.Body.String())
+	}
+	if strings.Contains(getResp.Body.String(), created.PlaintextAPIKey) {
+		t.Fatalf("user get response leaked plaintext API key: %s", getResp.Body.String())
+	}
+	var current UserWithAPIKey
+	decodeResponse(t, getResp, &current)
+	if current.User.ID != created.User.ID {
+		t.Fatalf("current user ID = %q, want %q", current.User.ID, created.User.ID)
+	}
+
+	resetResp := doJSONRequest(t, handler, http.MethodPost, "/v0/user/api-key/reset", "", created.PlaintextAPIKey)
+	if resetResp.Code != http.StatusOK {
+		t.Fatalf("user reset status = %d, want 200, body: %s", resetResp.Code, resetResp.Body.String())
+	}
+	var reset CreatedUserAPIKey
+	decodeResponse(t, resetResp, &reset)
+	if reset.PlaintextAPIKey == "" || reset.PlaintextAPIKey == created.PlaintextAPIKey {
+		t.Fatalf("reset plaintext API key = %q, want new non-empty key", reset.PlaintextAPIKey)
+	}
+
+	oldResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", created.PlaintextAPIKey)
+	if oldResp.Code != http.StatusUnauthorized {
+		t.Fatalf("old key status = %d, want 401", oldResp.Code)
+	}
+	newResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", reset.PlaintextAPIKey)
+	if newResp.Code != http.StatusOK {
+		t.Fatalf("new key status = %d, want 200, body: %s", newResp.Code, newResp.Body.String())
+	}
+}
+
+func TestUserAPIDisabledUserForbidden(t *testing.T) {
+	handler := newUserManagementTestHandler(t, &Config{AdminAPIKey: "admin-key"})
+	created := createManagedUser(t, handler, "admin-key", "Alice")
+
+	disableResp := doJSONRequest(t, handler, http.MethodPatch, "/v0/management/users/"+created.User.ID, `{"enabled":false}`, "admin-key")
+	if disableResp.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200, body: %s", disableResp.Code, disableResp.Body.String())
+	}
+	disabledResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", created.PlaintextAPIKey)
+	if disabledResp.Code != http.StatusForbidden {
+		t.Fatalf("disabled user status = %d, want 403, body: %s", disabledResp.Code, disabledResp.Body.String())
+	}
+
+	enableResp := doJSONRequest(t, handler, http.MethodPatch, "/v0/management/users/"+created.User.ID, `{"enabled":true}`, "admin-key")
+	if enableResp.Code != http.StatusOK {
+		t.Fatalf("enable status = %d, want 200, body: %s", enableResp.Code, enableResp.Body.String())
+	}
+	enabledResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", created.PlaintextAPIKey)
+	if enabledResp.Code != http.StatusOK {
+		t.Fatalf("re-enabled user status = %d, want 200, body: %s", enabledResp.Code, enabledResp.Body.String())
+	}
+}
+
+func TestProxyAcceptsStoredUserAPIKeyAndRejectsDisabledUser(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	var sawAuthorization string
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		sawAuthorization = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:        authDir,
+		AdminAPIKey:    "admin-key",
+		APIKeys:        []string{"static-proxy-key"},
+		Database:       DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL:   upstream.URL + "/backend-api/codex",
+		RequestRetry:   1,
+		ChatGPTBaseURL: upstream.URL + "/backend-api",
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	created := createManagedUser(t, handler, "admin-key", "Alice")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+created.PlaintextAPIKey)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("stored user key proxy status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	if sawAuthorization != "Bearer access-1" {
+		t.Fatalf("upstream Authorization = %q, want Bearer access-1", sawAuthorization)
+	}
+
+	disableResp := doJSONRequest(t, handler, http.MethodPatch, "/v0/management/users/"+created.User.ID, `{"enabled":false}`, "admin-key")
+	if disableResp.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200, body: %s", disableResp.Code, disableResp.Body.String())
+	}
+	disabledReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	disabledReq.Header.Set("Authorization", "Bearer "+created.PlaintextAPIKey)
+	disabledResp := httptest.NewRecorder()
+	handler.ServeHTTP(disabledResp, disabledReq)
+	if disabledResp.Code != http.StatusForbidden {
+		t.Fatalf("disabled user proxy status = %d, want 403, body: %s", disabledResp.Code, disabledResp.Body.String())
+	}
+	if upstreamCalls != 1 {
+		t.Fatalf("upstream calls after disabled proxy = %d, want 1", upstreamCalls)
+	}
+
+	enableResp := doJSONRequest(t, handler, http.MethodPatch, "/v0/management/users/"+created.User.ID, `{"enabled":true}`, "admin-key")
+	if enableResp.Code != http.StatusOK {
+		t.Fatalf("enable status = %d, want 200, body: %s", enableResp.Code, enableResp.Body.String())
+	}
+	enabledReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	enabledReq.Header.Set("Authorization", "Bearer "+created.PlaintextAPIKey)
+	enabledResp := httptest.NewRecorder()
+	handler.ServeHTTP(enabledResp, enabledReq)
+	if enabledResp.Code != http.StatusOK {
+		t.Fatalf("re-enabled user proxy status = %d, want 200, body: %s", enabledResp.Code, enabledResp.Body.String())
+	}
+}
+
 func findCodexClientModel(models []map[string]any, slug string) map[string]any {
 	for _, model := range models {
 		if model["slug"] == slug {
@@ -696,6 +913,65 @@ func findCodexClientModel(models []map[string]any, slug string) map[string]any {
 		}
 	}
 	return nil
+}
+
+func newUserManagementTestHandler(t *testing.T, cfg *Config) http.Handler {
+	t.Helper()
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	cfg.AuthDir = authDir
+	cfg.Database.Path = filepath.Join(t.TempDir(), "users.db")
+	cfg.CodexBaseURL = "http://127.0.0.1:1/backend-api/codex"
+	cfg.RequestRetry = 1
+	handler, err := NewHandler(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	return handler
+}
+
+func doJSONRequest(t *testing.T, handler http.Handler, method string, path string, body string, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != "" {
+		reader = bytes.NewBufferString(body)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func decodeResponse(t *testing.T, resp *httptest.ResponseRecorder, target any) {
+	t.Helper()
+	if err := json.Unmarshal(resp.Body.Bytes(), target); err != nil {
+		t.Fatalf("decode response %q: %v", resp.Body.String(), err)
+	}
+}
+
+func createManagedUser(t *testing.T, handler http.Handler, adminKey string, name string) CreatedUserAPIKey {
+	t.Helper()
+	resp := doJSONRequest(t, handler, http.MethodPost, "/v0/management/users", fmt.Sprintf(`{"name":%q}`, name), adminKey)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create managed user status = %d, want 201, body: %s", resp.Code, resp.Body.String())
+	}
+	var created CreatedUserAPIKey
+	decodeResponse(t, resp, &created)
+	return created
 }
 
 func stringSliceFieldContains(model map[string]any, key string, want string) bool {

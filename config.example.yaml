@@ -11,6 +11,14 @@ auth-dir: "~/.codex"
 # API keys accepted by this local proxy. Keep empty for direct Codex CLI testing.
 api-keys: []
 
+# Admin API key for /v0/management endpoints. Leave empty to disable them.
+admin-api-key: ""
+
+# SQLite database for managed users and generated user API keys.
+# Empty path resolves to <auth-dir>/codex-oauth-proxy.db.
+database:
+  path: ""
+
 # Optional outbound proxy. Use "direct" or "none" to bypass proxy settings.
 proxy-url: ""
 

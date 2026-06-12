@@ -4,8 +4,8 @@
 CLI traffic to ChatGPT/Codex backend endpoints using existing Codex OAuth
 credentials stored on disk.
 
-It does not implement a web UI, provider translation, management APIs, SDK
-embedding, plugin hosting, or non-Codex provider compatibility routes.
+It does not implement a web UI, provider translation, SDK embedding, plugin
+hosting, or non-Codex provider compatibility routes.
 
 ## Build
 
@@ -22,6 +22,9 @@ host: "127.0.0.1"
 port: 8317
 auth-dir: "~/.codex"
 api-keys: []
+admin-api-key: ""
+database:
+  path: ""
 proxy-url: ""
 codex-base-url: "https://chatgpt.com/backend-api/codex"
 chatgpt-base-url: "https://chatgpt.com/backend-api"
@@ -46,14 +49,24 @@ chatgpt_base_url = "http://127.0.0.1:8317/backend-api/"
 [model_providers.proxy]
 name = "OpenAI using LLM proxy"
 base_url = "http://127.0.0.1:8317/v1"
-env_key = "CLIPROXYAPI_API_KEY"
+env_key = "COP_API_KEY"
 wire_api = "responses"
 supports_websockets = true
 requires_openai_auth = true
 ```
 
-If `api-keys` is non-empty, set `CLIPROXYAPI_API_KEY` to one of those keys. For
-local-only testing with `api-keys: []`, any non-empty value is enough.
+If `api-keys` is non-empty, set `COP_API_KEY` to one of those keys. For
+local-only testing with `api-keys: []`, any non-empty value is enough. Managed
+user API keys can also be supplied through `COP_API_KEY`.
+
+Set `admin-api-key` to enable API-only user management under `/v0/management`.
+Managed users and their generated API keys are stored in SQLite. If
+`database.path` is empty, the database is created at
+`<auth-dir>/codex-oauth-proxy.db`.
+
+Managed user API keys can authenticate Codex proxy routes and `/v0/user`
+endpoints. Legacy static `api-keys` remain proxy-only credentials and cannot
+call user APIs.
 
 For Codex file uploads used by Apps/MCP tools, point Codex's ChatGPT backend URL
 at the proxy too. Codex also uses this backend URL to prefetch account rate-limit
@@ -68,6 +81,13 @@ data for `/status`.
 Supported routes:
 
 - `GET /healthz`
+- `POST /v0/management/users`
+- `GET /v0/management/users`
+- `GET /v0/management/users/{user_id}`
+- `PATCH /v0/management/users/{user_id}`
+- `POST /v0/management/users/{user_id}/api-key/reset`
+- `GET /v0/user/api-key`
+- `POST /v0/user/api-key/reset`
 - `GET /v1/models`
 - `POST /v1/responses`
 - `GET /v1/responses`
@@ -103,6 +123,18 @@ key:
 curl http://localhost:8317/v1/models \
   -H 'Authorization: Bearer change-me'
 ```
+
+Create a managed user and one generated API key:
+
+```bash
+curl -X POST http://localhost:8317/v0/management/users \
+  -H 'Authorization: Bearer admin-change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"alice"}'
+```
+
+The plaintext user API key is returned only by user creation and key reset
+responses. List/detail responses only return key metadata such as `masked_key`.
 
 ## Verify
 

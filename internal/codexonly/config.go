@@ -18,17 +18,23 @@ const (
 )
 
 type Config struct {
-	Host                 string   `yaml:"host"`
-	Port                 int      `yaml:"port"`
-	AuthDir              string   `yaml:"auth-dir"`
-	APIKeys              []string `yaml:"api-keys"`
-	ProxyURL             string   `yaml:"proxy-url"`
-	RequestRetry         int      `yaml:"request-retry"`
-	CodexBaseURL         string   `yaml:"codex-base-url"`
-	ChatGPTBaseURL       string   `yaml:"chatgpt-base-url"`
-	CodexUserAgent       string   `yaml:"codex-user-agent"`
-	CodexBetaFeatures    string   `yaml:"codex-beta-features"`
-	CodexRefreshTokenURL string   `yaml:"codex-refresh-token-url"`
+	Host                 string         `yaml:"host"`
+	Port                 int            `yaml:"port"`
+	AuthDir              string         `yaml:"auth-dir"`
+	APIKeys              []string       `yaml:"api-keys"`
+	AdminAPIKey          string         `yaml:"admin-api-key"`
+	Database             DatabaseConfig `yaml:"database"`
+	ProxyURL             string         `yaml:"proxy-url"`
+	RequestRetry         int            `yaml:"request-retry"`
+	CodexBaseURL         string         `yaml:"codex-base-url"`
+	ChatGPTBaseURL       string         `yaml:"chatgpt-base-url"`
+	CodexUserAgent       string         `yaml:"codex-user-agent"`
+	CodexBetaFeatures    string         `yaml:"codex-beta-features"`
+	CodexRefreshTokenURL string         `yaml:"codex-refresh-token-url"`
+}
+
+type DatabaseConfig struct {
+	Path string `yaml:"path"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -75,6 +81,37 @@ func ResolveAuthDir(path string) (string, error) {
 	if path == "" {
 		path = DefaultAuthDir
 	}
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home dir: %w", err)
+		}
+		return home, nil
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home dir: %w", err)
+		}
+		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
+	}
+	return path, nil
+}
+
+func ResolveDatabasePath(path string, authDir string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path != "" {
+		return expandHome(path)
+	}
+	authDir, err := ResolveAuthDir(authDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(authDir, "codex-oauth-proxy.db"), nil
+}
+
+func expandHome(path string) (string, error) {
+	path = strings.TrimSpace(path)
 	if path == "~" {
 		home, err := os.UserHomeDir()
 		if err != nil {
