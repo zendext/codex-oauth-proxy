@@ -26,7 +26,7 @@ management APIs for usage summaries and threshold events.
 - `internal/codexonly` owns config loading, Codex auth parsing and refresh,
   route whitelisting, proxy authorization, and reverse proxy behavior.
 - Codex OAuth credentials are loaded from `auth-dir`, defaulting to `~/.codex`.
-- Static proxy API keys are configured by the top-level `api-keys` list.
+- Proxy API keys are generated for managed users and stored in SQLite.
 - There is no persistent application database, management API, user model,
   Web UI, login flow, provider registry, or plugin host.
 
@@ -38,9 +38,7 @@ management APIs for usage summaries and threshold events.
 - Let a user's API key authenticate both Codex proxy requests and user APIs.
 - Resolve proxy requests authenticated by a stored user API key to `user_id`
   and `api_key_id`.
-- Preserve existing local testing behavior where `api-keys: []` allows proxy
-  requests without authentication.
-- Keep existing static `api-keys` support as a legacy proxy-only path.
+- Require managed user API keys for Codex proxy requests.
 
 ## Non-Goals
 
@@ -67,9 +65,9 @@ database:
 - `database.path`: Optional SQLite path. Empty resolves to
   `<auth-dir>/codex-oauth-proxy.db`.
 
-Existing `api-keys` remain supported. They are accepted for proxy
-authorization, but they are not attached to a user, cannot authenticate user
-APIs, and do not create a `user_id` or `api_key_id` for later usage tracking.
+Proxy requests must authenticate with a stored managed user API key, except for
+ChatGPT backend compatibility routes that explicitly allow the current Codex
+upstream access token.
 
 ## Authentication Model
 
@@ -81,13 +79,12 @@ Management APIs require:
 Authorization: Bearer <admin-api-key>
 ```
 
-The same token may also be accepted from `X-API-Key` for consistency with
-existing proxy key handling.
+The same token may also be accepted from `X-API-Key` for clients that send
+provider credentials outside the `Authorization` header.
 
 Management APIs must not accept:
 
 - User API keys.
-- Static proxy `api-keys`.
 - Codex upstream access tokens.
 
 When `admin-api-key` is empty, management endpoints should return `404 Not
@@ -109,21 +106,18 @@ Authentication succeeds only when:
 - The key row is enabled.
 - The owning user is enabled.
 
-User APIs must not accept the admin API key, static proxy `api-keys`, or Codex
-upstream access tokens.
+User APIs must not accept the admin API key or Codex upstream access tokens.
 
 ### Proxy Route Authentication
 
-Proxy route authorization should support three cases:
+Proxy route authorization should support two cases:
 
-- `api-keys: []`: keep today's unauthenticated local testing behavior.
-- Static `api-keys`: accept configured static keys as proxy-only credentials.
 - Stored user API keys: accept enabled user keys and return the matched
   `user_id` and `api_key_id` for downstream usage tracking.
+- Current Codex upstream access tokens: accept only on existing ChatGPT backend
+  compatibility routes that already require this fallback.
 
-When a request is allowed because `api-keys: []` and no valid user API key is
-present, the request has no user identity and should not be counted by later
-per-user usage tracking.
+Unauthenticated Codex proxy requests should be rejected with HTTP 401.
 
 ## Data Model Draft
 
@@ -271,7 +265,7 @@ phase.
 - Config defaults resolve the database path under `auth-dir`.
 - Empty `admin-api-key` does not expose management APIs.
 - Management endpoints require the configured admin API key.
-- Management endpoints reject user API keys and static proxy keys.
+- Management endpoints reject user API keys.
 - Creating a user creates exactly one active API key and returns plaintext once.
 - Duplicate user names are rejected.
 - Disabled users cannot call user APIs.
@@ -279,9 +273,8 @@ phase.
 - Re-enabled users can use their current stored API key again.
 - User API key reset disables the old key and returns a new plaintext key once.
 - Old user API keys stop authenticating after reset.
-- Static `api-keys` still authenticate proxy routes.
-- Static `api-keys` cannot call user APIs.
-- `api-keys: []` still allows local proxy requests without authentication.
+- Unauthenticated proxy requests are rejected.
+- Stored user API keys authenticate proxy routes.
 - Full API keys are never exposed by list/detail responses, logs, or SQLite.
 - `go test ./...` passes.
 - `go build -o test-output ./cmd/server && rm test-output` passes.

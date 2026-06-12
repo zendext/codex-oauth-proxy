@@ -21,7 +21,7 @@ Create `config.yaml` from `config.example.yaml`.
 host: "127.0.0.1"
 port: 8317
 auth-dir: "~/.codex"
-api-keys: []
+debug: false
 admin-api-key: ""
 database:
   path: ""
@@ -36,11 +36,10 @@ with `type: "codex"`, `access_token`, and `refresh_token`. The server refreshes
 expired tokens automatically and writes the updated token fields back to the same
 file without changing the official Codex CLI file shape.
 
-Configure Codex CLI to use the proxy as a Responses provider. The important
-settings are `supports_websockets = true` and `requires_openai_auth = true`:
-without WebSocket support Codex falls back to HTTP SSE, and without OpenAI auth
-gating Codex skips the startup `/status` rate-limit prefetch for custom
-providers.
+Configure Codex CLI to use the proxy as a Responses provider. Use
+`supports_websockets = true` for realtime routes and
+`requires_openai_auth = false` so Codex sends the managed user API key from
+`COP_API_KEY` to this proxy.
 
 ```toml
 model_provider = "proxy"
@@ -52,21 +51,22 @@ base_url = "http://127.0.0.1:8317/v1"
 env_key = "COP_API_KEY"
 wire_api = "responses"
 supports_websockets = true
-requires_openai_auth = true
+requires_openai_auth = false
 ```
-
-If `api-keys` is non-empty, set `COP_API_KEY` to one of those keys. For
-local-only testing with `api-keys: []`, any non-empty value is enough. Managed
-user API keys can also be supplied through `COP_API_KEY`.
 
 Set `admin-api-key` to enable API-only user management under `/v0/management`.
 Managed users and their generated API keys are stored in SQLite. If
 `database.path` is empty, the database is created at
 `<auth-dir>/codex-oauth-proxy.db`.
 
-Managed user API keys can authenticate Codex proxy routes and `/v0/user`
-endpoints. Legacy static `api-keys` remain proxy-only credentials and cannot
-call user APIs.
+Managed user API keys authenticate Codex proxy routes and `/v0/user`
+endpoints. Set `COP_API_KEY` to a generated managed user API key when running
+Codex through this proxy.
+
+Set `debug: true` while diagnosing Codex Desktop or custom-provider setup. Debug
+logs show request arrival, route selection, token header sources, authentication
+decisions, upstream targets, upstream response status, and final response status.
+Full API keys, OAuth access tokens, and refresh tokens are not logged.
 
 For Codex file uploads used by Apps/MCP tools, point Codex's ChatGPT backend URL
 at the proxy too. Codex also uses this backend URL to prefetch account rate-limit
@@ -116,12 +116,11 @@ Supported routes:
 - `GET /backend-api/wham/accounts/check`
 - `POST /backend-api/wham/accounts/send_add_credits_nudge_email`
 
-When `api-keys` is non-empty, protected routes require one configured proxy API
-key:
+Protected proxy routes require a managed user API key:
 
 ```bash
 curl http://localhost:8317/v1/models \
-  -H 'Authorization: Bearer change-me'
+  -H 'Authorization: Bearer cop_...'
 ```
 
 Create a managed user and one generated API key:

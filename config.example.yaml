@@ -8,8 +8,8 @@ port: 8317
 # The official Codex CLI ~/.codex/auth.json format is supported directly.
 auth-dir: "~/.codex"
 
-# API keys accepted by this local proxy. Keep empty for direct Codex CLI testing.
-api-keys: []
+# Enable request and proxy debug logs. Secrets are masked.
+debug: false
 
 # Admin API key for /v0/management endpoints. Leave empty to disable them.
 admin-api-key: ""

@@ -4,7 +4,7 @@
 
 **Goal:** Build API-only user and API key management with SQLite-backed users, admin APIs, user APIs, and proxy authentication through stored user API keys.
 
-**Architecture:** Add a small SQLite store under `internal/codexonly`, wire it into `Server`, and keep existing static `api-keys` behavior as a proxy-only path. HTTP handlers remain in the codex-only server and expose `/v0/management/users...` and `/v0/user/api-key...`.
+**Architecture:** Add a small SQLite store under `internal/codexonly`, wire it into `Server`, and require managed user API keys for Codex proxy requests. HTTP handlers remain in the codex-only server and expose `/v0/management/users...` and `/v0/user/api-key...`.
 
 **Tech Stack:** Go `database/sql`, pure-Go SQLite driver `modernc.org/sqlite`, existing `net/http` handler tests, `gofmt`, `go test ./...`.
 
@@ -47,7 +47,7 @@ Expected: passes.
 
 - [ ] **Step 1: Write failing HTTP API tests**
 
-Add tests for disabled management APIs, admin-authenticated user creation/list/detail/update/reset, user self key lookup/reset, and rejection of static proxy keys for user APIs.
+Add tests for disabled management APIs, admin-authenticated user creation/list/detail/update/reset, user self key lookup/reset, and rejection of non-user credentials for user APIs.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -73,7 +73,7 @@ Expected: passes.
 
 - [ ] **Step 1: Write failing proxy auth tests**
 
-Add tests showing stored user API keys authenticate proxy routes, disabled users are rejected, re-enabled users work again, static `api-keys` still work, and `api-keys: []` local mode still works.
+Add tests showing stored user API keys authenticate proxy routes, disabled users are rejected, re-enabled users work again, and unauthenticated proxy requests are rejected.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -83,7 +83,7 @@ Expected: stored user API key cases fail before proxy auth consults the SQLite s
 
 - [ ] **Step 3: Integrate stored key auth into proxy routes**
 
-Change proxy authorization to check static keys, stored user API keys, local empty-key mode, and upstream Codex access tokens in the existing allowed backend cases.
+Change proxy authorization to check stored user API keys and upstream Codex access tokens in the existing allowed backend compatibility cases.
 
 - [ ] **Step 4: Run focused proxy tests**
 

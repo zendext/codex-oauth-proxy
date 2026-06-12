@@ -15,8 +15,8 @@ This feature depends on `docs/todo/user-api-key-management-api.md`.
 
 Usage records should be attributed through the authenticated `user_id` and
 `api_key_id` produced by the user API key authentication path. Requests allowed
-only through unauthenticated local mode or legacy static `api-keys` do not have
-a stored user identity and should not be included in per-user usage totals.
+only through current Codex upstream access-token compatibility routes do not
+have a stored user identity and should not be included in per-user usage totals.
 
 ## Product Scope
 
@@ -268,7 +268,6 @@ Telegram bot or external service can explain why an alert fired.
   needs config or startup wiring.
 - Do not reintroduce CPA packages for this feature.
 - Keep route behavior unchanged for existing Codex proxy endpoints.
-- Keep the current `api-keys: []` local testing behavior unchanged.
 - Prefer small, testable units:
   - request identity propagation
   - bucket aggregation and pruning
@@ -283,9 +282,8 @@ Telegram bot or external service can explain why an alert fired.
 
 - Config defaults match the documented values.
 - Codex OAuth requests with stored user API keys are counted.
-- Requests allowed only through `api-keys: []` are not counted.
-- Requests authenticated only by static `api-keys` are not counted as user
-  usage.
+- Requests authenticated only by Codex upstream access-token compatibility are
+  not counted as user usage.
 - Full API keys are never exposed by APIs, events, logs, or SQLite.
 - Zero-token records do not affect quota ratios.
 - Today's usage aggregates the expected UTC-day buckets.

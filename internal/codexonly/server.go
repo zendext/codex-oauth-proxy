@@ -1,13 +1,18 @@
 package codexonly
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -142,18 +147,56 @@ func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	server := &Server{
 		cfg:            cfg,
 		auths:          manager,
 		users:          userStore,
 		httpClient:     client,
 		baseURL:        upstream,
 		chatGPTBaseURL: chatGPTUpstream,
-	}, nil
+	}
+	server.debugf(
+		"debug enabled listen=%s auth_dir=%s database_path=%s codex_base_url=%s chatgpt_base_url=%s",
+		ListenAddr(cfg),
+		cfg.AuthDir,
+		cfg.Database.Path,
+		safeURLString(upstream),
+		safeURLString(chatGPTUpstream),
+	)
+	return server, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.debugEnabled() {
+		start := time.Now()
+		recorder := &debugResponseWriter{ResponseWriter: w}
+		route, routeOK := s.proxyRoute(r.URL.Path)
+		s.debugf(
+			"request received method=%s path=%s route=%s remote=%s user_agent=%q token_sources=%s",
+			r.Method,
+			r.URL.Path,
+			s.debugRouteName(r, routeOK),
+			r.RemoteAddr,
+			r.UserAgent(),
+			tokenSourceSummary(r),
+		)
+		defer func() {
+			s.debugf(
+				"request completed method=%s path=%s status=%d duration_ms=%d",
+				r.Method,
+				r.URL.Path,
+				recorder.statusCode(),
+				time.Since(start).Milliseconds(),
+			)
+		}()
+		s.serveHTTP(recorder, r, route, routeOK)
+		return
+	}
 	route, routeOK := s.proxyRoute(r.URL.Path)
+	s.serveHTTP(w, r, route, routeOK)
+}
+
+func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstreamRoute, routeOK bool) {
 	switch {
 	case r.URL.Path == "/healthz":
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -161,20 +204,42 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"message": "codex-oauth-proxy"})
 	case strings.HasPrefix(r.URL.Path, "/v0/management/"):
 		if !s.managementAPIEnabled() {
+			s.debugf("management auth failed method=%s path=%s reason=disabled", r.Method, r.URL.Path)
 			writeError(w, http.StatusNotFound, "not found")
 			return
 		}
 		if !s.authorizedAdmin(r) {
+			s.debugf(
+				"management auth failed method=%s path=%s reason=invalid_admin_key token_sources=%s",
+				r.Method,
+				r.URL.Path,
+				tokenSourceSummary(r),
+			)
 			writeError(w, http.StatusUnauthorized, "invalid admin API key")
 			return
 		}
+		s.debugf("management auth ok method=%s path=%s", r.Method, r.URL.Path)
 		s.handleManagement(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v0/user/"):
 		credential, err := s.authenticateUserAPIKey(r)
 		if err != nil {
+			s.debugf(
+				"user auth failed method=%s path=%s reason=%s token_sources=%s",
+				r.Method,
+				r.URL.Path,
+				authFailureReason(err),
+				tokenSourceSummary(r),
+			)
 			writeAuthError(w, err)
 			return
 		}
+		s.debugf(
+			"user auth ok method=%s path=%s user_id=%s api_key_id=%s",
+			r.Method,
+			r.URL.Path,
+			credential.User.ID,
+			credential.APIKey.ID,
+		)
 		s.handleUserAPI(w, r, credential)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		if err := s.authorizeProxy(r, false); err != nil {
@@ -235,40 +300,43 @@ func (s *Server) authenticateUserAPIKeyFromTokens(ctx context.Context, tokens []
 }
 
 func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) error {
-	if s == nil || s.cfg == nil || len(s.cfg.APIKeys) == 0 {
-		return nil
-	}
 	tokens := candidateProxyTokens(r)
-	if s.staticProxyKeyMatches(tokens) {
-		return nil
-	}
-	if _, err := s.authenticateUserAPIKeyFromTokens(r.Context(), tokens); err == nil {
+	if credential, err := s.authenticateUserAPIKeyFromTokens(r.Context(), tokens); err == nil {
+		s.debugf(
+			"proxy auth ok method=%s path=%s auth=user_api_key user_id=%s api_key_id=%s token_sources=%s",
+			r.Method,
+			r.URL.Path,
+			credential.User.ID,
+			credential.APIKey.ID,
+			tokenSourceSummary(r),
+		)
 		return nil
 	} else if errors.Is(err, ErrDisabledCredential) {
+		s.debugf(
+			"proxy auth failed method=%s path=%s reason=disabled_credential token_sources=%s",
+			r.Method,
+			r.URL.Path,
+			tokenSourceSummary(r),
+		)
 		return err
 	}
 	if allowUpstreamAuth && s.matchesCurrentCodexAccessToken(r.Context(), tokens) {
+		s.debugf(
+			"proxy auth ok method=%s path=%s auth=upstream_access_token token_sources=%s",
+			r.Method,
+			r.URL.Path,
+			tokenSourceSummary(r),
+		)
 		return nil
 	}
+	s.debugf(
+		"proxy auth failed method=%s path=%s reason=invalid_api_key allow_upstream_auth=%t token_sources=%s",
+		r.Method,
+		r.URL.Path,
+		allowUpstreamAuth,
+		tokenSourceSummary(r),
+	)
 	return ErrInvalidAPIKey
-}
-
-func (s *Server) staticProxyKeyMatches(tokens []string) bool {
-	if s == nil || s.cfg == nil {
-		return false
-	}
-	for _, key := range s.cfg.APIKeys {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		for _, token := range tokens {
-			if subtle.ConstantTimeCompare([]byte(token), []byte(key)) == 1 {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func (s *Server) matchesCurrentCodexAccessToken(ctx context.Context, tokens []string) bool {
@@ -453,6 +521,13 @@ func writeAuthError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusUnauthorized, "invalid API key")
 }
 
+func authFailureReason(err error) string {
+	if errors.Is(err, ErrDisabledCredential) {
+		return "disabled_credential"
+	}
+	return "invalid_api_key"
+}
+
 func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrInvalidInput):
@@ -493,9 +568,22 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute) {
 	auth, err := s.auths.Select(r.Context())
 	if err != nil {
+		s.debugf("proxy upstream auth unavailable method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	s.debugf(
+		"proxy upstream request method=%s path=%s target_scheme=%s target_host=%s target_path=%s websocket=%t allow_upstream_auth=%t auth_id=%s account_id_present=%t",
+		r.Method,
+		r.URL.Path,
+		route.baseURL.Scheme,
+		route.baseURL.Host,
+		route.targetPath,
+		route.responsesWebsocket && websocketRequested(r),
+		route.allowUpstreamAuth,
+		auth.ID,
+		strings.TrimSpace(auth.AccountID) != "",
+	)
 	proxy := &httputil.ReverseProxy{
 		Director: func(out *http.Request) {
 			out.URL.Scheme = route.baseURL.Scheme
@@ -506,11 +594,167 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 			applyCodexProxyHeaders(out, r, auth, s.cfg, route.responsesWebsocket)
 		},
 		Transport: s.httpClient.Transport,
+		ModifyResponse: func(resp *http.Response) error {
+			s.debugf(
+				"proxy upstream response method=%s path=%s status=%d target_host=%s target_path=%s",
+				r.Method,
+				r.URL.Path,
+				resp.StatusCode,
+				route.baseURL.Host,
+				route.targetPath,
+			)
+			return nil
+		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
+			s.debugf(
+				"proxy upstream error method=%s path=%s target_host=%s target_path=%s error=%q",
+				r.Method,
+				r.URL.Path,
+				route.baseURL.Host,
+				route.targetPath,
+				proxyErr.Error(),
+			)
 			writeError(rw, http.StatusBadGateway, proxyErr.Error())
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func (s *Server) debugEnabled() bool {
+	return s != nil && s.cfg != nil && s.cfg.Debug
+}
+
+func (s *Server) debugf(format string, args ...any) {
+	if !s.debugEnabled() {
+		return
+	}
+	log.Printf("debug "+format, args...)
+}
+
+func (s *Server) debugRouteName(r *http.Request, routeOK bool) string {
+	switch {
+	case r == nil:
+		return "unknown"
+	case r.URL.Path == "/healthz":
+		return "health"
+	case r.URL.Path == "/":
+		return "root"
+	case strings.HasPrefix(r.URL.Path, "/v0/management/"):
+		return "management"
+	case strings.HasPrefix(r.URL.Path, "/v0/user/"):
+		return "user"
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+		return "models"
+	case routeOK:
+		return "proxy"
+	default:
+		return "not_found"
+	}
+}
+
+func tokenSourceSummary(r *http.Request) string {
+	if r == nil {
+		return "none"
+	}
+	var parts []string
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHeader != "" {
+		kind := "raw"
+		token := authHeader
+		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			kind = "bearer"
+			token = strings.TrimSpace(authHeader[7:])
+		}
+		parts = append(parts, fmt.Sprintf("authorization:%s(len=%d,sha256=%s)", kind, len(token), tokenFingerprint(token)))
+	}
+	if apiKey := strings.TrimSpace(r.Header.Get("X-API-Key")); apiKey != "" {
+		parts = append(parts, fmt.Sprintf("x-api-key(len=%d,sha256=%s)", len(apiKey), tokenFingerprint(apiKey)))
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
+func tokenFingerprint(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "-"
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func safeURLString(raw *url.URL) string {
+	if raw == nil {
+		return ""
+	}
+	copied := *raw
+	copied.User = nil
+	copied.RawQuery = ""
+	copied.Fragment = ""
+	return copied.String()
+}
+
+type debugResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *debugResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (w *debugResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *debugResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func (w *debugResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *debugResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	if w.status == 0 {
+		w.status = http.StatusSwitchingProtocols
+	}
+	return hijacker.Hijack()
+}
+
+func (w *debugResponseWriter) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := w.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
+}
+
+func (w *debugResponseWriter) ReadFrom(src io.Reader) (int64, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if readerFrom, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return readerFrom.ReadFrom(src)
+	}
+	return io.Copy(w.ResponseWriter, src)
 }
 
 func (s *Server) proxyRoute(path string) (upstreamRoute, bool) {

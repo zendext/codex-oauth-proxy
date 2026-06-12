@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -48,7 +49,8 @@ func TestServerProxiesResponsesWithCodexAuthHeaders(t *testing.T) {
 	cfg := &Config{
 		Port:           8317,
 		AuthDir:        authDir,
-		APIKeys:        []string{"proxy-key"},
+		AdminAPIKey:    "admin-key",
+		Database:       DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL:   upstream.URL + "/backend-api/codex",
 		CodexUserAgent: "codex-tui/0.139.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.139.0)",
 		RequestRetry:   1,
@@ -57,9 +59,10 @@ func TestServerProxiesResponsesWithCodexAuthHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.3-codex","input":"hello"}`))
-	req.Header.Set("Authorization", "Bearer proxy-key")
+	req.Header.Set("Authorization", "Bearer "+userKey)
 	req.Header.Set("User-Agent", "generic-responses-client/1.0")
 	resp := httptest.NewRecorder()
 
@@ -123,13 +126,15 @@ func TestServerProxiesAdditionalCodexEndpoints(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:         8317,
 		AuthDir:      authDir,
-		APIKeys:      []string{"proxy-key"},
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL: upstream.URL + "/backend-api/codex",
 		RequestRetry: 1,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	tests := []struct {
 		name            string
@@ -213,7 +218,7 @@ func TestServerProxiesAdditionalCodexEndpoints(t *testing.T) {
 			sawBody = ""
 
 			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
-			req.Header.Set("Authorization", "Bearer proxy-key")
+			req.Header.Set("Authorization", "Bearer "+userKey)
 			if tt.contentType != "" {
 				req.Header.Set("Content-Type", tt.contentType)
 			}
@@ -283,7 +288,8 @@ func TestServerProxiesChatGPTFileEndpoints(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:           8317,
 		AuthDir:        authDir,
-		APIKeys:        []string{"proxy-key"},
+		AdminAPIKey:    "admin-key",
+		Database:       DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL:   codexUpstream.URL + "/backend-api/codex",
 		ChatGPTBaseURL: chatGPTUpstream.URL + "/backend-api",
 		RequestRetry:   1,
@@ -291,6 +297,7 @@ func TestServerProxiesChatGPTFileEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	tests := []struct {
 		name     string
@@ -326,7 +333,7 @@ func TestServerProxiesChatGPTFileEndpoints(t *testing.T) {
 			sawBody = ""
 
 			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
-			req.Header.Set("Authorization", "Bearer proxy-key")
+			req.Header.Set("Authorization", "Bearer "+userKey)
 			resp := httptest.NewRecorder()
 
 			handler.ServeHTTP(resp, req)
@@ -380,7 +387,8 @@ func TestServerProxiesChatGPTWhamUsageEndpoint(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:           8317,
 		AuthDir:        authDir,
-		APIKeys:        []string{"proxy-key"},
+		AdminAPIKey:    "admin-key",
+		Database:       DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL:   codexUpstream.URL + "/backend-api/codex",
 		ChatGPTBaseURL: chatGPTUpstream.URL + "/backend-api",
 		RequestRetry:   1,
@@ -388,9 +396,10 @@ func TestServerProxiesChatGPTWhamUsageEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
-	req.Header.Set("Authorization", "Bearer proxy-key")
+	req.Header.Set("Authorization", "Bearer "+userKey)
 	resp := httptest.NewRecorder()
 
 	handler.ServeHTTP(resp, req)
@@ -448,7 +457,8 @@ func TestServerProxiesChatGPTHostedMCPRoutes(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:           8317,
 		AuthDir:        authDir,
-		APIKeys:        []string{"proxy-key"},
+		AdminAPIKey:    "admin-key",
+		Database:       DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL:   codexUpstream.URL + "/backend-api/codex",
 		ChatGPTBaseURL: chatGPTUpstream.URL + "/backend-api",
 		RequestRetry:   1,
@@ -456,6 +466,7 @@ func TestServerProxiesChatGPTHostedMCPRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	tests := []struct {
 		name     string
@@ -485,7 +496,7 @@ func TestServerProxiesChatGPTHostedMCPRoutes(t *testing.T) {
 			sawBody = ""
 
 			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
-			req.Header.Set("Authorization", "Bearer proxy-key")
+			req.Header.Set("Authorization", "Bearer "+userKey)
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Accept", "application/json, text/event-stream")
 			req.Header.Set("MCP-Protocol-Version", "2025-06-18")
@@ -543,7 +554,6 @@ func TestServerAcceptsCodexOAuthForChatGPTBackendRoutes(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:           8317,
 		AuthDir:        authDir,
-		APIKeys:        []string{"proxy-key"},
 		CodexBaseURL:   chatGPTUpstream.URL + "/backend-api/codex",
 		ChatGPTBaseURL: chatGPTUpstream.URL + "/backend-api",
 		RequestRetry:   1,
@@ -578,16 +588,18 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:         8317,
 		AuthDir:      authDir,
-		APIKeys:      []string{"proxy-key"},
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL: "http://127.0.0.1:1/backend-api/codex",
 		RequestRetry: 1,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.139.0", nil)
-	req.Header.Set("Authorization", "Bearer proxy-key")
+	req.Header.Set("Authorization", "Bearer "+userKey)
 	resp := httptest.NewRecorder()
 
 	handler.ServeHTTP(resp, req)
@@ -634,7 +646,8 @@ func TestServerRejectsInvalidProxyAPIKey(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:         8317,
 		AuthDir:      authDir,
-		APIKeys:      []string{"proxy-key"},
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL: "http://127.0.0.1:1/backend-api/codex",
 		RequestRetry: 1,
 	})
@@ -653,7 +666,7 @@ func TestServerRejectsInvalidProxyAPIKey(t *testing.T) {
 	}
 }
 
-func TestServerAcceptsXAPIKeyWithUnrelatedAuthorization(t *testing.T) {
+func TestServerAcceptsUserAPIKeyFromXAPIKeyWithUnrelatedAuthorization(t *testing.T) {
 	authDir := t.TempDir()
 	writeAuthFile(t, authDir, "codex.json", `{
 		"type": "codex",
@@ -671,17 +684,19 @@ func TestServerAcceptsXAPIKeyWithUnrelatedAuthorization(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		Port:         8317,
 		AuthDir:      authDir,
-		APIKeys:      []string{"proxy-key"},
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL: upstream.URL + "/backend-api/codex",
 		RequestRetry: 1,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer chatgpt-token")
-	req.Header.Set("X-API-Key", "proxy-key")
+	req.Header.Set("X-API-Key", userKey)
 	resp := httptest.NewRecorder()
 
 	handler.ServeHTTP(resp, req)
@@ -707,16 +722,7 @@ func TestManagementAPIDisabledWithoutAdminAPIKey(t *testing.T) {
 func TestManagementAPICreatesAndListsUsers(t *testing.T) {
 	handler := newUserManagementTestHandler(t, &Config{
 		AdminAPIKey: "admin-key",
-		APIKeys:     []string{"static-proxy-key"},
 	})
-
-	staticReq := httptest.NewRequest(http.MethodPost, "/v0/management/users", strings.NewReader(`{"name":"Alice"}`))
-	staticReq.Header.Set("Authorization", "Bearer static-proxy-key")
-	staticResp := httptest.NewRecorder()
-	handler.ServeHTTP(staticResp, staticReq)
-	if staticResp.Code != http.StatusUnauthorized {
-		t.Fatalf("static proxy key status = %d, want 401", staticResp.Code)
-	}
 
 	createdResp := doJSONRequest(t, handler, http.MethodPost, "/v0/management/users", `{"name":" Alice "}`, "admin-key")
 	if createdResp.Code != http.StatusCreated {
@@ -763,18 +769,22 @@ func TestManagementAPICreatesAndListsUsers(t *testing.T) {
 	if got.User.ID != created.User.ID {
 		t.Fatalf("got user ID = %q, want %q", got.User.ID, created.User.ID)
 	}
+
+	userKeyManagementResp := doJSONRequest(t, handler, http.MethodGet, "/v0/management/users", "", created.PlaintextAPIKey)
+	if userKeyManagementResp.Code != http.StatusUnauthorized {
+		t.Fatalf("user key management status = %d, want 401", userKeyManagementResp.Code)
+	}
 }
 
 func TestUserAPIKeySelfService(t *testing.T) {
 	handler := newUserManagementTestHandler(t, &Config{
 		AdminAPIKey: "admin-key",
-		APIKeys:     []string{"static-proxy-key"},
 	})
 	created := createManagedUser(t, handler, "admin-key", "Alice")
 
-	staticResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", "static-proxy-key")
-	if staticResp.Code != http.StatusUnauthorized {
-		t.Fatalf("static proxy key user API status = %d, want 401", staticResp.Code)
+	adminResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", "admin-key")
+	if adminResp.Code != http.StatusUnauthorized {
+		t.Fatalf("admin key user API status = %d, want 401", adminResp.Code)
 	}
 
 	getResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/api-key", "", created.PlaintextAPIKey)
@@ -855,7 +865,6 @@ func TestProxyAcceptsStoredUserAPIKeyAndRejectsDisabledUser(t *testing.T) {
 	handler, err := NewHandler(context.Background(), &Config{
 		AuthDir:        authDir,
 		AdminAPIKey:    "admin-key",
-		APIKeys:        []string{"static-proxy-key"},
 		Database:       DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
 		CodexBaseURL:   upstream.URL + "/backend-api/codex",
 		RequestRetry:   1,
@@ -903,6 +912,168 @@ func TestProxyAcceptsStoredUserAPIKeyAndRejectsDisabledUser(t *testing.T) {
 	handler.ServeHTTP(enabledResp, enabledReq)
 	if enabledResp.Code != http.StatusOK {
 		t.Fatalf("re-enabled user proxy status = %d, want 200, body: %s", enabledResp.Code, enabledResp.Body.String())
+	}
+}
+
+func TestProxyRejectsUnauthenticatedRequests(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unauthenticated proxy request reached upstream")
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:        authDir,
+		AdminAPIKey:    "admin-key",
+		Database:       DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL:   upstream.URL + "/backend-api/codex",
+		ChatGPTBaseURL: upstream.URL + "/backend-api",
+		RequestRetry:   1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body: %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestDebugLogsSuccessfulProxyRequestWithoutSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	restore := captureStandardLogger(t, &logs)
+	defer restore()
+
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:      authDir,
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL: upstream.URL + "/backend-api/codex",
+		RequestRetry: 1,
+		Debug:        true,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+userKey)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	got := logs.String()
+	for _, want := range []string{
+		"debug enabled",
+		"request received method=POST path=/v1/responses",
+		"proxy auth ok method=POST path=/v1/responses auth=user_api_key",
+		"proxy upstream request method=POST path=/v1/responses",
+		"target_path=/backend-api/codex/responses",
+		"proxy upstream response method=POST path=/v1/responses status=200",
+		"request completed method=POST path=/v1/responses status=200",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("debug log missing %q\nlogs:\n%s", want, got)
+		}
+	}
+	for _, secret := range []string{userKey, "access-1", "refresh-1"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("debug log leaked secret %q\nlogs:\n%s", secret, got)
+		}
+	}
+}
+
+func TestDebugLogsUnauthorizedProxyRequestWithoutSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	restore := captureStandardLogger(t, &logs)
+	defer restore()
+
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:      authDir,
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL: "http://127.0.0.1:1/backend-api/codex",
+		RequestRetry: 1,
+		Debug:        true,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer cop_missing")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body: %s", resp.Code, resp.Body.String())
+	}
+	got := logs.String()
+	for _, want := range []string{
+		"request received method=POST path=/v1/responses",
+		"proxy auth failed method=POST path=/v1/responses",
+		"token_sources=authorization:bearer",
+		"request completed method=POST path=/v1/responses status=401",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("debug log missing %q\nlogs:\n%s", want, got)
+		}
+	}
+	for _, secret := range []string{"cop_missing", "access-1", "refresh-1"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("debug log leaked secret %q\nlogs:\n%s", secret, got)
+		}
+	}
+}
+
+func captureStandardLogger(t *testing.T, buf *bytes.Buffer) func() {
+	t.Helper()
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	oldPrefix := log.Prefix()
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	return func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
 	}
 }
 

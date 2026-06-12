@@ -21,7 +21,7 @@ type Config struct {
 	Host                 string         `yaml:"host"`
 	Port                 int            `yaml:"port"`
 	AuthDir              string         `yaml:"auth-dir"`
-	APIKeys              []string       `yaml:"api-keys"`
+	Debug                bool           `yaml:"debug"`
 	AdminAPIKey          string         `yaml:"admin-api-key"`
 	Database             DatabaseConfig `yaml:"database"`
 	ProxyURL             string         `yaml:"proxy-url"`

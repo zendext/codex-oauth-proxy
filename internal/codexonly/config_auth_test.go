@@ -14,7 +14,7 @@ import (
 func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte("port: 9123\napi-keys:\n  - local-key\n"), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte("port: 9123\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -32,8 +32,8 @@ func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 	if cfg.AuthDir != DefaultAuthDir {
 		t.Fatalf("AuthDir = %q, want %q", cfg.AuthDir, DefaultAuthDir)
 	}
-	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0] != "local-key" {
-		t.Fatalf("APIKeys = %#v, want [local-key]", cfg.APIKeys)
+	if cfg.Debug {
+		t.Fatal("Debug = true, want false default")
 	}
 	if cfg.RequestRetry != 3 {
 		t.Fatalf("RequestRetry = %d, want 3", cfg.RequestRetry)
@@ -55,7 +55,7 @@ func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 func TestLoadConfigParsesManagementDatabaseSettings(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte("admin-api-key: admin-secret\ndatabase:\n  path: /tmp/proxy.db\n"), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte("debug: true\nadmin-api-key: admin-secret\ndatabase:\n  path: /tmp/proxy.db\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -66,6 +66,9 @@ func TestLoadConfigParsesManagementDatabaseSettings(t *testing.T) {
 
 	if cfg.AdminAPIKey != "admin-secret" {
 		t.Fatalf("AdminAPIKey = %q, want admin-secret", cfg.AdminAPIKey)
+	}
+	if !cfg.Debug {
+		t.Fatal("Debug = false, want true")
 	}
 	if cfg.Database.Path != "/tmp/proxy.db" {
 		t.Fatalf("Database.Path = %q, want /tmp/proxy.db", cfg.Database.Path)
