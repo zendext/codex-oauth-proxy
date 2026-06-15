@@ -1,12 +1,12 @@
 # codex-oauth-proxy
 
 `codex-oauth-proxy` is a Codex OAuth-backed proxy for the Codex CLI and clients
-that can use the OpenAI Responses API wire format. It forwards supported Codex
-traffic to ChatGPT/Codex backend endpoints using existing Codex OAuth
-credentials stored on disk.
+that can use OpenAI-compatible Responses or Chat Completions wire formats. It
+forwards supported Codex traffic to ChatGPT/Codex backend endpoints using
+existing Codex OAuth credentials stored on disk.
 
 Codex CLI is the primary target. The proxy also provides API-only managed-user
-endpoints and a small Responses-compatible public API surface for custom agents.
+endpoints and a small OpenAI-compatible public API surface for custom agents.
 
 ## Build
 
@@ -88,6 +88,11 @@ Set `debug: true` for masked request/proxy logs. Add
 `usage.debug-openai-response: true` for request IDs, model, key metadata, and
 token summaries; secrets and response bodies are not logged.
 
+OpenAI-compatible clients can also point their base URL at
+`http://127.0.0.1:8317/v1` and send `POST /v1/chat/completions` with a managed
+user API key. Chat requests are translated to upstream Responses requests; both
+streaming and non-streaming calls are supported.
+
 ## Run
 
 ```bash
@@ -109,6 +114,7 @@ Public API routes:
 - `POST /v0/user/api-key/reset`
 - `GET /v0/user/usage/today`
 - `GET /v1/models`
+- `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `GET /v1/responses`
 - `POST /v1/responses/compact`

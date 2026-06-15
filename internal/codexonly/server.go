@@ -251,6 +251,18 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			return
 		}
 		s.handleModels(w, r)
+	case r.URL.Path == "/v1/chat/completions":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		authorization, err := s.authorizeProxy(r, false)
+		if err != nil {
+			writeAuthError(w, err)
+			return
+		}
+		s.handleChatCompletions(w, r, authorization)
 	case routeOK:
 		authorization, err := s.authorizeProxy(r, route.allowUpstreamAuth)
 		if err != nil {
@@ -717,6 +729,8 @@ func (s *Server) debugRouteName(r *http.Request, routeOK bool) string {
 		return "user"
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		return "models"
+	case r.URL.Path == "/v1/chat/completions":
+		return "chat_completions"
 	case routeOK:
 		return "proxy"
 	default:
