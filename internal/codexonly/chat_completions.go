@@ -149,12 +149,6 @@ func chatRequestToResponses(raw map[string]any) (chatRequestConversion, error) {
 	if reasoning, ok := chatReasoningToResponses(raw); ok {
 		out["reasoning"] = reasoning
 	}
-	if value, ok := raw["temperature"]; ok {
-		out["temperature"] = value
-	}
-	if value, ok := raw["top_p"]; ok {
-		out["top_p"] = value
-	}
 	if value, ok := raw["parallel_tool_calls"]; ok {
 		out["parallel_tool_calls"] = value
 	}
@@ -162,7 +156,7 @@ func chatRequestToResponses(raw map[string]any) (chatRequestConversion, error) {
 		Responses: out,
 		Metadata: proxyRequestUsageMetadata{
 			Model:           model,
-			ReasoningEffort: stringFromMap(raw, "reasoning_effort"),
+			ReasoningEffort: chatReasoningEffort(raw),
 		},
 		Stream:        chatBoolFromMap(raw, "stream"),
 		IncludeUsage:  chatStreamOptionsIncludeUsage(raw["stream_options"]),
@@ -313,10 +307,27 @@ func chatReasoningToResponses(raw map[string]any) (map[string]any, bool) {
 			}
 		}
 	}
-	if effort := stringFromMap(raw, "reasoning_effort"); effort != "" {
+	if effort := chatReasoningEffort(raw); effort != "" {
 		reasoning["effort"] = effort
 	}
 	return reasoning, len(reasoning) > 0
+}
+
+func chatReasoningEffort(raw map[string]any) string {
+	return normalizeChatReasoningEffort(stringFromMap(raw, "reasoning_effort"))
+}
+
+func normalizeChatReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal":
+		return "low"
+	case "max":
+		return "xhigh"
+	case "none", "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(effort))
+	default:
+		return strings.TrimSpace(effort)
+	}
 }
 
 func chatTextOptionsToResponses(raw map[string]any) (map[string]any, bool) {

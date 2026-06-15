@@ -249,6 +249,81 @@ data: {"type":"response.completed","response":{"id":"resp_json","model":"gpt-5.3
 	}
 }
 
+func TestChatCompletionsNormalizesReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "minimal", in: "minimal", want: "low"},
+		{name: "max", in: "max", want: "xhigh"},
+		{name: "none", in: "none", want: "none"},
+		{name: "low", in: "low", want: "low"},
+		{name: "medium", in: "medium", want: "medium"},
+		{name: "high", in: "high", want: "high"},
+		{name: "xhigh", in: "xhigh", want: "xhigh"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, userKey, saw := newChatCompletionTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(`event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"ok"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_reasoning","model":"gpt-5.3-codex","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}
+
+`))
+			})
+
+			resp := doJSONRequest(t, handler, http.MethodPost, "/v1/chat/completions", `{
+				"model":"gpt-5.3-codex",
+				"messages":[{"role":"user","content":"say ok"}],
+				"reasoning_effort":"`+tt.in+`"
+			}`, userKey)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+			}
+
+			reasoning, ok := saw.request(t)["reasoning"].(map[string]any)
+			if !ok || reasoning["effort"] != tt.want {
+				t.Fatalf("reasoning = %#v, want effort %q", saw.request(t)["reasoning"], tt.want)
+			}
+		})
+	}
+}
+
+func TestChatCompletionsIgnoresUnsupportedSamplingParameters(t *testing.T) {
+	handler, userKey, saw := newChatCompletionTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"ok"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_sampling","model":"gpt-5.3-codex","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}
+
+`))
+	})
+
+	resp := doJSONRequest(t, handler, http.MethodPost, "/v1/chat/completions", `{
+		"model":"gpt-5.3-codex",
+		"messages":[{"role":"user","content":"say ok"}],
+		"temperature":0,
+		"top_p":1
+	}`, userKey)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+
+	upstreamReq := saw.request(t)
+	if _, ok := upstreamReq["temperature"]; ok {
+		t.Fatalf("upstream request should not include temperature: %#v", upstreamReq)
+	}
+	if _, ok := upstreamReq["top_p"]; ok {
+		t.Fatalf("upstream request should not include top_p: %#v", upstreamReq)
+	}
+}
+
 func TestChatCompletionsToolChoiceReturnsToolCalls(t *testing.T) {
 	handler, userKey, saw := newChatCompletionTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
