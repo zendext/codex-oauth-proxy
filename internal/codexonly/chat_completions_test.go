@@ -3,6 +3,7 @@ package codexonly
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -78,6 +79,34 @@ data: {"type":"response.completed","response":{"id":"resp_ok","model":"gpt-5.3-c
 	message, ok := input[0].(map[string]any)
 	if !ok || message["role"] != "user" || message["content"] != "say ok" {
 		t.Fatalf("input message = %#v, want user say ok", input[0])
+	}
+}
+
+func TestChatCompletionsRejectsFastServiceTierByDefault(t *testing.T) {
+	for _, serviceTier := range []string{"fast", "priority"} {
+		t.Run(serviceTier, func(t *testing.T) {
+			var upstreamCalled bool
+			handler, userKey, _ := newChatCompletionTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalled = true
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(`event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","model":"gpt-5.5","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}
+
+`))
+			})
+
+			resp := doJSONRequest(t, handler, http.MethodPost, "/v1/chat/completions", fmt.Sprintf(`{
+		"model":"gpt-5.5",
+		"service_tier":%q,
+		"messages":[{"role":"user","content":"say ok"}]
+	}`, serviceTier), userKey)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body: %s", resp.Code, resp.Body.String())
+			}
+			if upstreamCalled {
+				t.Fatal("upstream was called for disabled Fast mode chat completion request")
+			}
+		})
 	}
 }
 

@@ -142,6 +142,7 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			masked_key TEXT NOT NULL,
 			model TEXT NOT NULL,
 			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			service_tier TEXT NOT NULL DEFAULT 'standard',
 			auth_id TEXT NOT NULL,
 			request_count INTEGER NOT NULL DEFAULT 0,
 			failed_request_count INTEGER NOT NULL DEFAULT 0,
@@ -153,7 +154,7 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL,
-			PRIMARY KEY (bucket_start, user_id, api_key_id, model, reasoning_effort, auth_id),
+			PRIMARY KEY (bucket_start, user_id, api_key_id, model, reasoning_effort, service_tier, auth_id),
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
@@ -162,9 +163,10 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			api_key_id TEXT NOT NULL,
 			model TEXT NOT NULL DEFAULT 'unknown',
 			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			service_tier TEXT NOT NULL DEFAULT 'standard',
 			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
 			updated_at TEXT NOT NULL,
-			PRIMARY KEY (window, api_key_id, model, reasoning_effort),
+			PRIMARY KEY (window, api_key_id, model, reasoning_effort, service_tier),
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS usage_threshold_events (
@@ -183,6 +185,7 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			failed_request_count INTEGER NOT NULL,
 			model TEXT NOT NULL,
 			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			service_tier TEXT NOT NULL DEFAULT 'standard',
 			auth_id TEXT NOT NULL,
 			request_id TEXT NOT NULL,
 			diagnostics TEXT NOT NULL,
@@ -196,6 +199,9 @@ func (s *UserStore) migrate(ctx context.Context) error {
 		}
 	}
 	if err := s.migrateUsageReasoningEffort(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateUsageServiceTier(ctx); err != nil {
 		return err
 	}
 	indexStatements := []string{
@@ -254,6 +260,7 @@ func (s *UserStore) migrateUsageBucketsReasoningEffort(ctx context.Context) erro
 			masked_key TEXT NOT NULL,
 			model TEXT NOT NULL,
 			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			service_tier TEXT NOT NULL DEFAULT 'standard',
 			auth_id TEXT NOT NULL,
 			request_count INTEGER NOT NULL DEFAULT 0,
 			failed_request_count INTEGER NOT NULL DEFAULT 0,
@@ -265,17 +272,17 @@ func (s *UserStore) migrateUsageBucketsReasoningEffort(ctx context.Context) erro
 			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL,
-			PRIMARY KEY (bucket_start, user_id, api_key_id, model, reasoning_effort, auth_id),
+			PRIMARY KEY (bucket_start, user_id, api_key_id, model, reasoning_effort, service_tier, auth_id),
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
 		`INSERT INTO usage_buckets (
-			bucket_start, user_id, api_key_id, key_hash, masked_key, model, reasoning_effort, auth_id,
+			bucket_start, user_id, api_key_id, key_hash, masked_key, model, reasoning_effort, service_tier, auth_id,
 			request_count, failed_request_count, input_tokens, output_tokens, reasoning_tokens,
 			cached_input_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, updated_at
 		)
 		SELECT
-			bucket_start, user_id, api_key_id, MAX(key_hash), MAX(masked_key), model, 'unknown', auth_id,
+			bucket_start, user_id, api_key_id, MAX(key_hash), MAX(masked_key), model, 'unknown', 'standard', auth_id,
 			COALESCE(SUM(request_count), 0),
 			COALESCE(SUM(failed_request_count), 0),
 			COALESCE(SUM(input_tokens), 0),
@@ -297,6 +304,152 @@ func (s *UserStore) migrateUsageBucketsReasoningEffort(ctx context.Context) erro
 	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit usage_buckets reasoning_effort migration: %w", err)
+	}
+	return nil
+}
+
+func (s *UserStore) migrateUsageServiceTier(ctx context.Context) error {
+	if err := s.migrateUsageBucketsServiceTier(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateUsageThresholdStateServiceTier(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateUsageThresholdEventsServiceTier(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *UserStore) migrateUsageBucketsServiceTier(ctx context.Context) error {
+	hasColumn, err := tableColumnExists(ctx, s.db, "usage_buckets", "service_tier")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin usage_buckets service_tier migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+
+	statements := []string{
+		`DROP TABLE IF EXISTS usage_buckets_before_service_tier`,
+		`ALTER TABLE usage_buckets RENAME TO usage_buckets_before_service_tier`,
+		`CREATE TABLE usage_buckets (
+			bucket_start TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			api_key_id TEXT NOT NULL,
+			key_hash TEXT NOT NULL,
+			masked_key TEXT NOT NULL,
+			model TEXT NOT NULL,
+			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			service_tier TEXT NOT NULL DEFAULT 'standard',
+			auth_id TEXT NOT NULL,
+			request_count INTEGER NOT NULL DEFAULT 0,
+			failed_request_count INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (bucket_start, user_id, api_key_id, model, reasoning_effort, service_tier, auth_id),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+		)`,
+		`INSERT INTO usage_buckets (
+			bucket_start, user_id, api_key_id, key_hash, masked_key, model, reasoning_effort, service_tier, auth_id,
+			request_count, failed_request_count, input_tokens, output_tokens, reasoning_tokens,
+			cached_input_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, updated_at
+		)
+		SELECT
+			bucket_start, user_id, api_key_id, MAX(key_hash), MAX(masked_key), model, reasoning_effort, 'standard', auth_id,
+			COALESCE(SUM(request_count), 0),
+			COALESCE(SUM(failed_request_count), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(reasoning_tokens), 0),
+			COALESCE(SUM(cached_input_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_creation_tokens), 0),
+			COALESCE(SUM(total_tokens), 0),
+			MAX(updated_at)
+		FROM usage_buckets_before_service_tier
+		GROUP BY bucket_start, user_id, api_key_id, model, reasoning_effort, auth_id`,
+		`DROP TABLE usage_buckets_before_service_tier`,
+	}
+	for _, statement := range statements {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate usage_buckets service_tier: %w", err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit usage_buckets service_tier migration: %w", err)
+	}
+	return nil
+}
+
+func (s *UserStore) migrateUsageThresholdStateServiceTier(ctx context.Context) error {
+	hasColumn, err := tableColumnExists(ctx, s.db, "usage_threshold_state", "service_tier")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin usage_threshold_state service_tier migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+
+	statements := []string{
+		`DROP TABLE IF EXISTS usage_threshold_state_before_service_tier`,
+		`ALTER TABLE usage_threshold_state RENAME TO usage_threshold_state_before_service_tier`,
+		`CREATE TABLE usage_threshold_state (
+			window TEXT NOT NULL,
+			api_key_id TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT 'unknown',
+			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
+			service_tier TEXT NOT NULL DEFAULT 'standard',
+			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (window, api_key_id, model, reasoning_effort, service_tier),
+			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+		)`,
+		`INSERT INTO usage_threshold_state (
+			window, api_key_id, model, reasoning_effort, service_tier, above_threshold, updated_at
+		)
+		SELECT window, api_key_id, model, reasoning_effort, 'standard', above_threshold, updated_at
+		FROM usage_threshold_state_before_service_tier`,
+		`DROP TABLE usage_threshold_state_before_service_tier`,
+	}
+	for _, statement := range statements {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate usage_threshold_state service_tier: %w", err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit usage_threshold_state service_tier migration: %w", err)
+	}
+	return nil
+}
+
+func (s *UserStore) migrateUsageThresholdEventsServiceTier(ctx context.Context) error {
+	hasColumn, err := tableColumnExists(ctx, s.db, "usage_threshold_events", "service_tier")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	if _, err = s.db.ExecContext(ctx, `ALTER TABLE usage_threshold_events ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'standard'`); err != nil {
+		return fmt.Errorf("migrate usage_threshold_events service_tier: %w", err)
 	}
 	return nil
 }

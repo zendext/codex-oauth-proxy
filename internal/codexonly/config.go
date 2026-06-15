@@ -25,6 +25,7 @@ type Config struct {
 	AdminAPIKey          string         `yaml:"admin-api-key"`
 	Database             DatabaseConfig `yaml:"database"`
 	Usage                UsageConfig    `yaml:"usage"`
+	AllowFastMode        bool           `yaml:"allow-fast-mode"`
 	ProxyURL             string         `yaml:"proxy-url"`
 	RequestRetry         int            `yaml:"request-retry"`
 	CodexBaseURL         string         `yaml:"codex-base-url"`

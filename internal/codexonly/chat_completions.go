@@ -152,11 +152,16 @@ func chatRequestToResponses(raw map[string]any) (chatRequestConversion, error) {
 	if value, ok := raw["parallel_tool_calls"]; ok {
 		out["parallel_tool_calls"] = value
 	}
+	serviceTier := stringFromMap(raw, "service_tier")
+	if serviceTier != "" {
+		out["service_tier"] = serviceTier
+	}
 	return chatRequestConversion{
 		Responses: out,
 		Metadata: proxyRequestUsageMetadata{
 			Model:           model,
 			ReasoningEffort: chatReasoningEffort(raw),
+			ServiceTier:     normalizeServiceTier(serviceTier),
 		},
 		Stream:        chatBoolFromMap(raw, "stream"),
 		IncludeUsage:  chatStreamOptionsIncludeUsage(raw["stream_options"]),
@@ -1074,6 +1079,7 @@ func (s *Server) recordChatCompletionUsage(r *http.Request, authorization proxyA
 		AuthID:          authID,
 		Model:           metadata.Model,
 		ReasoningEffort: metadata.ReasoningEffort,
+		ServiceTier:     metadata.ServiceTier,
 		StatusCode:      statusCode,
 		RequestID:       requestID,
 		Counters:        counters,

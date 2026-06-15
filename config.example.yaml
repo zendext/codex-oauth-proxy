@@ -28,6 +28,11 @@ usage:
   event-retention-days: 30
   debug-openai-response: false
 
+# Allow Codex Fast mode. Disabled by default because Fast mode consumes credits
+# at a higher rate. When false, Fast tier metadata is hidden and explicit
+# service_tier="fast" or service_tier="priority" requests are rejected.
+allow-fast-mode: false
+
 # Optional outbound proxy. Use "direct" or "none" to bypass proxy settings.
 proxy-url: ""
 

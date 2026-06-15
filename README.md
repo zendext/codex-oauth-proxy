@@ -45,6 +45,7 @@ Create `config.yaml` from `config.example.yaml`.
 | `usage.alert-threshold` | `0.8` | Threshold-event ratio. |
 | `usage.event-retention-days` | `30` | Threshold-event retention. |
 | `usage.debug-openai-response` | `false` | Log safe usage metadata from upstream responses. |
+| `allow-fast-mode` | `false` | Allow Codex Fast mode. When disabled, Fast tier metadata is hidden and `service_tier: "fast"` or `"priority"` requests return `400`. |
 | `proxy-url` | empty | Optional outbound proxy. Use `direct` or `none` to bypass proxy settings. |
 | `request-retry` | `3` | Upstream retry attempts for retry-aware calls. |
 | `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Codex upstream base URL. |
@@ -82,7 +83,8 @@ through this proxy.
 Usage tracking stores 10-minute UTC buckets for managed user API keys. User
 totals are exposed at `/v0/user/usage/today`; management snapshots and threshold
 events are exposed at `/v0/management/usage` and
-`/v0/management/usage/events`.
+`/v0/management/usage/events`. Model breakdowns include `model`,
+`reasoning_effort`, and `service_tier` (`standard` or `fast`).
 
 Set `debug: true` for masked request/proxy logs. Add
 `usage.debug-openai-response: true` for request IDs, model, key metadata, and

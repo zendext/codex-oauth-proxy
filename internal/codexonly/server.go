@@ -2,6 +2,7 @@ package codexonly
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -262,11 +263,19 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			writeAuthError(w, err)
 			return
 		}
+		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
+			writeError(w, http.StatusBadRequest, "fast mode is disabled")
+			return
+		}
 		s.handleChatCompletions(w, r, authorization)
 	case routeOK:
 		authorization, err := s.authorizeProxy(r, route.allowUpstreamAuth)
 		if err != nil {
 			writeAuthError(w, err)
+			return
+		}
+		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
+			writeError(w, http.StatusBadRequest, "fast mode is disabled")
 			return
 		}
 		s.proxyCodex(w, r, route, authorization)
@@ -598,7 +607,7 @@ func writeStoreError(w http.ResponseWriter, err error) {
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if _, ok := r.URL.Query()["client_version"]; ok {
-		writeJSON(w, http.StatusOK, map[string]any{"models": codexClientModels()})
+		writeJSON(w, http.StatusOK, map[string]any{"models": codexClientModels(s.fastModeAllowed())})
 		return
 	}
 	data := make([]map[string]any, 0, len(codexModelIDs()))
@@ -614,6 +623,65 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   data,
 	})
+}
+
+func (s *Server) fastModeAllowed() bool {
+	return s != nil && s.cfg != nil && s.cfg.AllowFastMode
+}
+
+func requestHasFastServiceTier(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if queryHasFastServiceTier(r.URL.Query()) {
+		return true
+	}
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	jsonCandidate := strings.Contains(contentType, "json") ||
+		(contentType == "" && r.Method != http.MethodGet)
+	if !jsonCandidate {
+		return false
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(nil))
+		return false
+	}
+	resetRequestBody(r, body)
+	return payloadHasFastServiceTier(body)
+}
+
+func queryHasFastServiceTier(query url.Values) bool {
+	for _, key := range []string{"service_tier", "service-tier"} {
+		for _, value := range query[key] {
+			if isFastServiceTier(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func payloadHasFastServiceTier(payload []byte) bool {
+	var value map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	serviceTier, ok := value["service_tier"].(string)
+	return ok && isFastServiceTier(serviceTier)
+}
+
+func resetRequestBody(r *http.Request, body []byte) {
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
 }
 
 func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization) {
@@ -666,6 +734,7 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 						AuthID:          auth.ID,
 						Model:           metadata.Model,
 						ReasoningEffort: metadata.ReasoningEffort,
+						ServiceTier:     metadata.ServiceTier,
 						StatusCode:      resp.StatusCode,
 						RequestID:       usageRequestID(r, resp),
 						RetryAfter:      resp.Header.Get("Retry-After"),
@@ -694,6 +763,7 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 					AuthID:          auth.ID,
 					Model:           metadata.Model,
 					ReasoningEffort: metadata.ReasoningEffort,
+					ServiceTier:     metadata.ServiceTier,
 					StatusCode:      http.StatusBadGateway,
 					RequestID:       requestIDFromRequest(req),
 				})
@@ -1076,7 +1146,7 @@ func codexModelIDs() []string {
 	}
 }
 
-func codexClientModels() []map[string]any {
+func codexClientModels(allowFastMode bool) []map[string]any {
 	codexClientModelsOnce.Do(func() {
 		var payload codexClientModelsPayload
 		codexClientModelsErr = json.Unmarshal(codexClientModelsJSON, &payload)
@@ -1090,7 +1160,12 @@ func codexClientModels() []map[string]any {
 	}
 	out := make([]map[string]any, 0, len(codexClientModelsList))
 	for _, model := range codexClientModelsList {
-		out = append(out, cloneCodexClientModelMap(model))
+		cloned := cloneCodexClientModelMap(model)
+		if !allowFastMode {
+			delete(cloned, "service_tiers")
+			delete(cloned, "additional_speed_tiers")
+		}
+		out = append(out, cloned)
 	}
 	return out
 }

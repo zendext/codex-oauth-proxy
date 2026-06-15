@@ -586,12 +586,13 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	}`)
 
 	handler, err := NewHandler(context.Background(), &Config{
-		Port:         8317,
-		AuthDir:      authDir,
-		AdminAPIKey:  "admin-key",
-		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
-		CodexBaseURL: "http://127.0.0.1:1/backend-api/codex",
-		RequestRetry: 1,
+		Port:          8317,
+		AuthDir:       authDir,
+		AdminAPIKey:   "admin-key",
+		Database:      DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		AllowFastMode: true,
+		CodexBaseURL:  "http://127.0.0.1:1/backend-api/codex",
+		RequestRetry:  1,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler returned error: %v", err)
@@ -631,6 +632,148 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	}
 	if !reasoningLevelsContain(model, "xhigh") {
 		t.Fatalf("supported_reasoning_levels does not include xhigh: %#v", model["supported_reasoning_levels"])
+	}
+	if !modelHasFastTier(model) {
+		t.Fatalf("Fast tier metadata not found in %#v", model)
+	}
+}
+
+func TestCodexClientModelsHideFastTierByDefault(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	handler, err := NewHandler(context.Background(), &Config{
+		Port:         8317,
+		AuthDir:      authDir,
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL: "http://127.0.0.1:1/backend-api/codex",
+		RequestRetry: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.139.0", nil)
+	req.Header.Set("Authorization", "Bearer "+userKey)
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	model := findCodexClientModel(payload.Models, "gpt-5.5")
+	if model == nil {
+		t.Fatalf("gpt-5.5 model metadata not found in %#v", payload.Models)
+	}
+	if modelHasFastTier(model) {
+		t.Fatalf("gpt-5.5 unexpectedly advertises Fast tier: %#v", model)
+	}
+}
+
+func TestServerRejectsFastServiceTierByDefault(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	var called bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		Port:         8317,
+		AuthDir:      authDir,
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL: upstream.URL + "/backend-api/codex",
+		RequestRetry: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
+
+	for _, serviceTier := range []string{"fast", "priority"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q,"input":"hello"}`, serviceTier)))
+		req.Header.Set("Authorization", "Bearer "+userKey)
+		resp := httptest.NewRecorder()
+
+		handler.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("service_tier %q status = %d, want 400, body: %s", serviceTier, resp.Code, resp.Body.String())
+		}
+	}
+	if called {
+		t.Fatal("upstream was called for disabled Fast mode request")
+	}
+}
+
+func TestServerAllowsFastServiceTierWhenEnabled(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	var sawBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		sawBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		Port:          8317,
+		AuthDir:       authDir,
+		AdminAPIKey:   "admin-key",
+		Database:      DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		AllowFastMode: true,
+		CodexBaseURL:  upstream.URL + "/backend-api/codex",
+		RequestRetry:  1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
+
+	body := `{"model":"gpt-5.5","service_tier":"priority","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+userKey)
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	if sawBody != body {
+		t.Fatalf("upstream body = %q, want %q", sawBody, body)
 	}
 }
 
@@ -1166,6 +1309,26 @@ func reasoningLevelsContain(model map[string]any, want string) bool {
 	for _, value := range values {
 		entry, ok := value.(map[string]any)
 		if ok && entry["effort"] == want {
+			return true
+		}
+	}
+	return false
+}
+
+func modelHasFastTier(model map[string]any) bool {
+	if stringSliceFieldContains(model, "additional_speed_tiers", "fast") {
+		return true
+	}
+	values, ok := model["service_tiers"].([]any)
+	if !ok {
+		return false
+	}
+	for _, value := range values {
+		entry, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		if entry["name"] == "Fast" || entry["id"] == "priority" {
 			return true
 		}
 	}

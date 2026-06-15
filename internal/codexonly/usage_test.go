@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -261,6 +262,7 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 		{
 			Model:           "gpt-5.3-codex",
 			ReasoningEffort: "high",
+			ServiceTier:     "standard",
 			UsageCounters: UsageCounters{
 				RequestCount:    1,
 				InputTokens:     12,
@@ -303,6 +305,7 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 		{
 			Model:           "gpt-5.3-codex",
 			ReasoningEffort: "high",
+			ServiceTier:     "standard",
 			Windows: map[string]UsageWindow{
 				"5h": {
 					UsageCounters: UsageCounters{
@@ -349,6 +352,74 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 	if eventsPayload.Events[0].ReasoningEffort != "high" {
 		t.Fatalf("event reasoning_effort = %q, want high", eventsPayload.Events[0].ReasoningEffort)
 	}
+	if eventsPayload.Events[0].ServiceTier != "standard" {
+		t.Fatalf("event service_tier = %q, want standard", eventsPayload.Events[0].ServiceTier)
+	}
+}
+
+func TestServerRecordsFastServiceTierUsage(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"account_id": "acct_1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	var upstreamReq map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&upstreamReq); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","usage":{"input_tokens":14,"output_tokens":10,"total_tokens":24}}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:       authDir,
+		AdminAPIKey:   "admin-key",
+		Database:      DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL:  upstream.URL + "/backend-api/codex",
+		RequestRetry:  1,
+		AllowFastMode: true,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	created := createManagedUser(t, handler, "admin-key", "Alice")
+
+	resp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.5","reasoning":{"effort":"xhigh"},"service_tier":"priority","input":"hello"}`, created.PlaintextAPIKey)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	if upstreamReq["service_tier"] != "priority" {
+		t.Fatalf("upstream service_tier = %#v, want priority", upstreamReq["service_tier"])
+	}
+
+	waitForUsageTotal(t, handler, created.PlaintextAPIKey, 24)
+	todayResp := doJSONRequest(t, handler, http.MethodGet, "/v0/user/usage/today", "", created.PlaintextAPIKey)
+	if todayResp.Code != http.StatusOK {
+		t.Fatalf("today status = %d, want 200, body: %s", todayResp.Code, todayResp.Body.String())
+	}
+	var today UserUsageToday
+	decodeResponse(t, todayResp, &today)
+	assertUsageDimensions(t, today.Models, []testUsageDimension{
+		{
+			Model:           "gpt-5.5",
+			ReasoningEffort: "xhigh",
+			ServiceTier:     "fast",
+			UsageCounters: UsageCounters{
+				RequestCount: 1,
+				InputTokens:  14,
+				OutputTokens: 10,
+				TotalTokens:  24,
+			},
+		},
+	})
 }
 
 func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
@@ -414,6 +485,7 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 		{
 			Model:           "gpt-5.5",
 			ReasoningEffort: "high",
+			ServiceTier:     "standard",
 			UsageCounters: UsageCounters{
 				RequestCount: 2,
 				InputTokens:  27,
@@ -424,6 +496,7 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 		{
 			Model:           "gpt-5.5",
 			ReasoningEffort: "xhigh",
+			ServiceTier:     "standard",
 			UsageCounters: UsageCounters{
 				RequestCount: 1,
 				InputTokens:  10,
@@ -444,6 +517,7 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 		{
 			Model:           "gpt-5.5",
 			ReasoningEffort: "high",
+			ServiceTier:     "standard",
 			Windows: map[string]UsageWindow{
 				"5h": {
 					UsageCounters: UsageCounters{
@@ -472,6 +546,7 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 		{
 			Model:           "gpt-5.5",
 			ReasoningEffort: "xhigh",
+			ServiceTier:     "standard",
 			Windows: map[string]UsageWindow{
 				"5h": {
 					UsageCounters: UsageCounters{
@@ -507,11 +582,110 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 		t.Fatalf("event count = %d, want 2", len(events))
 	}
 	for _, event := range events {
-		if event.Model != "gpt-5.5" || event.ReasoningEffort != "high" {
-			t.Fatalf("event dimension = %s/%s, want gpt-5.5/high", event.Model, event.ReasoningEffort)
+		if event.Model != "gpt-5.5" || event.ReasoningEffort != "high" || event.ServiceTier != "standard" {
+			t.Fatalf("event dimension = %s/%s/%s, want gpt-5.5/high/standard", event.Model, event.ReasoningEffort, event.ServiceTier)
 		}
 		if event.TotalTokens != 55 || event.RequestCount != 2 {
 			t.Fatalf("event totals = tokens %d requests %d, want 55/2", event.TotalTokens, event.RequestCount)
+		}
+	}
+}
+
+func TestUserStoreSeparatesUsageByServiceTier(t *testing.T) {
+	store := openTestUserStore(t)
+	ctx := context.Background()
+	fixed := time.Date(2026, 6, 12, 10, 7, 0, 0, time.UTC)
+	store.now = func() time.Time { return fixed }
+
+	created, err := store.CreateUser(ctx, CreateUserParams{Name: "Alice"})
+	if err != nil {
+		t.Fatalf("CreateUser returned error: %v", err)
+	}
+	credential, err := store.AuthenticateAPIKey(ctx, created.PlaintextAPIKey)
+	if err != nil {
+		t.Fatalf("AuthenticateAPIKey returned error: %v", err)
+	}
+
+	cfg := UsageConfig{
+		FiveHourReferenceTokens: 100,
+		WeeklyReferenceTokens:   100,
+		AlertThreshold:          0.5,
+	}
+	records := []struct {
+		serviceTier string
+		tokens      int64
+	}{
+		{serviceTier: "", tokens: 30},
+		{serviceTier: "priority", tokens: 20},
+		{serviceTier: "standard", tokens: 25},
+	}
+	for i, record := range records {
+		err = store.RecordUsage(ctx, UsageRecordParams{
+			Timestamp:       fixed.Add(time.Duration(i) * time.Minute),
+			User:            credential.User,
+			APIKey:          credential.APIKey,
+			Model:           "gpt-5.5",
+			ReasoningEffort: "high",
+			ServiceTier:     record.serviceTier,
+			AuthID:          "auth.json",
+			RequestID:       fmt.Sprintf("req_tier_%d", i+1),
+			StatusCode:      http.StatusOK,
+			Counters: UsageCounters{
+				InputTokens:  record.tokens / 2,
+				OutputTokens: record.tokens - record.tokens/2,
+				TotalTokens:  record.tokens,
+			},
+		}, cfg)
+		if err != nil {
+			t.Fatalf("RecordUsage #%d returned error: %v", i+1, err)
+		}
+	}
+
+	today, err := store.GetTodayUsage(ctx, credential.User.ID, credential.APIKey.ID, fixed)
+	if err != nil {
+		t.Fatalf("GetTodayUsage returned error: %v", err)
+	}
+	assertUsageCounters(t, today.UsageCounters, UsageCounters{
+		RequestCount: 3,
+		InputTokens:  37,
+		OutputTokens: 38,
+		TotalTokens:  75,
+	})
+	assertUsageDimensions(t, today.Models, []testUsageDimension{
+		{
+			Model:           "gpt-5.5",
+			ReasoningEffort: "high",
+			ServiceTier:     "fast",
+			UsageCounters: UsageCounters{
+				RequestCount: 1,
+				InputTokens:  10,
+				OutputTokens: 10,
+				TotalTokens:  20,
+			},
+		},
+		{
+			Model:           "gpt-5.5",
+			ReasoningEffort: "high",
+			ServiceTier:     "standard",
+			UsageCounters: UsageCounters{
+				RequestCount: 2,
+				InputTokens:  27,
+				OutputTokens: 28,
+				TotalTokens:  55,
+			},
+		},
+	})
+
+	events, err := store.ListUsageEvents(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListUsageEvents returned error: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("event count = %d, want 2", len(events))
+	}
+	for _, event := range events {
+		if event.ServiceTier != "standard" {
+			t.Fatalf("event service_tier = %q, want standard", event.ServiceTier)
 		}
 	}
 }
@@ -626,27 +800,41 @@ func TestUserStoreMigratesUsageReasoningEffort(t *testing.T) {
 	defer store.Close()
 
 	assertColumnExists(t, store.db, "usage_buckets", "reasoning_effort")
+	assertColumnExists(t, store.db, "usage_buckets", "service_tier")
 	assertColumnExists(t, store.db, "usage_threshold_state", "model")
 	assertColumnExists(t, store.db, "usage_threshold_state", "reasoning_effort")
+	assertColumnExists(t, store.db, "usage_threshold_state", "service_tier")
 	assertColumnExists(t, store.db, "usage_threshold_events", "reasoning_effort")
+	assertColumnExists(t, store.db, "usage_threshold_events", "service_tier")
 
 	var effort string
+	var serviceTier string
 	var total int64
-	err = store.db.QueryRowContext(ctx, `SELECT reasoning_effort, total_tokens FROM usage_buckets WHERE user_id = 'usr_1'`).Scan(&effort, &total)
+	err = store.db.QueryRowContext(ctx, `SELECT reasoning_effort, service_tier, total_tokens FROM usage_buckets WHERE user_id = 'usr_1'`).Scan(&effort, &serviceTier, &total)
 	if err != nil {
 		t.Fatalf("query migrated usage bucket: %v", err)
 	}
-	if effort != "unknown" || total != 12 {
-		t.Fatalf("migrated usage bucket effort/total = %s/%d, want unknown/12", effort, total)
+	if effort != "unknown" || serviceTier != "standard" || total != 12 {
+		t.Fatalf("migrated usage bucket dimension/total = %s/%s/%d, want unknown/standard/12", effort, serviceTier, total)
 	}
 
 	var eventEffort string
-	err = store.db.QueryRowContext(ctx, `SELECT reasoning_effort FROM usage_threshold_events WHERE id = 'evt_1'`).Scan(&eventEffort)
+	var eventServiceTier string
+	err = store.db.QueryRowContext(ctx, `SELECT reasoning_effort, service_tier FROM usage_threshold_events WHERE id = 'evt_1'`).Scan(&eventEffort, &eventServiceTier)
 	if err != nil {
 		t.Fatalf("query migrated threshold event: %v", err)
 	}
-	if eventEffort != "unknown" {
-		t.Fatalf("migrated event effort = %q, want unknown", eventEffort)
+	if eventEffort != "unknown" || eventServiceTier != "standard" {
+		t.Fatalf("migrated event dimension = %s/%s, want unknown/standard", eventEffort, eventServiceTier)
+	}
+
+	var stateServiceTier string
+	err = store.db.QueryRowContext(ctx, `SELECT service_tier FROM usage_threshold_state WHERE api_key_id = 'key_1'`).Scan(&stateServiceTier)
+	if err != nil {
+		t.Fatalf("query migrated threshold state: %v", err)
+	}
+	if stateServiceTier != "standard" {
+		t.Fatalf("migrated state service_tier = %q, want standard", stateServiceTier)
 	}
 }
 
@@ -800,6 +988,7 @@ func TestServerRecordsFinalWebSocketUsagePerResponseAndProxiesFrames(t *testing.
 		{
 			Model:           "gpt-5.5",
 			ReasoningEffort: "xhigh",
+			ServiceTier:     "standard",
 			UsageCounters: UsageCounters{
 				RequestCount: 1,
 				InputTokens:  10,
@@ -814,6 +1003,74 @@ func TestServerRecordsFinalWebSocketUsagePerResponseAndProxiesFrames(t *testing.
 	}
 	if sawOpenAIBeta != websocketBetaHeader {
 		t.Fatalf("upstream OpenAI-Beta = %q, want %q", sawOpenAIBeta, websocketBetaHeader)
+	}
+}
+
+func TestServerRejectsFastServiceTierWebSocketFrameByDefault(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	upstreamReceived := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, payload, err := conn.ReadMessage()
+		if err == nil {
+			upstreamReceived <- payload
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:      authDir,
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL: upstream.URL + "/backend-api/codex",
+		RequestRetry: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	created := createManagedUser(t, handler, "admin-key", "Alice")
+
+	proxyServer := httptest.NewServer(handler)
+	defer proxyServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http") + "/v1/responses"
+	headers := http.Header{"Authorization": []string{"Bearer " + created.PlaintextAPIKey}}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if err != nil {
+		t.Fatalf("dial proxy websocket: %v", err)
+	}
+	defer conn.Close()
+
+	requestFrame := []byte(`{"type":"response.create","model":"gpt-5.5","service_tier":"priority","input":"hello"}`)
+	if err = conn.WriteMessage(websocket.TextMessage, requestFrame); err != nil {
+		t.Fatalf("write proxy websocket: %v", err)
+	}
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("read websocket returned nil error, want close")
+	}
+	closeErr, ok := err.(*websocket.CloseError)
+	if !ok || closeErr.Code != websocket.ClosePolicyViolation {
+		t.Fatalf("websocket close error = %v, want policy violation", err)
+	}
+
+	select {
+	case payload := <-upstreamReceived:
+		t.Fatalf("upstream received disabled Fast mode frame: %s", string(payload))
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -931,6 +1188,7 @@ func TestServerSkipsWebSocketPrewarmUsage(t *testing.T) {
 		{
 			Model:           "gpt-5.5",
 			ReasoningEffort: "xhigh",
+			ServiceTier:     "standard",
 			UsageCounters: UsageCounters{
 				RequestCount: 1,
 				InputTokens:  10,
@@ -1006,8 +1264,8 @@ func assertUsageDimensions(t *testing.T, got []testUsageDimension, want []testUs
 		t.Fatalf("usage dimension count = %d, want %d: %#v", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i].Model != want[i].Model || got[i].ReasoningEffort != want[i].ReasoningEffort {
-			t.Fatalf("usage dimension #%d = %s/%s, want %s/%s", i, got[i].Model, got[i].ReasoningEffort, want[i].Model, want[i].ReasoningEffort)
+		if got[i].Model != want[i].Model || got[i].ReasoningEffort != want[i].ReasoningEffort || got[i].ServiceTier != want[i].ServiceTier {
+			t.Fatalf("usage dimension #%d = %s/%s/%s, want %s/%s/%s", i, got[i].Model, got[i].ReasoningEffort, got[i].ServiceTier, want[i].Model, want[i].ReasoningEffort, want[i].ServiceTier)
 		}
 		assertUsageCounters(t, got[i].UsageCounters, want[i].UsageCounters)
 		assertUsageWindows(t, got[i].Windows, want[i].Windows)

@@ -35,6 +35,9 @@ func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 	if cfg.Debug {
 		t.Fatal("Debug = true, want false default")
 	}
+	if cfg.AllowFastMode {
+		t.Fatal("AllowFastMode = true, want false default")
+	}
 	if cfg.RequestRetry != 3 {
 		t.Fatalf("RequestRetry = %d, want 3", cfg.RequestRetry)
 	}
@@ -49,6 +52,23 @@ func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 	}
 	if cfg.ChatGPTBaseURL != DefaultChatGPTBaseURL {
 		t.Fatalf("ChatGPTBaseURL = %q, want %q", cfg.ChatGPTBaseURL, DefaultChatGPTBaseURL)
+	}
+}
+
+func TestLoadConfigParsesFastModeSetting(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("allow-fast-mode: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+
+	if !cfg.AllowFastMode {
+		t.Fatal("AllowFastMode = false, want true")
 	}
 }
 

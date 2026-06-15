@@ -26,6 +26,7 @@ type usageCaptureContext struct {
 	AuthID          string
 	Model           string
 	ReasoningEffort string
+	ServiceTier     string
 	StatusCode      int
 	RequestID       string
 	RetryAfter      string
@@ -184,7 +185,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 	diagnostics := s.usageDiagnostics(capture)
 	if s.debugUsageResponseEnabled() {
 		s.debugf(
-			"usage response request_id=%s user_id=%s api_key_id=%s key_hash=%s masked_key=%s auth_id=%s model=%s reasoning_effort=%s status=%d total_tokens=%d has_usage=%t truncated=%t retry_after=%q",
+			"usage response request_id=%s user_id=%s api_key_id=%s key_hash=%s masked_key=%s auth_id=%s model=%s reasoning_effort=%s service_tier=%s status=%d total_tokens=%d has_usage=%t truncated=%t retry_after=%q",
 			capture.RequestID,
 			credential.User.ID,
 			credential.APIKey.ID,
@@ -193,6 +194,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 			capture.AuthID,
 			normalizeUsageText(capture.Model, "unknown"),
 			normalizeUsageText(capture.ReasoningEffort, "unknown"),
+			normalizeServiceTier(capture.ServiceTier),
 			capture.StatusCode,
 			capture.Counters.TotalTokens,
 			capture.HasUsage,
@@ -206,6 +208,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 		APIKey:          credential.APIKey,
 		Model:           capture.Model,
 		ReasoningEffort: capture.ReasoningEffort,
+		ServiceTier:     capture.ServiceTier,
 		AuthID:          capture.AuthID,
 		RequestID:       capture.RequestID,
 		StatusCode:      capture.StatusCode,
@@ -232,6 +235,7 @@ func (s *Server) usageDiagnostics(capture usageCaptureContext) string {
 		"auth_id":          capture.AuthID,
 		"model":            normalizeUsageText(capture.Model, "unknown"),
 		"reasoning_effort": normalizeUsageText(capture.ReasoningEffort, "unknown"),
+		"service_tier":     normalizeServiceTier(capture.ServiceTier),
 		"status":           capture.StatusCode,
 		"retry_after":      strings.TrimSpace(capture.RetryAfter),
 		"has_usage":        capture.HasUsage,
@@ -252,6 +256,7 @@ func (s *Server) debugUsageResponseEnabled() bool {
 type proxyRequestUsageMetadata struct {
 	Model           string
 	ReasoningEffort string
+	ServiceTier     string
 	SkipUsage       bool
 }
 
@@ -265,6 +270,9 @@ func captureProxyRequestUsageMetadata(r *http.Request) proxyRequestUsageMetadata
 	}
 	if queryEffort := strings.TrimSpace(r.URL.Query().Get("reasoning_effort")); queryEffort != "" {
 		metadata.ReasoningEffort = queryEffort
+	}
+	if queryServiceTier := requestServiceTierFromQuery(r.URL.Query()); queryServiceTier != "" {
+		metadata.ServiceTier = normalizeServiceTier(queryServiceTier)
 	}
 	if r.Body == nil || r.Body == http.NoBody {
 		return metadata
@@ -317,10 +325,13 @@ func usageMetadataFromMap(payload map[string]any) (proxyRequestUsageMetadata, bo
 	if effort, ok := payload["model_reasoning_effort"].(string); ok && strings.TrimSpace(effort) != "" {
 		metadata.ReasoningEffort = strings.TrimSpace(effort)
 	}
+	if serviceTier, ok := payload["service_tier"].(string); ok && strings.TrimSpace(serviceTier) != "" {
+		metadata.ServiceTier = normalizeServiceTier(serviceTier)
+	}
 	if generate, ok := payload["generate"].(bool); ok && !generate {
 		metadata.SkipUsage = true
 	}
-	return metadata, metadata.Model != "" || metadata.ReasoningEffort != "" || metadata.SkipUsage
+	return metadata, metadata.Model != "" || metadata.ReasoningEffort != "" || metadata.ServiceTier != "" || metadata.SkipUsage
 }
 
 func mergeUsageMetadata(current proxyRequestUsageMetadata, next proxyRequestUsageMetadata) proxyRequestUsageMetadata {
@@ -330,8 +341,22 @@ func mergeUsageMetadata(current proxyRequestUsageMetadata, next proxyRequestUsag
 	if strings.TrimSpace(next.ReasoningEffort) != "" {
 		current.ReasoningEffort = strings.TrimSpace(next.ReasoningEffort)
 	}
+	if strings.TrimSpace(next.ServiceTier) != "" {
+		current.ServiceTier = normalizeServiceTier(next.ServiceTier)
+	}
 	current.SkipUsage = next.SkipUsage
 	return current
+}
+
+func requestServiceTierFromQuery(query url.Values) string {
+	for _, key := range []string{"service_tier", "service-tier"} {
+		for _, value := range query[key] {
+			if strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
 }
 
 type webSocketUsageEvent struct {
@@ -432,9 +457,14 @@ func newUsageRequestID() string {
 }
 
 func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization, auth *Auth) {
+	if !s.fastModeAllowed() && queryHasFastServiceTier(r.URL.Query()) {
+		writeError(w, http.StatusBadRequest, "fast mode is disabled")
+		return
+	}
 	metadata := proxyRequestUsageMetadata{
 		Model:           strings.TrimSpace(r.URL.Query().Get("model")),
 		ReasoningEffort: strings.TrimSpace(r.URL.Query().Get("reasoning_effort")),
+		ServiceTier:     normalizeServiceTier(requestServiceTierFromQuery(r.URL.Query())),
 	}
 	var metadataMu sync.Mutex
 	currentMetadata := func() proxyRequestUsageMetadata {
@@ -473,6 +503,7 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 				AuthID:          auth.ID,
 				Model:           metadata.Model,
 				ReasoningEffort: metadata.ReasoningEffort,
+				ServiceTier:     metadata.ServiceTier,
 				StatusCode:      statusCode,
 				RequestID:       requestIDFromRequest(r),
 			})
@@ -499,6 +530,7 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 				AuthID:          auth.ID,
 				Model:           metadata.Model,
 				ReasoningEffort: metadata.ReasoningEffort,
+				ServiceTier:     metadata.ServiceTier,
 				StatusCode:      http.StatusBadGateway,
 				RequestID:       requestIDFromRequest(r),
 			})
@@ -540,6 +572,7 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 				AuthID:          auth.ID,
 				Model:           recordMetadata.Model,
 				ReasoningEffort: recordMetadata.ReasoningEffort,
+				ServiceTier:     recordMetadata.ServiceTier,
 				StatusCode:      http.StatusSwitchingProtocols,
 				RequestID:       requestIDFromRequest(r),
 				Counters:        counters,
@@ -562,13 +595,22 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 			closeBoth()
 			done <- struct{}{}
 		}()
-		copyWebSocketMessages(clientConn, upstreamConn, func(messageType int, payload []byte) {
+		copyWebSocketMessages(clientConn, upstreamConn, func(messageType int, payload []byte) bool {
 			if messageType != websocket.TextMessage {
-				return
+				return true
+			}
+			if !s.fastModeAllowed() && payloadHasFastServiceTier(payload) {
+				_ = clientConn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "fast mode is disabled"),
+					time.Now().Add(time.Second),
+				)
+				return false
 			}
 			if requestMetadata, ok := usageMetadataFromJSON(payload); ok {
 				updateMetadata(requestMetadata)
 			}
+			return true
 		})
 	}()
 	go func() {
@@ -576,13 +618,14 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 			closeBoth()
 			done <- struct{}{}
 		}()
-		copyWebSocketMessages(upstreamConn, clientConn, func(messageType int, payload []byte) {
+		copyWebSocketMessages(upstreamConn, clientConn, func(messageType int, payload []byte) bool {
 			if messageType != websocket.TextMessage {
-				return
+				return true
 			}
 			if usageEvent, ok := webSocketUsageEventFromJSON(payload); ok {
 				recordWebSocketUsage(usageEvent)
 			}
+			return true
 		})
 	}()
 	<-done
@@ -599,20 +642,21 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 			AuthID:          auth.ID,
 			Model:           recordMetadata.Model,
 			ReasoningEffort: recordMetadata.ReasoningEffort,
+			ServiceTier:     recordMetadata.ServiceTier,
 			StatusCode:      http.StatusSwitchingProtocols,
 			RequestID:       requestIDFromRequest(r),
 		})
 	}
 }
 
-func copyWebSocketMessages(src *websocket.Conn, dst *websocket.Conn, inspect func(int, []byte)) {
+func copyWebSocketMessages(src *websocket.Conn, dst *websocket.Conn, inspect func(int, []byte) bool) {
 	for {
 		messageType, payload, err := src.ReadMessage()
 		if err != nil {
 			return
 		}
-		if inspect != nil {
-			inspect(messageType, payload)
+		if inspect != nil && !inspect(messageType, payload) {
+			return
 		}
 		if err = dst.WriteMessage(messageType, payload); err != nil {
 			return
