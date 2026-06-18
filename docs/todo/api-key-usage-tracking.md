@@ -3,8 +3,8 @@
 Status: implemented.
 
 Implemented coverage includes managed-user usage buckets, today's user usage
-API, management usage snapshots, threshold events, HTTP/SSE usage extraction,
-WebSocket text-frame usage extraction, and safe debug diagnostics.
+API, management usage snapshots, HTTP/SSE usage extraction, WebSocket text-frame
+usage extraction, and safe debug diagnostics.
 
 ## Goal
 
@@ -12,8 +12,8 @@ Track Codex OAuth proxy usage by stored user API key after the User and API Key
 Management API phase is implemented.
 
 The first implementation should provide local statistics, user-visible today's
-token totals, and threshold events. It must not enforce limits, block requests,
-send Telegram messages, call webhooks, or add a Web UI.
+token totals, and management rolling-window snapshots. It must not enforce
+limits, block requests, send Telegram messages, call webhooks, or add a Web UI.
 
 ## Dependency
 
@@ -30,16 +30,13 @@ have a stored user identity and should not be included in per-user usage totals.
 - Count Codex OAuth proxy traffic authenticated by stored user API keys.
 - Attribute usage to both `user_id` and `api_key_id`.
 - Provide a user API for today's token usage.
-- Provide management APIs for usage snapshots and threshold events.
-- Use local token accounting as an approximation for Codex subscription
-  capacity.
+- Provide a management API for usage snapshots.
 - Track 5-hour and 7-day rolling windows.
-- Record threshold-crossing events for later Telegram bot or external-service
-  integration.
 
 ## Non-Goals
 
 - No request blocking or local quota enforcement.
+- No threshold events, quota ratios, or alert state.
 - No Telegram bot, webhook sender, or notification scheduler.
 - No Web UI.
 - No restoration of CPA management endpoints such as
@@ -52,24 +49,10 @@ have a stored user identity and should not be included in per-user usage totals.
 ```yaml
 usage:
   enabled: true
-  five-hour-reference-tokens: 0
-  weekly-reference-tokens: 0
-  alert-threshold: 0.8
-  event-retention-days: 30
   debug-openai-response: false
 ```
 
 - `enabled`: Enables built-in usage tracking. Default: `true`.
-- `five-hour-reference-tokens`: Reference token capacity for the 5-hour window.
-  This is not a hard limit. When `0`, return token totals without a ratio or
-  threshold event for this window.
-- `weekly-reference-tokens`: Reference token capacity for the 7-day window.
-  This is not a hard limit. When `0`, return token totals without a ratio or
-  threshold event for this window.
-- `alert-threshold`: Ratio that creates a threshold event when crossed from
-  below to above. Default: `0.8`.
-- `event-retention-days`: Number of days to keep threshold events. Default:
-  `30`.
 - `debug-openai-response`: Enables safe response diagnostics when top-level
   `debug` is also true. Default: `false`.
 
@@ -127,30 +110,6 @@ Keep enough buckets for the 7-day window and today's user query. Derive:
 
 Prune buckets older than the required retention window.
 
-### `usage_threshold_events`
-
-Event fields:
-
-- `id`
-- `timestamp`
-- `window`: `5h` or `7d`
-- `user_id`
-- `api_key_id`
-- `key_hash`
-- `masked_key`
-- `ratio`
-- `threshold`
-- `total_tokens`
-- `reference_tokens`
-- `request_count`
-- `failed_request_count`
-- `model`
-- `auth_id`
-- `request_id`
-- `diagnostics`
-
-Prune events older than `event-retention-days`.
-
 ## Token Accounting
 
 Token totals should come from safe response metadata when available.
@@ -174,15 +133,6 @@ For Codex response WebSocket traffic:
 
 If no token usage can be extracted for a request, count the request and failure
 status but leave token increments at zero.
-
-## Threshold Events
-
-Create an event only when a key crosses the configured threshold from below to
-above for a window. Do not repeatedly create events while the same key remains
-above the threshold. If the key later falls below the threshold and crosses
-again, create a new event.
-
-Threshold state should be tracked per `api_key_id` and window.
 
 ## User API Draft
 
@@ -220,21 +170,11 @@ Return a snapshot grouped by user and API key. Each entry should include:
 - `windows.7d`
 - token totals per window
 - request and failure counts per window
-- ratio when the reference token capacity is configured
-- whether the window is currently over the threshold
 
 Optional filters:
 
 - `user_id`
 - `api_key_id`
-
-### `GET /v0/management/usage/events?count=100`
-
-Return recent threshold events, newest first.
-
-- `count` defaults to `100`.
-- Reject non-positive `count` values with HTTP 400.
-- Apply a reasonable maximum to avoid unbounded responses.
 
 ## Safe Debug Logging
 
@@ -265,9 +205,6 @@ safe structured diagnostics containing only:
 - `usage_limit_reached` reset metadata, if present
 - token usage summary
 
-The same safe diagnostic fields can be copied into threshold events so a later
-Telegram bot or external service can explain why an alert fired.
-
 ## Implementation Notes
 
 - Keep implementation under `internal/codexonly` unless the server entrypoint
@@ -277,7 +214,6 @@ Telegram bot or external service can explain why an alert fired.
 - Prefer small, testable units:
   - request identity propagation
   - bucket aggregation and pruning
-  - threshold crossing state
   - SQLite persistence
   - management API response shaping
   - user API response shaping
@@ -290,17 +226,12 @@ Telegram bot or external service can explain why an alert fired.
 - Codex OAuth requests with stored user API keys are counted.
 - Requests authenticated only by Codex upstream access-token compatibility are
   not counted as user usage.
-- Full API keys are never exposed by APIs, events, logs, or SQLite.
-- Zero-token records do not affect quota ratios.
+- Full API keys are never exposed by APIs, logs, or SQLite.
 - Today's usage aggregates the expected UTC-day buckets.
 - 5-hour and 7-day windows aggregate the expected buckets.
 - Buckets older than the retention window are pruned.
-- First threshold crossing creates one event.
-- Remaining above the threshold does not create duplicate events.
-- Falling below and crossing again creates a new event.
 - Management usage endpoints require the admin API key.
 - User usage endpoints require a valid stored user API key.
-- `count <= 0` for the events endpoint returns HTTP 400.
 - Ordinary HTTP response usage is extracted when present.
 - Codex response WebSocket usage is extracted when present.
 - WebSocket traffic still proxies transparently after usage inspection is added.

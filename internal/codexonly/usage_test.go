@@ -23,18 +23,6 @@ func TestUsageConfigDefaultsAndDisable(t *testing.T) {
 	if !usageTrackingEnabled(cfg) {
 		t.Fatal("usage tracking default = false, want true")
 	}
-	if cfg.Usage.FiveHourReferenceTokens != 0 {
-		t.Fatalf("five-hour reference = %d, want 0", cfg.Usage.FiveHourReferenceTokens)
-	}
-	if cfg.Usage.WeeklyReferenceTokens != 0 {
-		t.Fatalf("weekly reference = %d, want 0", cfg.Usage.WeeklyReferenceTokens)
-	}
-	if got := usageAlertThreshold(cfg.Usage); got != 0.8 {
-		t.Fatalf("alert threshold = %v, want 0.8", got)
-	}
-	if got := usageEventRetentionDays(cfg.Usage); got != 30 {
-		t.Fatalf("event retention days = %d, want 30", got)
-	}
 
 	disabled := false
 	cfg.Usage.Enabled = &disabled
@@ -89,7 +77,7 @@ func TestExtractUsageCountersFromJSONAndSSE(t *testing.T) {
 	})
 }
 
-func TestUserStoreRecordsUsageBucketsAndThresholdEvents(t *testing.T) {
+func TestUserStoreRecordsUsageBucketsAndWindows(t *testing.T) {
 	store := openTestUserStore(t)
 	ctx := context.Background()
 	fixed := time.Date(2026, 6, 12, 10, 7, 0, 0, time.UTC)
@@ -106,12 +94,8 @@ func TestUserStoreRecordsUsageBucketsAndThresholdEvents(t *testing.T) {
 
 	enabled := true
 	cfg := UsageConfig{
-		Enabled:                 &enabled,
-		FiveHourReferenceTokens: 100,
-		WeeklyReferenceTokens:   100,
-		AlertThreshold:          0.5,
-		EventRetentionDays:      30,
-		DebugOpenAIResponse:     false,
+		Enabled:             &enabled,
+		DebugOpenAIResponse: false,
 	}
 
 	for i, tokens := range []int64{40, 20, 10} {
@@ -166,26 +150,6 @@ func TestUserStoreRecordsUsageBucketsAndThresholdEvents(t *testing.T) {
 		OutputTokens: 35,
 		TotalTokens:  70,
 	})
-	if fiveHour.Ratio == nil || *fiveHour.Ratio != 0.7 {
-		t.Fatalf("5h ratio = %#v, want 0.7", fiveHour.Ratio)
-	}
-	if !fiveHour.OverThreshold {
-		t.Fatal("5h over_threshold = false, want true")
-	}
-
-	events, err := store.ListUsageEvents(ctx, 10)
-	if err != nil {
-		t.Fatalf("ListUsageEvents returned error: %v", err)
-	}
-	if len(events) != 2 {
-		t.Fatalf("event count = %d, want 2", len(events))
-	}
-	if events[0].Window != "7d" || events[1].Window != "5h" {
-		t.Fatalf("event windows = %s/%s, want newest 7d then 5h", events[0].Window, events[1].Window)
-	}
-	if events[1].TotalTokens != 60 || events[1].RequestCount != 2 {
-		t.Fatalf("5h event totals = tokens %d requests %d, want 60/2", events[1].TotalTokens, events[1].RequestCount)
-	}
 }
 
 func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
@@ -218,10 +182,7 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 		ChatGPTBaseURL: upstream.URL + "/backend-api",
 		RequestRetry:   1,
 		Usage: UsageConfig{
-			Enabled:                 &enabled,
-			FiveHourReferenceTokens: 40,
-			WeeklyReferenceTokens:   100,
-			AlertThreshold:          0.5,
+			Enabled: &enabled,
 		},
 	})
 	if err != nil {
@@ -294,13 +255,19 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 	if strings.Contains(usageResp.Body.String(), created.PlaintextAPIKey) {
 		t.Fatalf("management usage leaked plaintext API key: %s", usageResp.Body.String())
 	}
+	for _, field := range []string{`"reference_tokens"`, `"ratio"`, `"over_threshold"`} {
+		if strings.Contains(usageResp.Body.String(), field) {
+			t.Fatalf("management usage response includes quota field %s: %s", field, usageResp.Body.String())
+		}
+	}
 	fiveHour := entry.Windows["5h"]
-	if fiveHour.Ratio == nil || *fiveHour.Ratio != 0.5 {
-		t.Fatalf("management 5h ratio = %#v, want 0.5", fiveHour.Ratio)
-	}
-	if !fiveHour.OverThreshold {
-		t.Fatal("management 5h over_threshold = false, want true")
-	}
+	assertUsageCounters(t, fiveHour.UsageCounters, UsageCounters{
+		RequestCount:    1,
+		InputTokens:     12,
+		OutputTokens:    8,
+		ReasoningTokens: 3,
+		TotalTokens:     20,
+	})
 	assertUsageDimensions(t, entry.Models, []testUsageDimension{
 		{
 			Model:           "gpt-5.3-codex",
@@ -315,9 +282,6 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 						ReasoningTokens: 3,
 						TotalTokens:     20,
 					},
-					ReferenceTokens: 40,
-					Ratio:           ptrFloat64(0.5),
-					OverThreshold:   true,
 				},
 				"7d": {
 					UsageCounters: UsageCounters{
@@ -327,34 +291,10 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 						ReasoningTokens: 3,
 						TotalTokens:     20,
 					},
-					ReferenceTokens: 100,
-					Ratio:           ptrFloat64(0.2),
-					OverThreshold:   false,
 				},
 			},
 		},
 	})
-
-	eventsResp := doJSONRequest(t, handler, http.MethodGet, "/v0/management/usage/events?count=10", "", "admin-key")
-	if eventsResp.Code != http.StatusOK {
-		t.Fatalf("events status = %d, want 200, body: %s", eventsResp.Code, eventsResp.Body.String())
-	}
-	var eventsPayload struct {
-		Events []UsageThresholdEvent `json:"events"`
-	}
-	decodeResponse(t, eventsResp, &eventsPayload)
-	if len(eventsPayload.Events) != 1 {
-		t.Fatalf("events count = %d, want 1", len(eventsPayload.Events))
-	}
-	if strings.Contains(eventsResp.Body.String(), created.PlaintextAPIKey) {
-		t.Fatalf("events leaked plaintext API key: %s", eventsResp.Body.String())
-	}
-	if eventsPayload.Events[0].ReasoningEffort != "high" {
-		t.Fatalf("event reasoning_effort = %q, want high", eventsPayload.Events[0].ReasoningEffort)
-	}
-	if eventsPayload.Events[0].ServiceTier != "standard" {
-		t.Fatalf("event service_tier = %q, want standard", eventsPayload.Events[0].ServiceTier)
-	}
 }
 
 func TestServerRecordsFastServiceTierUsage(t *testing.T) {
@@ -437,11 +377,7 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 		t.Fatalf("AuthenticateAPIKey returned error: %v", err)
 	}
 
-	cfg := UsageConfig{
-		FiveHourReferenceTokens: 100,
-		WeeklyReferenceTokens:   100,
-		AlertThreshold:          0.5,
-	}
+	cfg := UsageConfig{}
 	records := []struct {
 		effort string
 		tokens int64
@@ -526,9 +462,6 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 						OutputTokens: 28,
 						TotalTokens:  55,
 					},
-					ReferenceTokens: 100,
-					Ratio:           ptrFloat64(0.55),
-					OverThreshold:   true,
 				},
 				"7d": {
 					UsageCounters: UsageCounters{
@@ -537,9 +470,6 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 						OutputTokens: 28,
 						TotalTokens:  55,
 					},
-					ReferenceTokens: 100,
-					Ratio:           ptrFloat64(0.55),
-					OverThreshold:   true,
 				},
 			},
 		},
@@ -555,9 +485,6 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 						OutputTokens: 10,
 						TotalTokens:  20,
 					},
-					ReferenceTokens: 100,
-					Ratio:           ptrFloat64(0.2),
-					OverThreshold:   false,
 				},
 				"7d": {
 					UsageCounters: UsageCounters{
@@ -566,29 +493,10 @@ func TestUserStoreSeparatesUsageByReasoningEffort(t *testing.T) {
 						OutputTokens: 10,
 						TotalTokens:  20,
 					},
-					ReferenceTokens: 100,
-					Ratio:           ptrFloat64(0.2),
-					OverThreshold:   false,
 				},
 			},
 		},
 	})
-
-	events, err := store.ListUsageEvents(ctx, 10)
-	if err != nil {
-		t.Fatalf("ListUsageEvents returned error: %v", err)
-	}
-	if len(events) != 2 {
-		t.Fatalf("event count = %d, want 2", len(events))
-	}
-	for _, event := range events {
-		if event.Model != "gpt-5.5" || event.ReasoningEffort != "high" || event.ServiceTier != "standard" {
-			t.Fatalf("event dimension = %s/%s/%s, want gpt-5.5/high/standard", event.Model, event.ReasoningEffort, event.ServiceTier)
-		}
-		if event.TotalTokens != 55 || event.RequestCount != 2 {
-			t.Fatalf("event totals = tokens %d requests %d, want 55/2", event.TotalTokens, event.RequestCount)
-		}
-	}
 }
 
 func TestUserStoreSeparatesUsageByServiceTier(t *testing.T) {
@@ -606,11 +514,7 @@ func TestUserStoreSeparatesUsageByServiceTier(t *testing.T) {
 		t.Fatalf("AuthenticateAPIKey returned error: %v", err)
 	}
 
-	cfg := UsageConfig{
-		FiveHourReferenceTokens: 100,
-		WeeklyReferenceTokens:   100,
-		AlertThreshold:          0.5,
-	}
+	cfg := UsageConfig{}
 	records := []struct {
 		serviceTier string
 		tokens      int64
@@ -675,19 +579,6 @@ func TestUserStoreSeparatesUsageByServiceTier(t *testing.T) {
 			},
 		},
 	})
-
-	events, err := store.ListUsageEvents(ctx, 10)
-	if err != nil {
-		t.Fatalf("ListUsageEvents returned error: %v", err)
-	}
-	if len(events) != 2 {
-		t.Fatalf("event count = %d, want 2", len(events))
-	}
-	for _, event := range events {
-		if event.ServiceTier != "standard" {
-			t.Fatalf("event service_tier = %q, want standard", event.ServiceTier)
-		}
-	}
 }
 
 func TestUserStoreMigratesUsageReasoningEffort(t *testing.T) {
@@ -736,32 +627,6 @@ func TestUserStoreMigratesUsageReasoningEffort(t *testing.T) {
 			updated_at TEXT NOT NULL,
 			PRIMARY KEY (bucket_start, user_id, api_key_id, model, auth_id)
 		)`,
-		`CREATE TABLE usage_threshold_state (
-			window TEXT NOT NULL,
-			api_key_id TEXT NOT NULL,
-			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
-			updated_at TEXT NOT NULL,
-			PRIMARY KEY (window, api_key_id)
-		)`,
-		`CREATE TABLE usage_threshold_events (
-			id TEXT PRIMARY KEY,
-			timestamp TEXT NOT NULL,
-			window TEXT NOT NULL,
-			user_id TEXT NOT NULL,
-			api_key_id TEXT NOT NULL,
-			key_hash TEXT NOT NULL,
-			masked_key TEXT NOT NULL,
-			ratio REAL NOT NULL,
-			threshold REAL NOT NULL,
-			total_tokens INTEGER NOT NULL,
-			reference_tokens INTEGER NOT NULL,
-			request_count INTEGER NOT NULL,
-			failed_request_count INTEGER NOT NULL,
-			model TEXT NOT NULL,
-			auth_id TEXT NOT NULL,
-			request_id TEXT NOT NULL,
-			diagnostics TEXT NOT NULL
-		)`,
 		`INSERT INTO users (id, name, enabled, created_at, updated_at)
 			VALUES ('usr_1', 'Alice', 1, '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z')`,
 		`INSERT INTO api_keys (id, user_id, key_hash, key_prefix, masked_key, enabled, created_at)
@@ -772,17 +637,6 @@ func TestUserStoreMigratesUsageReasoningEffort(t *testing.T) {
 		) VALUES (
 			'2026-06-12T10:00:00Z', 'usr_1', 'key_1', 'hash_1', 'cop_old...old',
 			'gpt-5.5', 'auth.json', 1, 7, 5, 12, '2026-06-12T10:00:00Z'
-		)`,
-		`INSERT INTO usage_threshold_state (window, api_key_id, above_threshold, updated_at)
-			VALUES ('5h', 'key_1', 1, '2026-06-12T10:00:00Z')`,
-		`INSERT INTO usage_threshold_events (
-			id, timestamp, window, user_id, api_key_id, key_hash, masked_key, ratio,
-			threshold, total_tokens, reference_tokens, request_count, failed_request_count,
-			model, auth_id, request_id, diagnostics
-		) VALUES (
-			'evt_1', '2026-06-12T10:00:00Z', '5h', 'usr_1', 'key_1', 'hash_1',
-			'cop_old...old', 0.8, 0.8, 80, 100, 1, 0, 'gpt-5.5', 'auth.json',
-			'req_1', '{}'
 		)`,
 	} {
 		if _, err = db.ExecContext(ctx, statement); err != nil {
@@ -801,12 +655,6 @@ func TestUserStoreMigratesUsageReasoningEffort(t *testing.T) {
 
 	assertColumnExists(t, store.db, "usage_buckets", "reasoning_effort")
 	assertColumnExists(t, store.db, "usage_buckets", "service_tier")
-	assertColumnExists(t, store.db, "usage_threshold_state", "model")
-	assertColumnExists(t, store.db, "usage_threshold_state", "reasoning_effort")
-	assertColumnExists(t, store.db, "usage_threshold_state", "service_tier")
-	assertColumnExists(t, store.db, "usage_threshold_events", "reasoning_effort")
-	assertColumnExists(t, store.db, "usage_threshold_events", "service_tier")
-
 	var effort string
 	var serviceTier string
 	var total int64
@@ -818,24 +666,6 @@ func TestUserStoreMigratesUsageReasoningEffort(t *testing.T) {
 		t.Fatalf("migrated usage bucket dimension/total = %s/%s/%d, want unknown/standard/12", effort, serviceTier, total)
 	}
 
-	var eventEffort string
-	var eventServiceTier string
-	err = store.db.QueryRowContext(ctx, `SELECT reasoning_effort, service_tier FROM usage_threshold_events WHERE id = 'evt_1'`).Scan(&eventEffort, &eventServiceTier)
-	if err != nil {
-		t.Fatalf("query migrated threshold event: %v", err)
-	}
-	if eventEffort != "unknown" || eventServiceTier != "standard" {
-		t.Fatalf("migrated event dimension = %s/%s, want unknown/standard", eventEffort, eventServiceTier)
-	}
-
-	var stateServiceTier string
-	err = store.db.QueryRowContext(ctx, `SELECT service_tier FROM usage_threshold_state WHERE api_key_id = 'key_1'`).Scan(&stateServiceTier)
-	if err != nil {
-		t.Fatalf("query migrated threshold state: %v", err)
-	}
-	if stateServiceTier != "standard" {
-		t.Fatalf("migrated state service_tier = %q, want standard", stateServiceTier)
-	}
 }
 
 func TestServerRecordsLongSSEUsageBeyondCaptureLimit(t *testing.T) {
@@ -879,12 +709,12 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"outpu
 	waitForUsageTotal(t, handler, created.PlaintextAPIKey, 16)
 }
 
-func TestManagementUsageEventsRejectsNonPositiveCount(t *testing.T) {
+func TestManagementUsageEventsRouteRemoved(t *testing.T) {
 	handler := newUserManagementTestHandler(t, &Config{AdminAPIKey: "admin-key"})
 
 	resp := doJSONRequest(t, handler, http.MethodGet, "/v0/management/usage/events?count=0", "", "admin-key")
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400, body: %s", resp.Code, resp.Body.String())
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body: %s", resp.Code, resp.Body.String())
 	}
 }
 
@@ -1286,24 +1116,7 @@ func assertUsageWindows(t *testing.T, got map[string]UsageWindow, want map[strin
 			t.Fatalf("usage window %q missing from %#v", name, got)
 		}
 		assertUsageCounters(t, gotWindow.UsageCounters, wantWindow.UsageCounters)
-		if gotWindow.ReferenceTokens != wantWindow.ReferenceTokens {
-			t.Fatalf("usage window %q reference tokens = %d, want %d", name, gotWindow.ReferenceTokens, wantWindow.ReferenceTokens)
-		}
-		if gotWindow.OverThreshold != wantWindow.OverThreshold {
-			t.Fatalf("usage window %q over_threshold = %t, want %t", name, gotWindow.OverThreshold, wantWindow.OverThreshold)
-		}
-		switch {
-		case gotWindow.Ratio == nil && wantWindow.Ratio == nil:
-		case gotWindow.Ratio == nil || wantWindow.Ratio == nil:
-			t.Fatalf("usage window %q ratio = %#v, want %#v", name, gotWindow.Ratio, wantWindow.Ratio)
-		case *gotWindow.Ratio != *wantWindow.Ratio:
-			t.Fatalf("usage window %q ratio = %v, want %v", name, *gotWindow.Ratio, *wantWindow.Ratio)
-		}
 	}
-}
-
-func ptrFloat64(value float64) *float64 {
-	return &value
 }
 
 func assertColumnExists(t *testing.T, db *sql.DB, table string, column string) {

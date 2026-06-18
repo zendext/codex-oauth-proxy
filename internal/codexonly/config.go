@@ -40,12 +40,8 @@ type DatabaseConfig struct {
 }
 
 type UsageConfig struct {
-	Enabled                 *bool   `yaml:"enabled"`
-	FiveHourReferenceTokens int64   `yaml:"five-hour-reference-tokens"`
-	WeeklyReferenceTokens   int64   `yaml:"weekly-reference-tokens"`
-	AlertThreshold          float64 `yaml:"alert-threshold"`
-	EventRetentionDays      int     `yaml:"event-retention-days"`
-	DebugOpenAIResponse     bool    `yaml:"debug-openai-response"`
+	Enabled             *bool `yaml:"enabled"`
+	DebugOpenAIResponse bool  `yaml:"debug-openai-response"`
 }
 
 func LoadConfig(path string) (*Config, error) {

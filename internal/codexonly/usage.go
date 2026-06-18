@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -14,12 +13,9 @@ import (
 )
 
 const (
-	usageBucketDuration        = 10 * time.Minute
-	usageFiveHourBucketCount   = 30
-	usageWeeklyBucketCount     = 1008
-	defaultUsageAlertThreshold = 0.8
-	defaultUsageEventDays      = 30
-	maxUsageEventCount         = 1000
+	usageBucketDuration      = 10 * time.Minute
+	usageFiveHourBucketCount = 30
+	usageWeeklyBucketCount   = 1008
 )
 
 type UsageCounters struct {
@@ -64,9 +60,6 @@ type UsageSnapshotFilter struct {
 
 type UsageWindow struct {
 	UsageCounters
-	ReferenceTokens int64    `json:"reference_tokens,omitempty"`
-	Ratio           *float64 `json:"ratio,omitempty"`
-	OverThreshold   bool     `json:"over_threshold"`
 }
 
 type UsageDimension struct {
@@ -87,32 +80,9 @@ type ManagementUsageEntry struct {
 	Models    []UsageDimension       `json:"models,omitempty"`
 }
 
-type UsageThresholdEvent struct {
-	ID                 string    `json:"id"`
-	Timestamp          time.Time `json:"timestamp"`
-	Window             string    `json:"window"`
-	UserID             string    `json:"user_id"`
-	APIKeyID           string    `json:"api_key_id"`
-	KeyHash            string    `json:"key_hash"`
-	MaskedKey          string    `json:"masked_key"`
-	Ratio              float64   `json:"ratio"`
-	Threshold          float64   `json:"threshold"`
-	TotalTokens        int64     `json:"total_tokens"`
-	ReferenceTokens    int64     `json:"reference_tokens"`
-	RequestCount       int64     `json:"request_count"`
-	FailedRequestCount int64     `json:"failed_request_count"`
-	Model              string    `json:"model,omitempty"`
-	ReasoningEffort    string    `json:"reasoning_effort,omitempty"`
-	ServiceTier        string    `json:"service_tier,omitempty"`
-	AuthID             string    `json:"auth_id,omitempty"`
-	RequestID          string    `json:"request_id,omitempty"`
-	Diagnostics        string    `json:"diagnostics,omitempty"`
-}
-
 type usageWindowSpec struct {
-	name            string
-	bucketCount     int
-	referenceTokens int64
+	name        string
+	bucketCount int
 }
 
 func usageTrackingEnabled(cfg *Config) bool {
@@ -124,20 +94,6 @@ func usageTrackingEnabled(cfg *Config) bool {
 
 func usageConfigTrackingEnabled(cfg UsageConfig) bool {
 	return cfg.Enabled == nil || *cfg.Enabled
-}
-
-func usageAlertThreshold(cfg UsageConfig) float64 {
-	if cfg.AlertThreshold <= 0 {
-		return defaultUsageAlertThreshold
-	}
-	return cfg.AlertThreshold
-}
-
-func usageEventRetentionDays(cfg UsageConfig) int {
-	if cfg.EventRetentionDays <= 0 {
-		return defaultUsageEventDays
-	}
-	return cfg.EventRetentionDays
 }
 
 func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, cfg UsageConfig) error {
@@ -225,10 +181,7 @@ func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, c
 		return fmt.Errorf("upsert usage bucket: %w", err)
 	}
 
-	if err = s.recordThresholdEvents(ctx, tx, params, cfg); err != nil {
-		return err
-	}
-	if err = pruneUsageData(ctx, tx, timestamp, cfg); err != nil {
+	if err = pruneUsageData(ctx, tx, timestamp); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
@@ -315,13 +268,13 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 	entries := make([]ManagementUsageEntry, 0, len(identities))
 	for _, entry := range identities {
 		entry.Windows = map[string]UsageWindow{}
-		for _, spec := range usageWindowSpecs(cfg) {
+		for _, spec := range usageWindowSpecs() {
 			start := usageWindowStart(now, spec.bucketCount)
 			counters, errAggregate := s.aggregateUsageRange(ctx, entry.UserID, entry.APIKeyID, start, windowEnd)
 			if errAggregate != nil {
 				return nil, errAggregate
 			}
-			entry.Windows[spec.name] = buildUsageWindow(counters, spec.referenceTokens, usageAlertThreshold(cfg))
+			entry.Windows[spec.name] = buildUsageWindow(counters)
 		}
 		models, errModels := s.usageDimensionsSnapshot(ctx, entry.UserID, entry.APIKeyID, sevenDayStart, windowEnd, now, cfg)
 		if errModels != nil {
@@ -333,199 +286,16 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 	return entries, nil
 }
 
-func (s *UserStore) ListUsageEvents(ctx context.Context, count int) ([]UsageThresholdEvent, error) {
-	if s == nil || s.db == nil {
-		return nil, ErrInvalidInput
-	}
-	if count <= 0 {
-		return nil, ErrInvalidInput
-	}
-	if count > maxUsageEventCount {
-		count = maxUsageEventCount
-	}
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, timestamp, window, user_id, api_key_id, key_hash, masked_key, ratio,
-			threshold, total_tokens, reference_tokens, request_count, failed_request_count,
-			model, reasoning_effort, service_tier, auth_id, request_id, diagnostics
-		FROM usage_threshold_events
-		ORDER BY timestamp DESC, window DESC, id DESC
-		LIMIT ?`,
-		count,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list usage events: %w", err)
-	}
-	defer rows.Close()
-
-	var events []UsageThresholdEvent
-	for rows.Next() {
-		var event UsageThresholdEvent
-		var timestamp string
-		if errScan := rows.Scan(
-			&event.ID,
-			&timestamp,
-			&event.Window,
-			&event.UserID,
-			&event.APIKeyID,
-			&event.KeyHash,
-			&event.MaskedKey,
-			&event.Ratio,
-			&event.Threshold,
-			&event.TotalTokens,
-			&event.ReferenceTokens,
-			&event.RequestCount,
-			&event.FailedRequestCount,
-			&event.Model,
-			&event.ReasoningEffort,
-			&event.ServiceTier,
-			&event.AuthID,
-			&event.RequestID,
-			&event.Diagnostics,
-		); errScan != nil {
-			return nil, fmt.Errorf("scan usage event: %w", errScan)
-		}
-		parsed, errParse := parseDBTime(timestamp)
-		if errParse != nil {
-			return nil, errParse
-		}
-		event.Timestamp = parsed
-		events = append(events, event)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("list usage event rows: %w", err)
-	}
-	return events, nil
-}
-
-func (s *UserStore) recordThresholdEvents(ctx context.Context, tx *sql.Tx, params UsageRecordParams, cfg UsageConfig) error {
-	threshold := usageAlertThreshold(cfg)
-	windowEnd := usageBucketStart(params.Timestamp).Add(usageBucketDuration)
-	for _, spec := range usageWindowSpecs(cfg) {
-		if spec.referenceTokens <= 0 {
-			continue
-		}
-		start := usageWindowStart(params.Timestamp, spec.bucketCount)
-		counters, err := aggregateUsageRangeTx(ctx, tx, params.User.ID, params.APIKey.ID, start, windowEnd, params.Model, params.ReasoningEffort, params.ServiceTier)
-		if err != nil {
-			return err
-		}
-		ratio := 0.0
-		overThreshold := false
-		if counters.TotalTokens > 0 {
-			ratio = float64(counters.TotalTokens) / float64(spec.referenceTokens)
-			overThreshold = ratio >= threshold
-		}
-		previouslyOver, err := thresholdState(ctx, tx, spec.name, params.APIKey.ID, params.Model, params.ReasoningEffort, params.ServiceTier)
-		if err != nil {
-			return err
-		}
-		if overThreshold && !previouslyOver {
-			if err = insertUsageThresholdEvent(ctx, tx, params, spec, counters, ratio, threshold); err != nil {
-				return err
-			}
-		}
-		if err = upsertThresholdState(ctx, tx, spec.name, params.APIKey.ID, params.Model, params.ReasoningEffort, params.ServiceTier, overThreshold, params.Timestamp); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func insertUsageThresholdEvent(ctx context.Context, tx *sql.Tx, params UsageRecordParams, spec usageWindowSpec, counters UsageCounters, ratio float64, threshold float64) error {
-	id, err := randomID("evt")
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO usage_threshold_events (
-			id, timestamp, window, user_id, api_key_id, key_hash, masked_key, ratio, threshold,
-			total_tokens, reference_tokens, request_count, failed_request_count, model, reasoning_effort, service_tier,
-			auth_id, request_id, diagnostics
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id,
-		formatDBTime(params.Timestamp),
-		spec.name,
-		params.User.ID,
-		params.APIKey.ID,
-		params.APIKey.KeyHash,
-		params.APIKey.MaskedKey,
-		ratio,
-		threshold,
-		counters.TotalTokens,
-		spec.referenceTokens,
-		counters.RequestCount,
-		counters.FailedRequestCount,
-		params.Model,
-		params.ReasoningEffort,
-		params.ServiceTier,
-		params.AuthID,
-		params.RequestID,
-		params.Diagnostics,
-	)
-	if err != nil {
-		return fmt.Errorf("insert usage threshold event: %w", err)
-	}
-	return nil
-}
-
-func thresholdState(ctx context.Context, tx *sql.Tx, window string, apiKeyID string, model string, reasoningEffort string, serviceTier string) (bool, error) {
-	var above int
-	err := tx.QueryRowContext(ctx,
-		`SELECT above_threshold FROM usage_threshold_state WHERE window = ? AND api_key_id = ? AND model = ? AND reasoning_effort = ? AND service_tier = ?`,
-		window,
-		apiKeyID,
-		model,
-		reasoningEffort,
-		serviceTier,
-	).Scan(&above)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read usage threshold state: %w", err)
-	}
-	return above == 1, nil
-}
-
-func upsertThresholdState(ctx context.Context, tx *sql.Tx, window string, apiKeyID string, model string, reasoningEffort string, serviceTier string, overThreshold bool, timestamp time.Time) error {
-	_, err := tx.ExecContext(ctx,
-		`INSERT INTO usage_threshold_state (window, api_key_id, model, reasoning_effort, service_tier, above_threshold, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(window, api_key_id, model, reasoning_effort, service_tier) DO UPDATE SET
-			above_threshold = excluded.above_threshold,
-			updated_at = excluded.updated_at`,
-		window,
-		apiKeyID,
-		model,
-		reasoningEffort,
-		serviceTier,
-		boolInt(overThreshold),
-		formatDBTime(timestamp),
-	)
-	if err != nil {
-		return fmt.Errorf("upsert usage threshold state: %w", err)
-	}
-	return nil
-}
-
-func pruneUsageData(ctx context.Context, tx *sql.Tx, now time.Time, cfg UsageConfig) error {
+func pruneUsageData(ctx context.Context, tx *sql.Tx, now time.Time) error {
 	bucketCutoff := usageWindowStart(now, usageWeeklyBucketCount)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_buckets WHERE bucket_start < ?`, formatDBTime(bucketCutoff)); err != nil {
 		return fmt.Errorf("prune usage buckets: %w", err)
-	}
-	eventCutoff := now.UTC().Add(-time.Duration(usageEventRetentionDays(cfg)) * 24 * time.Hour)
-	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_threshold_events WHERE timestamp < ?`, formatDBTime(eventCutoff)); err != nil {
-		return fmt.Errorf("prune usage events: %w", err)
 	}
 	return nil
 }
 
 func (s *UserStore) aggregateUsageRange(ctx context.Context, userID string, apiKeyID string, start time.Time, end time.Time) (UsageCounters, error) {
 	return aggregateUsageRangeDB(ctx, s.db, userID, apiKeyID, start, end, "", "", "")
-}
-
-func aggregateUsageRangeTx(ctx context.Context, tx *sql.Tx, userID string, apiKeyID string, start time.Time, end time.Time, model string, reasoningEffort string, serviceTier string) (UsageCounters, error) {
-	return aggregateUsageRangeDB(ctx, tx, userID, apiKeyID, start, end, model, reasoningEffort, serviceTier)
 }
 
 type usageQueryer interface {
@@ -592,13 +362,13 @@ func (s *UserStore) usageDimensionsSnapshot(ctx context.Context, userID string, 
 	}
 	for i := range dimensions {
 		dimensions[i].Windows = map[string]UsageWindow{}
-		for _, spec := range usageWindowSpecs(cfg) {
+		for _, spec := range usageWindowSpecs() {
 			windowStart := usageWindowStart(now, spec.bucketCount)
 			counters, errAggregate := aggregateUsageRangeDB(ctx, s.db, userID, apiKeyID, windowStart, end, dimensions[i].Model, dimensions[i].ReasoningEffort, dimensions[i].ServiceTier)
 			if errAggregate != nil {
 				return nil, errAggregate
 			}
-			dimensions[i].Windows[spec.name] = buildUsageWindow(counters, spec.referenceTokens, usageAlertThreshold(cfg))
+			dimensions[i].Windows[spec.name] = buildUsageWindow(counters)
 		}
 	}
 	return dimensions, nil
@@ -690,32 +460,21 @@ func listUsageDimensionKeys(ctx context.Context, queryer usageRowsQueryer, userI
 	return dimensions, nil
 }
 
-func usageWindowSpecs(cfg UsageConfig) []usageWindowSpec {
+func usageWindowSpecs() []usageWindowSpec {
 	return []usageWindowSpec{
 		{
-			name:            "5h",
-			bucketCount:     usageFiveHourBucketCount,
-			referenceTokens: cfg.FiveHourReferenceTokens,
+			name:        "5h",
+			bucketCount: usageFiveHourBucketCount,
 		},
 		{
-			name:            "7d",
-			bucketCount:     usageWeeklyBucketCount,
-			referenceTokens: cfg.WeeklyReferenceTokens,
+			name:        "7d",
+			bucketCount: usageWeeklyBucketCount,
 		},
 	}
 }
 
-func buildUsageWindow(counters UsageCounters, referenceTokens int64, threshold float64) UsageWindow {
-	window := UsageWindow{
-		UsageCounters:   counters,
-		ReferenceTokens: referenceTokens,
-	}
-	if referenceTokens > 0 && counters.TotalTokens > 0 {
-		ratio := float64(counters.TotalTokens) / float64(referenceTokens)
-		window.Ratio = &ratio
-		window.OverThreshold = ratio >= threshold
-	}
-	return window
+func buildUsageWindow(counters UsageCounters) UsageWindow {
+	return UsageWindow{UsageCounters: counters}
 }
 
 func usageBucketStart(t time.Time) time.Time {

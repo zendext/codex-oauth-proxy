@@ -40,10 +40,6 @@ Create `config.yaml` from `config.example.yaml`.
 | `admin-api-key` | empty | Enables `/v0/management` when set. |
 | `database.path` | empty | SQLite path. Empty resolves to `<auth-dir>/codex-oauth-proxy.db`. |
 | `usage.enabled` | `true` | Track per-user token usage for managed API keys. |
-| `usage.five-hour-reference-tokens` | `0` | Reference capacity for 5-hour usage ratios. |
-| `usage.weekly-reference-tokens` | `0` | Reference capacity for weekly usage ratios. |
-| `usage.alert-threshold` | `0.8` | Threshold-event ratio. |
-| `usage.event-retention-days` | `30` | Threshold-event retention. |
 | `usage.debug-openai-response` | `false` | Log safe usage metadata from upstream responses. |
 | `allow-fast-mode` | `false` | Allow Codex Fast mode. When disabled, Fast tier metadata is hidden and `service_tier: "fast"` or `"priority"` requests return `400`. |
 | `proxy-url` | empty | Optional outbound proxy. Use `direct` or `none` to bypass proxy settings. |
@@ -81,10 +77,9 @@ authenticate proxy routes and `/v0/user`; set `COP_API_KEY` when running Codex
 through this proxy.
 
 Usage tracking stores 10-minute UTC buckets for managed user API keys. User
-totals are exposed at `/v0/user/usage/today`; management snapshots and threshold
-events are exposed at `/v0/management/usage` and
-`/v0/management/usage/events`. Model breakdowns include `model`,
-`reasoning_effort`, and `service_tier` (`standard` or `fast`).
+totals are exposed at `/v0/user/usage/today`; 5-hour and 7-day management
+snapshots are exposed at `/v0/management/usage`. Model breakdowns include
+`model`, `reasoning_effort`, and `service_tier` (`standard` or `fast`).
 
 Set `debug: true` for masked request/proxy logs. Add
 `usage.debug-openai-response: true` for request IDs, model, key metadata, and
@@ -111,7 +106,6 @@ Public API routes:
 - `PATCH /v0/management/users/{user_id}`
 - `POST /v0/management/users/{user_id}/api-key/reset`
 - `GET /v0/management/usage`
-- `GET /v0/management/usage/events`
 - `GET /v0/user/api-key`
 - `POST /v0/user/api-key/reset`
 - `GET /v0/user/usage/today`

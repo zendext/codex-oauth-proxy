@@ -16,7 +16,7 @@ implemented in a later phase and should depend on the user and API key identity
 returned by this phase.
 
 The later usage phase should add the user API for today's token usage and the
-management APIs for usage summaries and threshold events.
+management API for usage summaries.
 
 ## Current Project Context
 

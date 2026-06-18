@@ -432,22 +432,6 @@ func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"usage": usage})
-	case path == "/usage/events" && r.Method == http.MethodGet:
-		count := 100
-		if raw := strings.TrimSpace(r.URL.Query().Get("count")); raw != "" {
-			parsed, err := strconv.Atoi(raw)
-			if err != nil || parsed <= 0 {
-				writeError(w, http.StatusBadRequest, "invalid count")
-				return
-			}
-			count = parsed
-		}
-		events, err := s.users.ListUsageEvents(r.Context(), count)
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"events": events})
 	case path == "/users" && r.Method == http.MethodPost:
 		var req createUserRequest
 		if !decodeJSONRequest(w, r, &req) {

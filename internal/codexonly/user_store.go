@@ -158,40 +158,6 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
-		`CREATE TABLE IF NOT EXISTS usage_threshold_state (
-			window TEXT NOT NULL,
-			api_key_id TEXT NOT NULL,
-			model TEXT NOT NULL DEFAULT 'unknown',
-			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
-			service_tier TEXT NOT NULL DEFAULT 'standard',
-			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
-			updated_at TEXT NOT NULL,
-			PRIMARY KEY (window, api_key_id, model, reasoning_effort, service_tier),
-			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
-		)`,
-		`CREATE TABLE IF NOT EXISTS usage_threshold_events (
-			id TEXT PRIMARY KEY,
-			timestamp TEXT NOT NULL,
-			window TEXT NOT NULL,
-			user_id TEXT NOT NULL,
-			api_key_id TEXT NOT NULL,
-			key_hash TEXT NOT NULL,
-			masked_key TEXT NOT NULL,
-			ratio REAL NOT NULL,
-			threshold REAL NOT NULL,
-			total_tokens INTEGER NOT NULL,
-			reference_tokens INTEGER NOT NULL,
-			request_count INTEGER NOT NULL,
-			failed_request_count INTEGER NOT NULL,
-			model TEXT NOT NULL,
-			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
-			service_tier TEXT NOT NULL DEFAULT 'standard',
-			auth_id TEXT NOT NULL,
-			request_id TEXT NOT NULL,
-			diagnostics TEXT NOT NULL,
-			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
-		)`,
 	}
 	for _, statement := range tableStatements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -211,8 +177,6 @@ func (s *UserStore) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_user_key_time
 			ON usage_buckets(user_id, api_key_id, bucket_start)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_time ON usage_buckets(bucket_start)`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_threshold_events_time
-			ON usage_threshold_events(timestamp)`,
 	}
 	for _, statement := range indexStatements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -223,16 +187,7 @@ func (s *UserStore) migrate(ctx context.Context) error {
 }
 
 func (s *UserStore) migrateUsageReasoningEffort(ctx context.Context) error {
-	if err := s.migrateUsageBucketsReasoningEffort(ctx); err != nil {
-		return err
-	}
-	if err := s.migrateUsageThresholdStateReasoningEffort(ctx); err != nil {
-		return err
-	}
-	if err := s.migrateUsageThresholdEventsReasoningEffort(ctx); err != nil {
-		return err
-	}
-	return nil
+	return s.migrateUsageBucketsReasoningEffort(ctx)
 }
 
 func (s *UserStore) migrateUsageBucketsReasoningEffort(ctx context.Context) error {
@@ -309,16 +264,7 @@ func (s *UserStore) migrateUsageBucketsReasoningEffort(ctx context.Context) erro
 }
 
 func (s *UserStore) migrateUsageServiceTier(ctx context.Context) error {
-	if err := s.migrateUsageBucketsServiceTier(ctx); err != nil {
-		return err
-	}
-	if err := s.migrateUsageThresholdStateServiceTier(ctx); err != nil {
-		return err
-	}
-	if err := s.migrateUsageThresholdEventsServiceTier(ctx); err != nil {
-		return err
-	}
-	return nil
+	return s.migrateUsageBucketsServiceTier(ctx)
 }
 
 func (s *UserStore) migrateUsageBucketsServiceTier(ctx context.Context) error {
@@ -390,127 +336,6 @@ func (s *UserStore) migrateUsageBucketsServiceTier(ctx context.Context) error {
 	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit usage_buckets service_tier migration: %w", err)
-	}
-	return nil
-}
-
-func (s *UserStore) migrateUsageThresholdStateServiceTier(ctx context.Context) error {
-	hasColumn, err := tableColumnExists(ctx, s.db, "usage_threshold_state", "service_tier")
-	if err != nil {
-		return err
-	}
-	if hasColumn {
-		return nil
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin usage_threshold_state service_tier migration: %w", err)
-	}
-	defer rollbackUnlessCommitted(tx)
-
-	statements := []string{
-		`DROP TABLE IF EXISTS usage_threshold_state_before_service_tier`,
-		`ALTER TABLE usage_threshold_state RENAME TO usage_threshold_state_before_service_tier`,
-		`CREATE TABLE usage_threshold_state (
-			window TEXT NOT NULL,
-			api_key_id TEXT NOT NULL,
-			model TEXT NOT NULL DEFAULT 'unknown',
-			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
-			service_tier TEXT NOT NULL DEFAULT 'standard',
-			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
-			updated_at TEXT NOT NULL,
-			PRIMARY KEY (window, api_key_id, model, reasoning_effort, service_tier),
-			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
-		)`,
-		`INSERT INTO usage_threshold_state (
-			window, api_key_id, model, reasoning_effort, service_tier, above_threshold, updated_at
-		)
-		SELECT window, api_key_id, model, reasoning_effort, 'standard', above_threshold, updated_at
-		FROM usage_threshold_state_before_service_tier`,
-		`DROP TABLE usage_threshold_state_before_service_tier`,
-	}
-	for _, statement := range statements {
-		if _, err = tx.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("migrate usage_threshold_state service_tier: %w", err)
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit usage_threshold_state service_tier migration: %w", err)
-	}
-	return nil
-}
-
-func (s *UserStore) migrateUsageThresholdEventsServiceTier(ctx context.Context) error {
-	hasColumn, err := tableColumnExists(ctx, s.db, "usage_threshold_events", "service_tier")
-	if err != nil {
-		return err
-	}
-	if hasColumn {
-		return nil
-	}
-	if _, err = s.db.ExecContext(ctx, `ALTER TABLE usage_threshold_events ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'standard'`); err != nil {
-		return fmt.Errorf("migrate usage_threshold_events service_tier: %w", err)
-	}
-	return nil
-}
-
-func (s *UserStore) migrateUsageThresholdStateReasoningEffort(ctx context.Context) error {
-	hasModel, err := tableColumnExists(ctx, s.db, "usage_threshold_state", "model")
-	if err != nil {
-		return err
-	}
-	hasEffort, err := tableColumnExists(ctx, s.db, "usage_threshold_state", "reasoning_effort")
-	if err != nil {
-		return err
-	}
-	if hasModel && hasEffort {
-		return nil
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin usage_threshold_state reasoning_effort migration: %w", err)
-	}
-	defer rollbackUnlessCommitted(tx)
-
-	statements := []string{
-		`DROP TABLE IF EXISTS usage_threshold_state_before_reasoning_effort`,
-		`ALTER TABLE usage_threshold_state RENAME TO usage_threshold_state_before_reasoning_effort`,
-		`CREATE TABLE usage_threshold_state (
-			window TEXT NOT NULL,
-			api_key_id TEXT NOT NULL,
-			model TEXT NOT NULL DEFAULT 'unknown',
-			reasoning_effort TEXT NOT NULL DEFAULT 'unknown',
-			above_threshold INTEGER NOT NULL CHECK (above_threshold IN (0, 1)),
-			updated_at TEXT NOT NULL,
-			PRIMARY KEY (window, api_key_id, model, reasoning_effort),
-			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
-		)`,
-		`INSERT INTO usage_threshold_state (window, api_key_id, model, reasoning_effort, above_threshold, updated_at)
-		SELECT window, api_key_id, 'unknown', 'unknown', above_threshold, updated_at
-		FROM usage_threshold_state_before_reasoning_effort`,
-		`DROP TABLE usage_threshold_state_before_reasoning_effort`,
-	}
-	for _, statement := range statements {
-		if _, err = tx.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("migrate usage_threshold_state reasoning_effort: %w", err)
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit usage_threshold_state reasoning_effort migration: %w", err)
-	}
-	return nil
-}
-
-func (s *UserStore) migrateUsageThresholdEventsReasoningEffort(ctx context.Context) error {
-	hasColumn, err := tableColumnExists(ctx, s.db, "usage_threshold_events", "reasoning_effort")
-	if err != nil {
-		return err
-	}
-	if hasColumn {
-		return nil
-	}
-	if _, err = s.db.ExecContext(ctx, `ALTER TABLE usage_threshold_events ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'unknown'`); err != nil {
-		return fmt.Errorf("migrate usage_threshold_events reasoning_effort: %w", err)
 	}
 	return nil
 }
