@@ -80,6 +80,9 @@ Usage tracking stores 10-minute UTC buckets for managed user API keys. User
 totals are exposed at `/v0/user/usage/today`; 5-hour and 7-day management
 snapshots are exposed at `/v0/management/usage`. Model breakdowns include
 `model`, `reasoning_effort`, and `service_tier` (`standard` or `fast`).
+Dashboard-oriented timeseries are exposed at
+`/v0/management/usage/timeseries`; they read the same 10-minute buckets and can
+aggregate them with `step=10m`, `30m`, `1h`, `6h`, or `1d`.
 
 Set `debug: true` for masked request/proxy logs. Add
 `usage.debug-openai-response: true` for request IDs, model, key metadata, and
@@ -106,6 +109,7 @@ Public API routes:
 - `PATCH /v0/management/users/{user_id}`
 - `POST /v0/management/users/{user_id}/api-key/reset`
 - `GET /v0/management/usage`
+- `GET /v0/management/usage/timeseries`
 - `GET /v0/user/api-key`
 - `POST /v0/user/api-key/reset`
 - `GET /v0/user/usage/today`
@@ -142,6 +146,18 @@ curl -X POST http://localhost:8317/v0/management/users \
 
 The plaintext user API key is returned only by user creation and key reset
 responses. List/detail responses only return key metadata such as `masked_key`.
+
+## Dashboard
+
+An optional Grafana dashboard bundle is available under `observability/`.
+
+```bash
+export CODEX_OAUTH_PROXY_ADMIN_API_KEY="admin-change-me"
+docker compose -f docker-compose.yml -f observability/docker-compose.dashboard.yml up -d
+```
+
+Open Grafana at `http://localhost:3000`. The dashboard calls
+`/v0/management/usage/timeseries` through the configured admin API key.
 
 ## Verify
 

@@ -58,6 +58,35 @@ type UsageSnapshotFilter struct {
 	APIKeyID string
 }
 
+type UsageTimeseriesParams struct {
+	Window   string
+	Step     string
+	GroupBy  []string
+	UserID   string
+	APIKeyID string
+	Now      time.Time
+}
+
+type UsageTimeseries struct {
+	Window  string                 `json:"window"`
+	Step    string                 `json:"step"`
+	Start   time.Time              `json:"start"`
+	End     time.Time              `json:"end"`
+	GroupBy []string               `json:"group_by"`
+	Series  []UsageTimeseriesPoint `json:"series"`
+}
+
+type UsageTimeseriesPoint struct {
+	BucketStart     time.Time `json:"bucket_start"`
+	UserID          string    `json:"user_id,omitempty"`
+	Name            string    `json:"name,omitempty"`
+	APIKeyID        string    `json:"api_key_id,omitempty"`
+	Model           string    `json:"model,omitempty"`
+	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
+	ServiceTier     string    `json:"service_tier,omitempty"`
+	UsageCounters
+}
+
 type UsageWindow struct {
 	UsageCounters
 }
@@ -286,6 +315,40 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 	return entries, nil
 }
 
+func (s *UserStore) GetUsageTimeseries(ctx context.Context, params UsageTimeseriesParams, cfg UsageConfig) (UsageTimeseries, error) {
+	if s == nil || s.db == nil {
+		return UsageTimeseries{}, ErrInvalidInput
+	}
+	now := params.Now.UTC()
+	if now.IsZero() {
+		now = s.now().UTC()
+	}
+	window, start, end, err := usageTimeseriesWindow(params.Window, now)
+	if err != nil {
+		return UsageTimeseries{}, err
+	}
+	stepName, step, err := usageTimeseriesStep(params.Step, window)
+	if err != nil {
+		return UsageTimeseries{}, err
+	}
+	groupBy, err := usageTimeseriesGroupBy(params.GroupBy)
+	if err != nil {
+		return UsageTimeseries{}, err
+	}
+	points, err := s.queryUsageTimeseries(ctx, start, end, step, groupBy, strings.TrimSpace(params.UserID), strings.TrimSpace(params.APIKeyID))
+	if err != nil {
+		return UsageTimeseries{}, err
+	}
+	return UsageTimeseries{
+		Window:  window,
+		Step:    stepName,
+		Start:   start,
+		End:     end,
+		GroupBy: groupBy,
+		Series:  points,
+	}, nil
+}
+
 func pruneUsageData(ctx context.Context, tx *sql.Tx, now time.Time) error {
 	bucketCutoff := usageWindowStart(now, usageWeeklyBucketCount)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_buckets WHERE bucket_start < ?`, formatDBTime(bucketCutoff)); err != nil {
@@ -296,6 +359,272 @@ func pruneUsageData(ctx context.Context, tx *sql.Tx, now time.Time) error {
 
 func (s *UserStore) aggregateUsageRange(ctx context.Context, userID string, apiKeyID string, start time.Time, end time.Time) (UsageCounters, error) {
 	return aggregateUsageRangeDB(ctx, s.db, userID, apiKeyID, start, end, "", "", "")
+}
+
+type usageTimeseriesQueryRow struct {
+	BucketStart     time.Time
+	UserID          string
+	Name            string
+	APIKeyID        string
+	Model           string
+	ReasoningEffort string
+	ServiceTier     string
+	UsageCounters
+}
+
+type usageTimeseriesPointKey struct {
+	BucketStart     time.Time
+	UserID          string
+	Name            string
+	APIKeyID        string
+	Model           string
+	ReasoningEffort string
+	ServiceTier     string
+}
+
+func (s *UserStore) queryUsageTimeseries(ctx context.Context, start time.Time, end time.Time, step time.Duration, groupBy []string, userID string, apiKeyID string) ([]UsageTimeseriesPoint, error) {
+	query := `SELECT
+			b.bucket_start,
+			b.user_id,
+			u.name,
+			b.api_key_id,
+			b.model,
+			b.reasoning_effort,
+			b.service_tier,
+			COALESCE(SUM(b.request_count), 0),
+			COALESCE(SUM(b.failed_request_count), 0),
+			COALESCE(SUM(b.input_tokens), 0),
+			COALESCE(SUM(b.output_tokens), 0),
+			COALESCE(SUM(b.reasoning_tokens), 0),
+			COALESCE(SUM(b.cached_input_tokens), 0),
+			COALESCE(SUM(b.cache_read_tokens), 0),
+			COALESCE(SUM(b.cache_creation_tokens), 0),
+			COALESCE(SUM(b.total_tokens), 0)
+		FROM usage_buckets b
+		JOIN users u ON u.id = b.user_id
+		WHERE b.bucket_start >= ? AND b.bucket_start < ?`
+	args := []any{formatDBTime(start.UTC()), formatDBTime(end.UTC())}
+	if userID != "" {
+		query += ` AND b.user_id = ?`
+		args = append(args, userID)
+	}
+	if apiKeyID != "" {
+		query += ` AND b.api_key_id = ?`
+		args = append(args, apiKeyID)
+	}
+	query += ` GROUP BY b.bucket_start, b.user_id, u.name, b.api_key_id, b.model, b.reasoning_effort, b.service_tier
+		ORDER BY b.bucket_start ASC, u.name COLLATE NOCASE ASC, b.user_id ASC, b.api_key_id ASC, b.model ASC, b.reasoning_effort ASC, b.service_tier ASC`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query usage timeseries: %w", err)
+	}
+	defer rows.Close()
+
+	groupSet := usageTimeseriesGroupSet(groupBy)
+	pointsByKey := map[usageTimeseriesPointKey]UsageTimeseriesPoint{}
+	for rows.Next() {
+		var row usageTimeseriesQueryRow
+		var bucketStart string
+		if errScan := rows.Scan(
+			&bucketStart,
+			&row.UserID,
+			&row.Name,
+			&row.APIKeyID,
+			&row.Model,
+			&row.ReasoningEffort,
+			&row.ServiceTier,
+			&row.RequestCount,
+			&row.FailedRequestCount,
+			&row.InputTokens,
+			&row.OutputTokens,
+			&row.ReasoningTokens,
+			&row.CachedInputTokens,
+			&row.CacheReadTokens,
+			&row.CacheCreationTokens,
+			&row.TotalTokens,
+		); errScan != nil {
+			return nil, fmt.Errorf("scan usage timeseries: %w", errScan)
+		}
+		parsedBucketStart, errParse := parseDBTime(bucketStart)
+		if errParse != nil {
+			return nil, errParse
+		}
+		row.BucketStart = usageTimeseriesBucketStart(parsedBucketStart, step)
+		key := usageTimeseriesKey(row, groupSet)
+		point := pointsByKey[key]
+		if point.BucketStart.IsZero() {
+			point = UsageTimeseriesPoint{
+				BucketStart:     key.BucketStart,
+				UserID:          key.UserID,
+				Name:            key.Name,
+				APIKeyID:        key.APIKeyID,
+				Model:           key.Model,
+				ReasoningEffort: key.ReasoningEffort,
+				ServiceTier:     key.ServiceTier,
+			}
+		}
+		point.UsageCounters = point.UsageCounters.add(row.UsageCounters)
+		pointsByKey[key] = point
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("query usage timeseries rows: %w", err)
+	}
+
+	points := make([]UsageTimeseriesPoint, 0, len(pointsByKey))
+	for _, point := range pointsByKey {
+		points = append(points, point)
+	}
+	sort.Slice(points, func(i int, j int) bool {
+		if !points[i].BucketStart.Equal(points[j].BucketStart) {
+			return points[i].BucketStart.Before(points[j].BucketStart)
+		}
+		return usageTimeseriesPointSortKey(points[i]) < usageTimeseriesPointSortKey(points[j])
+	})
+	return points, nil
+}
+
+func usageTimeseriesKey(row usageTimeseriesQueryRow, groupSet map[string]bool) usageTimeseriesPointKey {
+	key := usageTimeseriesPointKey{BucketStart: row.BucketStart}
+	if groupSet["user"] {
+		key.UserID = row.UserID
+		key.Name = row.Name
+	}
+	if groupSet["api_key"] {
+		key.APIKeyID = row.APIKeyID
+	}
+	if groupSet["model"] {
+		key.Model = row.Model
+	}
+	if groupSet["reasoning_effort"] {
+		key.ReasoningEffort = row.ReasoningEffort
+	}
+	if groupSet["service_tier"] {
+		key.ServiceTier = row.ServiceTier
+	}
+	return key
+}
+
+func usageTimeseriesWindow(raw string, now time.Time) (string, time.Time, time.Time, error) {
+	window := strings.ToLower(strings.TrimSpace(raw))
+	if window == "" {
+		window = "7d"
+	}
+	now = now.UTC()
+	windowEnd := usageBucketStart(now).Add(usageBucketDuration)
+	switch window {
+	case "5h":
+		return window, usageWindowStart(now, usageFiveHourBucketCount), windowEnd, nil
+	case "24h":
+		return window, usageWindowStart(now, 24*6), windowEnd, nil
+	case "7d":
+		return window, usageWindowStart(now, usageWeeklyBucketCount), windowEnd, nil
+	case "today":
+		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		return window, dayStart, windowEnd, nil
+	default:
+		return "", time.Time{}, time.Time{}, ErrInvalidInput
+	}
+}
+
+func usageTimeseriesStep(raw string, window string) (string, time.Duration, error) {
+	step := strings.ToLower(strings.TrimSpace(raw))
+	if step == "" || step == "auto" {
+		step = usageTimeseriesAutoStep(window)
+	}
+	switch step {
+	case "10m":
+		return step, 10 * time.Minute, nil
+	case "30m":
+		return step, 30 * time.Minute, nil
+	case "1h":
+		return step, time.Hour, nil
+	case "6h":
+		return step, 6 * time.Hour, nil
+	case "1d":
+		return step, 24 * time.Hour, nil
+	default:
+		return "", 0, ErrInvalidInput
+	}
+}
+
+func usageTimeseriesAutoStep(window string) string {
+	switch window {
+	case "5h":
+		return "10m"
+	case "7d":
+		return "6h"
+	default:
+		return "1h"
+	}
+}
+
+func usageTimeseriesGroupBy(values []string) ([]string, error) {
+	var groupBy []string
+	seen := map[string]bool{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			normalized, ok := normalizeUsageTimeseriesGroup(part)
+			if !ok {
+				return nil, ErrInvalidInput
+			}
+			if normalized == "" || seen[normalized] {
+				continue
+			}
+			seen[normalized] = true
+			groupBy = append(groupBy, normalized)
+		}
+	}
+	if len(groupBy) == 0 {
+		return []string{"user"}, nil
+	}
+	return groupBy, nil
+}
+
+func normalizeUsageTimeseriesGroup(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return "", true
+	case "user", "user_id":
+		return "user", true
+	case "api_key", "api_key_id":
+		return "api_key", true
+	case "model":
+		return "model", true
+	case "reasoning_effort":
+		return "reasoning_effort", true
+	case "service_tier":
+		return "service_tier", true
+	default:
+		return "", false
+	}
+}
+
+func usageTimeseriesGroupSet(groupBy []string) map[string]bool {
+	set := make(map[string]bool, len(groupBy))
+	for _, group := range groupBy {
+		set[group] = true
+	}
+	return set
+}
+
+func usageTimeseriesBucketStart(t time.Time, step time.Duration) time.Time {
+	t = t.UTC()
+	if step == 24*time.Hour {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	return t.Truncate(step)
+}
+
+func usageTimeseriesPointSortKey(point UsageTimeseriesPoint) string {
+	return strings.Join([]string{
+		point.Name,
+		point.UserID,
+		point.APIKeyID,
+		point.Model,
+		point.ReasoningEffort,
+		point.ServiceTier,
+	}, "\x00")
 }
 
 type usageQueryer interface {
@@ -514,6 +843,20 @@ func (c UsageCounters) normalized() UsageCounters {
 		c.TotalTokens = c.InputTokens + c.OutputTokens
 	}
 	return c
+}
+
+func (c UsageCounters) add(other UsageCounters) UsageCounters {
+	return UsageCounters{
+		RequestCount:        c.RequestCount + other.RequestCount,
+		FailedRequestCount:  c.FailedRequestCount + other.FailedRequestCount,
+		InputTokens:         c.InputTokens + other.InputTokens,
+		OutputTokens:        c.OutputTokens + other.OutputTokens,
+		ReasoningTokens:     c.ReasoningTokens + other.ReasoningTokens,
+		CachedInputTokens:   c.CachedInputTokens + other.CachedInputTokens,
+		CacheReadTokens:     c.CacheReadTokens + other.CacheReadTokens,
+		CacheCreationTokens: c.CacheCreationTokens + other.CacheCreationTokens,
+		TotalTokens:         c.TotalTokens + other.TotalTokens,
+	}
 }
 
 func (c UsageCounters) subtract(other UsageCounters) UsageCounters {

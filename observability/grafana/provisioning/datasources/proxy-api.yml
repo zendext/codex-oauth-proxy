@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Codex OAuth Proxy API
+    uid: codex-oauth-proxy-api
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    url: ${CODEX_OAUTH_PROXY_URL}
+    editable: true
+    jsonData:
+      auth_method: bearerToken
+      allowedHosts:
+        - ${CODEX_OAUTH_PROXY_URL}
+    secureJsonData:
+      bearerToken: ${CODEX_OAUTH_PROXY_ADMIN_API_KEY}

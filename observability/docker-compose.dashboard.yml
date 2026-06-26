@@ -1,0 +1,22 @@
+services:
+  grafana:
+    image: grafana/grafana:latest
+    container_name: codex-oauth-proxy-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_INSTALL_PLUGINS: "yesoreyeram-infinity-datasource"
+      CODEX_OAUTH_PROXY_URL: "${CODEX_OAUTH_PROXY_URL:-http://codex-oauth-proxy:8317}"
+      CODEX_OAUTH_PROXY_ADMIN_API_KEY: "${CODEX_OAUTH_PROXY_ADMIN_API_KEY:-}"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - codex-oauth-proxy
+    restart: unless-stopped
+
+volumes:
+  grafana-storage:

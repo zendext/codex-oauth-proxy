@@ -421,6 +421,13 @@ type updateUserRequest struct {
 func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v0/management")
 	switch {
+	case path == "/usage/timeseries" && r.Method == http.MethodGet:
+		timeseries, err := s.users.GetUsageTimeseries(r.Context(), usageTimeseriesParamsFromRequest(r), s.cfg.Usage)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, timeseries)
 	case path == "/usage" && r.Method == http.MethodGet:
 		filter := UsageSnapshotFilter{
 			UserID:   strings.TrimSpace(r.URL.Query().Get("user_id")),
@@ -458,6 +465,17 @@ func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
 		s.handleManagementUser(w, r, strings.TrimPrefix(path, "/users/"))
 	default:
 		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func usageTimeseriesParamsFromRequest(r *http.Request) UsageTimeseriesParams {
+	query := r.URL.Query()
+	return UsageTimeseriesParams{
+		Window:   strings.TrimSpace(query.Get("window")),
+		Step:     strings.TrimSpace(query.Get("step")),
+		GroupBy:  query["group_by"],
+		UserID:   strings.TrimSpace(query.Get("user_id")),
+		APIKeyID: strings.TrimSpace(query.Get("api_key_id")),
 	}
 }
 

@@ -152,6 +152,123 @@ func TestUserStoreRecordsUsageBucketsAndWindows(t *testing.T) {
 	})
 }
 
+func TestUserStoreUsageTimeseriesGroupsTenMinuteBucketsByUser(t *testing.T) {
+	store := openTestUserStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 12, 10, 45, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	alice := createUsageTestCredential(t, store, "Alice")
+	bob := createUsageTestCredential(t, store, "Bob")
+
+	records := []struct {
+		timestamp  time.Time
+		credential AuthenticatedAPIKey
+		requestID  string
+		input      int64
+		output     int64
+		total      int64
+	}{
+		{
+			timestamp:  time.Date(2026, 6, 12, 10, 7, 0, 0, time.UTC),
+			credential: alice,
+			requestID:  "req_alice_1",
+			input:      12,
+			output:     8,
+			total:      20,
+		},
+		{
+			timestamp:  time.Date(2026, 6, 12, 10, 12, 0, 0, time.UTC),
+			credential: alice,
+			requestID:  "req_alice_2",
+			input:      5,
+			output:     7,
+			total:      12,
+		},
+		{
+			timestamp:  time.Date(2026, 6, 12, 10, 13, 0, 0, time.UTC),
+			credential: bob,
+			requestID:  "req_bob_1",
+			input:      30,
+			output:     10,
+			total:      40,
+		},
+	}
+	for _, record := range records {
+		if err := store.RecordUsage(ctx, UsageRecordParams{
+			Timestamp:       record.timestamp,
+			User:            record.credential.User,
+			APIKey:          record.credential.APIKey,
+			Model:           "gpt-5.3-codex",
+			ReasoningEffort: "high",
+			ServiceTier:     "standard",
+			AuthID:          "auth.json",
+			RequestID:       record.requestID,
+			StatusCode:      http.StatusOK,
+			Counters: UsageCounters{
+				InputTokens:  record.input,
+				OutputTokens: record.output,
+				TotalTokens:  record.total,
+			},
+		}, UsageConfig{}); err != nil {
+			t.Fatalf("RecordUsage %s returned error: %v", record.requestID, err)
+		}
+	}
+
+	timeseries, err := store.GetUsageTimeseries(ctx, UsageTimeseriesParams{
+		Window:  "5h",
+		Step:    "10m",
+		GroupBy: []string{"user"},
+		Now:     now,
+	}, UsageConfig{})
+	if err != nil {
+		t.Fatalf("GetUsageTimeseries returned error: %v", err)
+	}
+	if timeseries.Window != "5h" || timeseries.Step != "10m" {
+		t.Fatalf("timeseries window/step = %s/%s, want 5h/10m", timeseries.Window, timeseries.Step)
+	}
+	if got := strings.Join(timeseries.GroupBy, ","); got != "user" {
+		t.Fatalf("group_by = %q, want user", got)
+	}
+	if len(timeseries.Series) != 3 {
+		t.Fatalf("series count = %d, want 3: %#v", len(timeseries.Series), timeseries.Series)
+	}
+
+	assertUsageTimeseriesPoint(t, timeseries.Series[0], UsageTimeseriesPoint{
+		BucketStart: time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC),
+		UserID:      alice.User.ID,
+		Name:        "Alice",
+		UsageCounters: UsageCounters{
+			RequestCount: 1,
+			InputTokens:  12,
+			OutputTokens: 8,
+			TotalTokens:  20,
+		},
+	})
+	assertUsageTimeseriesPoint(t, timeseries.Series[1], UsageTimeseriesPoint{
+		BucketStart: time.Date(2026, 6, 12, 10, 10, 0, 0, time.UTC),
+		UserID:      alice.User.ID,
+		Name:        "Alice",
+		UsageCounters: UsageCounters{
+			RequestCount: 1,
+			InputTokens:  5,
+			OutputTokens: 7,
+			TotalTokens:  12,
+		},
+	})
+	assertUsageTimeseriesPoint(t, timeseries.Series[2], UsageTimeseriesPoint{
+		BucketStart: time.Date(2026, 6, 12, 10, 10, 0, 0, time.UTC),
+		UserID:      bob.User.ID,
+		Name:        "Bob",
+		UsageCounters: UsageCounters{
+			RequestCount: 1,
+			InputTokens:  30,
+			OutputTokens: 10,
+			TotalTokens:  40,
+		},
+	})
+}
+
 func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 	authDir := t.TempDir()
 	writeAuthFile(t, authDir, "codex.json", `{
@@ -294,6 +411,67 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 				},
 			},
 		},
+	})
+}
+
+func TestServerExposesManagementUsageTimeseries(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"account_id": "acct_1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","usage":{"input_tokens":9,"output_tokens":6,"total_tokens":15}}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:       authDir,
+		AdminAPIKey:   "admin-key",
+		Database:      DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL:  upstream.URL + "/backend-api/codex",
+		RequestRetry:  1,
+		AllowFastMode: true,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	created := createManagedUser(t, handler, "admin-key", "Alice")
+
+	proxyResp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.3-codex","service_tier":"standard","input":"hello"}`, created.PlaintextAPIKey)
+	if proxyResp.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200, body: %s", proxyResp.Code, proxyResp.Body.String())
+	}
+	waitForUsageTotal(t, handler, created.PlaintextAPIKey, 15)
+
+	resp := doJSONRequest(t, handler, http.MethodGet, "/v0/management/usage/timeseries?window=5h&step=10m&group_by=user", "", "admin-key")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("timeseries status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	var payload UsageTimeseries
+	decodeResponse(t, resp, &payload)
+	if payload.Window != "5h" || payload.Step != "10m" {
+		t.Fatalf("timeseries window/step = %s/%s, want 5h/10m", payload.Window, payload.Step)
+	}
+	if got := strings.Join(payload.GroupBy, ","); got != "user" {
+		t.Fatalf("group_by = %q, want user", got)
+	}
+	if len(payload.Series) != 1 {
+		t.Fatalf("series count = %d, want 1: %#v", len(payload.Series), payload.Series)
+	}
+	if payload.Series[0].UserID != created.User.ID || payload.Series[0].Name != "Alice" {
+		t.Fatalf("series user = %s/%s, want %s/Alice", payload.Series[0].UserID, payload.Series[0].Name, created.User.ID)
+	}
+	assertUsageCounters(t, payload.Series[0].UsageCounters, UsageCounters{
+		RequestCount: 1,
+		InputTokens:  9,
+		OutputTokens: 6,
+		TotalTokens:  15,
 	})
 }
 
@@ -1087,6 +1265,33 @@ func waitForUsageTotal(t *testing.T, handler http.Handler, apiKey string, wantTo
 }
 
 type testUsageDimension = UsageDimension
+
+func createUsageTestCredential(t *testing.T, store *UserStore, name string) AuthenticatedAPIKey {
+	t.Helper()
+	created, err := store.CreateUser(context.Background(), CreateUserParams{Name: name})
+	if err != nil {
+		t.Fatalf("CreateUser %q returned error: %v", name, err)
+	}
+	credential, err := store.AuthenticateAPIKey(context.Background(), created.PlaintextAPIKey)
+	if err != nil {
+		t.Fatalf("AuthenticateAPIKey %q returned error: %v", name, err)
+	}
+	return credential
+}
+
+func assertUsageTimeseriesPoint(t *testing.T, got UsageTimeseriesPoint, want UsageTimeseriesPoint) {
+	t.Helper()
+	if !got.BucketStart.Equal(want.BucketStart) ||
+		got.UserID != want.UserID ||
+		got.Name != want.Name ||
+		got.APIKeyID != want.APIKeyID ||
+		got.Model != want.Model ||
+		got.ReasoningEffort != want.ReasoningEffort ||
+		got.ServiceTier != want.ServiceTier {
+		t.Fatalf("timeseries point identity = %#v, want %#v", got, want)
+	}
+	assertUsageCounters(t, got.UsageCounters, want.UsageCounters)
+}
 
 func assertUsageDimensions(t *testing.T, got []testUsageDimension, want []testUsageDimension) {
 	t.Helper()
