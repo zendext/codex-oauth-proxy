@@ -157,14 +157,6 @@ func runAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	}
 }
 
-func runAdminUsers(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	_ = ctx
-	_ = client
-	_ = opts
-	_ = stdout
-	return fmt.Errorf("admin users command requires user command handlers: %v", args)
-}
-
 func runAdminUsage(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
 	_ = ctx
 	_ = client
