@@ -97,7 +97,31 @@ streaming and non-streaming calls are supported.
 
 ```bash
 ./codex-oauth-proxy --config config.yaml
+./codex-oauth-proxy serve --config config.yaml
 ```
+
+## Admin CLI
+
+The same binary includes a local admin CLI. It calls the running proxy at
+`http://127.0.0.1:8317` by default through a loopback-only local admin route and
+does not require `--config` or the configured `admin-api-key`.
+
+```bash
+./codex-oauth-proxy admin users list
+./codex-oauth-proxy admin users create alice
+./codex-oauth-proxy admin users reset-key usr_xxx
+./codex-oauth-proxy admin usage snapshot
+./codex-oauth-proxy admin usage timeseries --window 7d --step 1h --group-by user
+```
+
+Use `--url` for a non-default local instance:
+
+```bash
+./codex-oauth-proxy admin users list --url http://127.0.0.1:8318
+```
+
+All admin commands support `--json` for scripting. User creation and key reset
+print the plaintext user API key once.
 
 Public API routes:
 
