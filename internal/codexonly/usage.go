@@ -63,6 +63,7 @@ type UsageTimeseriesParams struct {
 	Window   string
 	Step     string
 	GroupBy  []string
+	Fill     string
 	UserID   string
 	APIKeyID string
 	Now      time.Time
@@ -336,9 +337,16 @@ func (s *UserStore) GetUsageTimeseries(ctx context.Context, params UsageTimeseri
 	if err != nil {
 		return UsageTimeseries{}, err
 	}
+	fill, err := usageTimeseriesFill(params.Fill)
+	if err != nil {
+		return UsageTimeseries{}, err
+	}
 	points, err := s.queryUsageTimeseries(ctx, start, end, step, groupBy, strings.TrimSpace(params.UserID), strings.TrimSpace(params.APIKeyID))
 	if err != nil {
 		return UsageTimeseries{}, err
+	}
+	if fill == "zero" {
+		points = fillUsageTimeseriesZeros(points, start, end, step)
 	}
 	return UsageTimeseries{
 		Window:  window,
@@ -485,6 +493,58 @@ func (s *UserStore) queryUsageTimeseries(ctx context.Context, start time.Time, e
 	return points, nil
 }
 
+func fillUsageTimeseriesZeros(points []UsageTimeseriesPoint, start time.Time, end time.Time, step time.Duration) []UsageTimeseriesPoint {
+	if len(points) == 0 || step <= 0 {
+		return points
+	}
+	pointByKey := make(map[usageTimeseriesPointKey]UsageTimeseriesPoint, len(points))
+	identityByKey := map[usageTimeseriesPointKey]UsageTimeseriesPoint{}
+	for _, point := range points {
+		key := usageTimeseriesPointKey{
+			BucketStart:     point.BucketStart,
+			UserID:          point.UserID,
+			Name:            point.Name,
+			APIKeyID:        point.APIKeyID,
+			Model:           point.Model,
+			ReasoningEffort: point.ReasoningEffort,
+			ServiceTier:     point.ServiceTier,
+		}
+		pointByKey[key] = point
+		identityKey := key
+		identityKey.BucketStart = time.Time{}
+		identityByKey[identityKey] = point
+	}
+
+	filled := make([]UsageTimeseriesPoint, 0, len(pointByKey))
+	start = usageTimeseriesBucketStart(start, step)
+	for identityKey, identityPoint := range identityByKey {
+		for bucketStart := start; bucketStart.Before(end); bucketStart = bucketStart.Add(step) {
+			key := identityKey
+			key.BucketStart = bucketStart
+			if point, ok := pointByKey[key]; ok {
+				filled = append(filled, point)
+				continue
+			}
+			filled = append(filled, UsageTimeseriesPoint{
+				BucketStart:     bucketStart,
+				UserID:          identityPoint.UserID,
+				Name:            identityPoint.Name,
+				APIKeyID:        identityPoint.APIKeyID,
+				Model:           identityPoint.Model,
+				ReasoningEffort: identityPoint.ReasoningEffort,
+				ServiceTier:     identityPoint.ServiceTier,
+			})
+		}
+	}
+	sort.Slice(filled, func(i int, j int) bool {
+		if !filled[i].BucketStart.Equal(filled[j].BucketStart) {
+			return filled[i].BucketStart.Before(filled[j].BucketStart)
+		}
+		return usageTimeseriesPointSortKey(filled[i]) < usageTimeseriesPointSortKey(filled[j])
+	})
+	return filled
+}
+
 func usageTimeseriesKey(row usageTimeseriesQueryRow, groupSet map[string]bool) usageTimeseriesPointKey {
 	key := usageTimeseriesPointKey{BucketStart: row.BucketStart}
 	if groupSet["user"] {
@@ -584,6 +644,17 @@ func usageTimeseriesGroupBy(values []string) ([]string, error) {
 		return []string{"user"}, nil
 	}
 	return groupBy, nil
+}
+
+func usageTimeseriesFill(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "none":
+		return "", nil
+	case "zero", "zeros":
+		return "zero", nil
+	default:
+		return "", ErrInvalidInput
+	}
 }
 
 func normalizeUsageTimeseriesGroup(value string) (string, bool) {

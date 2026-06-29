@@ -73,7 +73,7 @@
               }
             ]
           },
-          "unit": "none"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -157,7 +157,7 @@
           "summarizeExpression": "",
           "type": "json",
           "uql": "",
-          "url": "/v0/management/usage/timeseries?window=30d&step=1d&group_by=user",
+          "url": "/v0/management/usage/timeseries?window=30d&step=1h&group_by=user&fill=zero",
           "url_options": {
             "body_content_type": "",
             "body_form": [],
@@ -171,7 +171,7 @@
           }
         }
       ],
-      "title": "Total tokens by user (30d, 1d)",
+      "title": "Total tokens by user (30d, 1h)",
       "type": "timeseries",
       "transformations": [
         {
@@ -240,7 +240,7 @@
               }
             ]
           },
-          "unit": "none"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -334,7 +334,7 @@
           "summarizeExpression": "",
           "type": "json",
           "uql": "",
-          "url": "/v0/management/usage/timeseries?window=30d&step=1d",
+          "url": "/v0/management/usage/timeseries?window=30d&step=1h&fill=zero",
           "url_options": {
             "body_content_type": "",
             "body_form": [],
@@ -348,7 +348,7 @@
           }
         }
       ],
-      "title": "Token mix (30d, 1d)",
+      "title": "Token mix (30d, 1h)",
       "type": "timeseries",
       "transformations": [
         {

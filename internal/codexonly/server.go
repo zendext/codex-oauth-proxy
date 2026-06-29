@@ -474,6 +474,7 @@ func usageTimeseriesParamsFromRequest(r *http.Request) UsageTimeseriesParams {
 		Window:   strings.TrimSpace(query.Get("window")),
 		Step:     strings.TrimSpace(query.Get("step")),
 		GroupBy:  query["group_by"],
+		Fill:     strings.TrimSpace(query.Get("fill")),
 		UserID:   strings.TrimSpace(query.Get("user_id")),
 		APIKeyID: strings.TrimSpace(query.Get("api_key_id")),
 	}

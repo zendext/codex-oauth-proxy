@@ -374,6 +374,68 @@ func TestUserStoreUsageTimeseriesSupportsThirtyDayWindow(t *testing.T) {
 	})
 }
 
+func TestUserStoreUsageTimeseriesCanFillMissingBucketsWithZero(t *testing.T) {
+	store := openTestUserStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 12, 10, 45, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	alice := createUsageTestCredential(t, store, "Alice")
+	if err := store.RecordUsage(ctx, UsageRecordParams{
+		Timestamp:       time.Date(2026, 6, 12, 10, 7, 0, 0, time.UTC),
+		User:            alice.User,
+		APIKey:          alice.APIKey,
+		Model:           "gpt-5.3-codex",
+		ReasoningEffort: "high",
+		ServiceTier:     "standard",
+		AuthID:          "auth.json",
+		RequestID:       "req_alice_fill_zero",
+		StatusCode:      http.StatusOK,
+		Counters: UsageCounters{
+			InputTokens:  12,
+			OutputTokens: 8,
+			TotalTokens:  20,
+		},
+	}, UsageConfig{}); err != nil {
+		t.Fatalf("RecordUsage returned error: %v", err)
+	}
+
+	timeseries, err := store.GetUsageTimeseries(ctx, UsageTimeseriesParams{
+		Window:  "5h",
+		Step:    "10m",
+		GroupBy: []string{"user"},
+		Fill:    "zero",
+		Now:     now,
+	}, UsageConfig{})
+	if err != nil {
+		t.Fatalf("GetUsageTimeseries returned error: %v", err)
+	}
+	if len(timeseries.Series) != usageFiveHourBucketCount {
+		t.Fatalf("series count = %d, want %d: %#v", len(timeseries.Series), usageFiveHourBucketCount, timeseries.Series)
+	}
+	assertUsageTimeseriesPoint(t, timeseries.Series[0], UsageTimeseriesPoint{
+		BucketStart: time.Date(2026, 6, 12, 5, 50, 0, 0, time.UTC),
+		UserID:      alice.User.ID,
+		Name:        "Alice",
+	})
+	assertUsageTimeseriesPoint(t, timeseries.Series[25], UsageTimeseriesPoint{
+		BucketStart: time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC),
+		UserID:      alice.User.ID,
+		Name:        "Alice",
+		UsageCounters: UsageCounters{
+			RequestCount: 1,
+			InputTokens:  12,
+			OutputTokens: 8,
+			TotalTokens:  20,
+		},
+	})
+	assertUsageTimeseriesPoint(t, timeseries.Series[26], UsageTimeseriesPoint{
+		BucketStart: time.Date(2026, 6, 12, 10, 10, 0, 0, time.UTC),
+		UserID:      alice.User.ID,
+		Name:        "Alice",
+	})
+}
+
 func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 	authDir := t.TempDir()
 	writeAuthFile(t, authDir, "codex.json", `{

@@ -73,8 +73,13 @@ them for dashboard views:
 - `window=5h&step=10m`
 - `window=24h&step=1h`
 - `window=7d&step=6h`
-- `window=30d&step=1d`
+- `window=30d&step=1h`
 - `window=today&step=1h`
 
 Supported `group_by` values are `user`, `api_key`, `model`, `service_tier`, and
 `reasoning_effort`. Multiple values can be comma-separated.
+
+Add `fill=zero` for chart queries that should include zero-valued points for
+missing buckets. This keeps line charts pinned to zero during idle periods while
+table views can omit the parameter to show only buckets that exist in the
+database.
