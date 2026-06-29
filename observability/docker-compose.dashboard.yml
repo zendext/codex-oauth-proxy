@@ -7,7 +7,8 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
-      GF_INSTALL_PLUGINS: "yesoreyeram-infinity-datasource"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/usage-timeseries.json"
+      GF_PLUGINS_PREINSTALL_SYNC: "yesoreyeram-infinity-datasource"
       CODEX_OAUTH_PROXY_URL: "${CODEX_OAUTH_PROXY_URL:-http://codex-oauth-proxy:8317}"
       CODEX_OAUTH_PROXY_ADMIN_API_KEY: "${CODEX_OAUTH_PROXY_ADMIN_API_KEY:-}"
     volumes:

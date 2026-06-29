@@ -159,6 +159,10 @@ docker compose -f docker-compose.yml -f observability/docker-compose.dashboard.y
 Open Grafana at `http://localhost:3000`. The dashboard calls
 `/v0/management/usage/timeseries` through the configured admin API key.
 
+If Grafana shows `No data`, make sure `observability/grafana` is readable by the
+Grafana container and recreate the Grafana volume after provisioning changes.
+The proxy usage database is separate from the Grafana volume.
+
 ## Verify
 
 ```bash

@@ -28,6 +28,28 @@ export GRAFANA_ADMIN_PASSWORD="change-me"
 export GRAFANA_PORT="3000"
 ```
 
+## Troubleshooting
+
+If the dashboard loads but panels show `No data`, first verify that the mounted
+dashboard and provisioning files are readable by the Grafana container:
+
+```bash
+chmod -R a+rX observability/grafana
+```
+
+Grafana persists provisioned data in the `grafana-storage` volume. If you change
+dashboard or data source provisioning after the first start and the UI still
+shows stale panels, recreate the Grafana volume:
+
+```bash
+docker compose -f docker-compose.yml -f observability/docker-compose.dashboard.yml down
+docker volume rm codex-oauth-proxy_grafana-storage
+docker compose -f docker-compose.yml -f observability/docker-compose.dashboard.yml up -d
+```
+
+This only resets Grafana state. Proxy users and usage buckets live in the proxy
+database, not in the Grafana volume.
+
 ## Data Source
 
 The dashboard calls:

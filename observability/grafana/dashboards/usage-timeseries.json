@@ -133,15 +133,21 @@
           "url": "/v0/management/usage/timeseries?window=7d&step=6h&group_by=user"
         }
       ],
-      "title": "User total tokens over time",
       "transformations": [
         {
-          "id": "prepareTimeSeries",
+          "id": "partitionByValues",
           "options": {
-            "format": "multi"
+            "fields": [
+              "user"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
           }
         }
       ],
+      "title": "User total tokens over time",
       "type": "timeseries"
     },
     {
