@@ -862,6 +862,47 @@ func TestManagementAPIDisabledWithoutAdminAPIKey(t *testing.T) {
 	}
 }
 
+func TestLocalAdminAPIBypassesAdminKeyForLoopback(t *testing.T) {
+	handler := newUserManagementTestHandler(t, &Config{})
+
+	resp := doJSONRequestFromRemote(t, handler, "127.0.0.1:43123", http.MethodPost, "/v0/local-admin/users", `{"name":"Alice"}`, "")
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("local create status = %d, want 201, body: %s", resp.Code, resp.Body.String())
+	}
+
+	var created CreatedUserAPIKey
+	decodeResponse(t, resp, &created)
+	if created.User.Name != "Alice" {
+		t.Fatalf("created user name = %q, want Alice", created.User.Name)
+	}
+	if created.PlaintextAPIKey == "" || !strings.HasPrefix(created.PlaintextAPIKey, "cop_") {
+		t.Fatalf("plaintext API key = %q, want cop_ prefix", created.PlaintextAPIKey)
+	}
+
+	listResp := doJSONRequestFromRemote(t, handler, "[::1]:43123", http.MethodGet, "/v0/local-admin/users", "", "")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("local list status = %d, want 200, body: %s", listResp.Code, listResp.Body.String())
+	}
+}
+
+func TestLocalAdminAPIRejectsNonLoopback(t *testing.T) {
+	handler := newUserManagementTestHandler(t, &Config{})
+
+	resp := doJSONRequestFromRemote(t, handler, "203.0.113.10:43123", http.MethodGet, "/v0/local-admin/users", "", "")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("remote local-admin status = %d, want 404, body: %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestManagementAPIStillRequiresAdminAPIKeyWithLocalAdminEnabled(t *testing.T) {
+	handler := newUserManagementTestHandler(t, &Config{})
+
+	resp := doJSONRequestFromRemote(t, handler, "127.0.0.1:43123", http.MethodGet, "/v0/management/users", "", "")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("management status = %d, want 404, body: %s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestManagementAPICreatesAndListsUsers(t *testing.T) {
 	handler := newUserManagementTestHandler(t, &Config{
 		AdminAPIKey: "admin-key",
@@ -1259,6 +1300,25 @@ func doJSONRequest(t *testing.T, handler http.Handler, method string, path strin
 		reader = bytes.NewBufferString(body)
 	}
 	req := httptest.NewRequest(method, path, reader)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func doJSONRequestFromRemote(t *testing.T, handler http.Handler, remoteAddr string, method string, path string, body string, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != "" {
+		reader = bytes.NewBufferString(body)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.RemoteAddr = remoteAddr
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}

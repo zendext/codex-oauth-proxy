@@ -207,6 +207,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	case r.URL.Path == "/":
 		writeJSON(w, http.StatusOK, map[string]any{"message": "codex-oauth-proxy"})
+	case strings.HasPrefix(r.URL.Path, "/v0/local-admin/"):
+		if !isLoopbackRemoteAddr(r.RemoteAddr) {
+			s.debugf("local admin auth failed method=%s path=%s remote=%s reason=non_loopback", r.Method, r.URL.Path, r.RemoteAddr)
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		s.debugf("local admin auth ok method=%s path=%s remote=%s", r.Method, r.URL.Path, r.RemoteAddr)
+		s.handleManagementPath(w, r, strings.TrimPrefix(r.URL.Path, "/v0/local-admin"))
 	case strings.HasPrefix(r.URL.Path, "/v0/management/"):
 		if !s.managementAPIEnabled() {
 			s.debugf("management auth failed method=%s path=%s reason=disabled", r.Method, r.URL.Path)
@@ -299,6 +307,18 @@ func (s *Server) authorizedAdmin(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host := strings.TrimSpace(remoteAddr)
+	if host == "" {
+		return false
+	}
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) authenticateUserAPIKey(r *http.Request) (AuthenticatedAPIKey, error) {
@@ -419,7 +439,10 @@ type updateUserRequest struct {
 }
 
 func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/v0/management")
+	s.handleManagementPath(w, r, strings.TrimPrefix(r.URL.Path, "/v0/management"))
+}
+
+func (s *Server) handleManagementPath(w http.ResponseWriter, r *http.Request, path string) {
 	switch {
 	case path == "/usage/timeseries" && r.Method == http.MethodGet:
 		timeseries, err := s.users.GetUsageTimeseries(r.Context(), usageTimeseriesParamsFromRequest(r), s.cfg.Usage)
