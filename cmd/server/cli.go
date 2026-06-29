@@ -156,11 +156,3 @@ func runAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return fmt.Errorf("unknown admin resource %q", rest[0])
 	}
 }
-
-func runAdminUsage(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	_ = ctx
-	_ = client
-	_ = opts
-	_ = stdout
-	return fmt.Errorf("admin usage command requires usage command handlers: %v", args)
-}
