@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	usageBucketDuration      = 10 * time.Minute
-	usageFiveHourBucketCount = 30
-	usageWeeklyBucketCount   = 1008
+	usageBucketDuration       = 10 * time.Minute
+	usageFiveHourBucketCount  = 30
+	usageSevenDayBucketCount  = 7 * 24 * 6
+	usageRetentionBucketCount = 30 * 24 * 6
 )
 
 type UsageCounters struct {
@@ -255,7 +256,7 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 		now = s.now().UTC()
 	}
 	windowEnd := usageBucketStart(now).Add(usageBucketDuration)
-	sevenDayStart := usageWindowStart(now, usageWeeklyBucketCount)
+	sevenDayStart := usageWindowStart(now, usageSevenDayBucketCount)
 
 	query := `SELECT DISTINCT u.id, u.name, k.id, k.key_hash, k.masked_key
 		FROM usage_buckets b
@@ -350,7 +351,7 @@ func (s *UserStore) GetUsageTimeseries(ctx context.Context, params UsageTimeseri
 }
 
 func pruneUsageData(ctx context.Context, tx *sql.Tx, now time.Time) error {
-	bucketCutoff := usageWindowStart(now, usageWeeklyBucketCount)
+	bucketCutoff := usageWindowStart(now, usageRetentionBucketCount)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_buckets WHERE bucket_start < ?`, formatDBTime(bucketCutoff)); err != nil {
 		return fmt.Errorf("prune usage buckets: %w", err)
 	}
@@ -518,7 +519,7 @@ func usageTimeseriesWindow(raw string, now time.Time) (string, time.Time, time.T
 	case "24h":
 		return window, usageWindowStart(now, 24*6), windowEnd, nil
 	case "7d":
-		return window, usageWindowStart(now, usageWeeklyBucketCount), windowEnd, nil
+		return window, usageWindowStart(now, usageSevenDayBucketCount), windowEnd, nil
 	case "today":
 		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 		return window, dayStart, windowEnd, nil
@@ -797,7 +798,7 @@ func usageWindowSpecs() []usageWindowSpec {
 		},
 		{
 			name:        "7d",
-			bucketCount: usageWeeklyBucketCount,
+			bucketCount: usageSevenDayBucketCount,
 		},
 	}
 }

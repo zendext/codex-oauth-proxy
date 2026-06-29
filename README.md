@@ -76,11 +76,11 @@ Set `admin-api-key` to enable `/v0/management`. Generated user API keys
 authenticate proxy routes and `/v0/user`; set `COP_API_KEY` when running Codex
 through this proxy.
 
-Usage tracking stores 10-minute UTC buckets for managed user API keys. User
-totals are exposed at `/v0/user/usage/today`; 5-hour and 7-day management
-snapshots are exposed at `/v0/management/usage`. Model breakdowns include
-`model`, `reasoning_effort`, and `service_tier` (`standard` or `fast`).
-Dashboard-oriented timeseries are exposed at
+Usage tracking stores 10-minute UTC buckets for managed user API keys and keeps
+30 days of bucket data. User totals are exposed at `/v0/user/usage/today`;
+5-hour and 7-day management snapshots are exposed at `/v0/management/usage`.
+Model breakdowns include `model`, `reasoning_effort`, and `service_tier`
+(`standard` or `fast`). Dashboard-oriented timeseries are exposed at
 `/v0/management/usage/timeseries`; they read the same 10-minute buckets and can
 aggregate them with `step=10m`, `30m`, `1h`, `6h`, or `1d`.
 

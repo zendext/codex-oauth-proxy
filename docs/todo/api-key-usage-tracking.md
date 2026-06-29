@@ -102,13 +102,13 @@ Suggested counters:
 - cache creation tokens, if present
 - total tokens
 
-Keep enough buckets for the 7-day window and today's user query. Derive:
+Keep 30 days of buckets for retention. Derive:
 
 - The 5-hour window from the most recent 30 buckets.
 - The 7-day window from the most recent 1008 buckets.
 - Today's usage from buckets whose timestamp falls on the current UTC day.
 
-Prune buckets older than the required retention window.
+Prune buckets older than the 30-day retention window.
 
 ## Token Accounting
 

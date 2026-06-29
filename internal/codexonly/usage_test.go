@@ -152,6 +152,56 @@ func TestUserStoreRecordsUsageBucketsAndWindows(t *testing.T) {
 	})
 }
 
+func TestUserStorePrunesUsageBucketsAfterThirtyDays(t *testing.T) {
+	store := openTestUserStore(t)
+	ctx := context.Background()
+	fixed := time.Date(2026, 6, 12, 10, 7, 0, 0, time.UTC)
+	store.now = func() time.Time { return fixed }
+
+	created, err := store.CreateUser(ctx, CreateUserParams{Name: "Alice"})
+	if err != nil {
+		t.Fatalf("CreateUser returned error: %v", err)
+	}
+	credential, err := store.AuthenticateAPIKey(ctx, created.PlaintextAPIKey)
+	if err != nil {
+		t.Fatalf("AuthenticateAPIKey returned error: %v", err)
+	}
+
+	enabled := true
+	cfg := UsageConfig{Enabled: &enabled}
+	record := func(timestamp time.Time, requestID string, totalTokens int64) {
+		t.Helper()
+		errRecord := store.RecordUsage(ctx, UsageRecordParams{
+			Timestamp:  timestamp,
+			User:       credential.User,
+			APIKey:     credential.APIKey,
+			Model:      "gpt-5.3-codex",
+			AuthID:     "auth.json",
+			RequestID:  requestID,
+			StatusCode: http.StatusOK,
+			Counters: UsageCounters{
+				TotalTokens: totalTokens,
+			},
+		}, cfg)
+		if errRecord != nil {
+			t.Fatalf("RecordUsage %s returned error: %v", requestID, errRecord)
+		}
+	}
+
+	record(fixed.Add(-29*24*time.Hour), "req_within_retention", 29)
+	record(fixed.Add(-31*24*time.Hour), "req_outside_retention", 31)
+	record(fixed, "req_current", 1)
+
+	var bucketCount int
+	var totalTokens int64
+	if err = store.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM usage_buckets`).Scan(&bucketCount, &totalTokens); err != nil {
+		t.Fatalf("query usage buckets returned error: %v", err)
+	}
+	if bucketCount != 2 || totalTokens != 30 {
+		t.Fatalf("usage buckets count/tokens = %d/%d, want 2/30", bucketCount, totalTokens)
+	}
+}
+
 func TestUserStoreUsageTimeseriesGroupsTenMinuteBucketsByUser(t *testing.T) {
 	store := openTestUserStore(t)
 	ctx := context.Background()
