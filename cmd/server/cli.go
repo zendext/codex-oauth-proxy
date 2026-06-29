@@ -135,8 +135,40 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 }
 
 func runAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
-	_ = ctx
-	_ = stdout
 	_ = stderr
-	return fmt.Errorf("admin command requires local admin HTTP client: %v", args)
+	opts, rest, err := splitAdminFlags(args)
+	if err != nil {
+		return err
+	}
+	if len(rest) == 0 {
+		return fmt.Errorf("admin requires a resource: users or usage")
+	}
+	client, err := newAdminClient(opts.baseURL)
+	if err != nil {
+		return err
+	}
+	switch rest[0] {
+	case "users":
+		return runAdminUsers(ctx, client, opts, rest[1:], stdout)
+	case "usage":
+		return runAdminUsage(ctx, client, opts, rest[1:], stdout)
+	default:
+		return fmt.Errorf("unknown admin resource %q", rest[0])
+	}
+}
+
+func runAdminUsers(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
+	_ = ctx
+	_ = client
+	_ = opts
+	_ = stdout
+	return fmt.Errorf("admin users command requires user command handlers: %v", args)
+}
+
+func runAdminUsage(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
+	_ = ctx
+	_ = client
+	_ = opts
+	_ = stdout
+	return fmt.Errorf("admin usage command requires usage command handlers: %v", args)
 }
