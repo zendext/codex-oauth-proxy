@@ -53,7 +53,6 @@ func parseServeFlags(args []string) (cliOptions, error) {
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
-	fmt.Fprintf(stdout, "codex-oauth-proxy Version: %s, Commit: %s, BuiltAt: %s\n", Version, Commit, BuildDate)
 	opts, err := parseCLI(args)
 	if err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
@@ -67,6 +66,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 		return 0
 	default:
+		fmt.Fprintf(stdout, "codex-oauth-proxy Version: %s, Commit: %s, BuiltAt: %s\n", Version, Commit, BuildDate)
 		if err = runServe(ctx, opts, stdout, stderr); err != nil {
 			fmt.Fprintf(stderr, "%v\n", err)
 			return 1
