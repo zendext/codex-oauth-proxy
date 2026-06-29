@@ -319,6 +319,61 @@ func TestUserStoreUsageTimeseriesGroupsTenMinuteBucketsByUser(t *testing.T) {
 	})
 }
 
+func TestUserStoreUsageTimeseriesSupportsThirtyDayWindow(t *testing.T) {
+	store := openTestUserStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 29, 10, 45, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	alice := createUsageTestCredential(t, store, "Alice")
+	timestamp := now.Add(-14 * 24 * time.Hour)
+	if err := store.RecordUsage(ctx, UsageRecordParams{
+		Timestamp:       timestamp,
+		User:            alice.User,
+		APIKey:          alice.APIKey,
+		Model:           "gpt-5.3-codex",
+		ReasoningEffort: "high",
+		ServiceTier:     "standard",
+		AuthID:          "auth.json",
+		RequestID:       "req_alice_30d",
+		StatusCode:      http.StatusOK,
+		Counters: UsageCounters{
+			InputTokens:  30,
+			OutputTokens: 12,
+			TotalTokens:  42,
+		},
+	}, UsageConfig{}); err != nil {
+		t.Fatalf("RecordUsage returned error: %v", err)
+	}
+
+	timeseries, err := store.GetUsageTimeseries(ctx, UsageTimeseriesParams{
+		Window:  "30d",
+		Step:    "1d",
+		GroupBy: []string{"user"},
+		Now:     now,
+	}, UsageConfig{})
+	if err != nil {
+		t.Fatalf("GetUsageTimeseries returned error: %v", err)
+	}
+	if timeseries.Window != "30d" || timeseries.Step != "1d" {
+		t.Fatalf("timeseries window/step = %s/%s, want 30d/1d", timeseries.Window, timeseries.Step)
+	}
+	if len(timeseries.Series) != 1 {
+		t.Fatalf("series count = %d, want 1: %#v", len(timeseries.Series), timeseries.Series)
+	}
+	assertUsageTimeseriesPoint(t, timeseries.Series[0], UsageTimeseriesPoint{
+		BucketStart: time.Date(timestamp.Year(), timestamp.Month(), timestamp.Day(), 0, 0, 0, 0, time.UTC),
+		UserID:      alice.User.ID,
+		Name:        "Alice",
+		UsageCounters: UsageCounters{
+			RequestCount: 1,
+			InputTokens:  30,
+			OutputTokens: 12,
+			TotalTokens:  42,
+		},
+	})
+}
+
 func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 	authDir := t.TempDir()
 	writeAuthFile(t, authDir, "codex.json", `{

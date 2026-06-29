@@ -520,6 +520,8 @@ func usageTimeseriesWindow(raw string, now time.Time) (string, time.Time, time.T
 		return window, usageWindowStart(now, 24*6), windowEnd, nil
 	case "7d":
 		return window, usageWindowStart(now, usageSevenDayBucketCount), windowEnd, nil
+	case "30d":
+		return window, usageWindowStart(now, usageRetentionBucketCount), windowEnd, nil
 	case "today":
 		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 		return window, dayStart, windowEnd, nil
@@ -555,6 +557,8 @@ func usageTimeseriesAutoStep(window string) string {
 		return "10m"
 	case "7d":
 		return "6h"
+	case "30d":
+		return "1d"
 	default:
 		return "1h"
 	}

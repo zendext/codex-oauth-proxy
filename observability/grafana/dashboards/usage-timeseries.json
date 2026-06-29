@@ -53,7 +53,7 @@
             "scaleDistribution": {
               "type": "linear"
             },
-            "showPoints": "never",
+            "showPoints": "auto",
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -78,12 +78,12 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 9,
         "w": 24,
         "x": 0,
         "y": 0
       },
-      "id": 1,
+      "id": 21,
       "options": {
         "legend": {
           "calcs": [
@@ -102,6 +102,7 @@
       },
       "targets": [
         {
+          "alias": "",
           "columns": [
             {
               "selector": "bucket_start",
@@ -119,20 +120,59 @@
               "type": "number"
             }
           ],
+          "computed_columns": [],
+          "csv_options": {
+            "columns": "",
+            "comment": "",
+            "delimiter": "",
+            "relax_column_count": false,
+            "skip_empty_lines": false,
+            "skip_lines_with_error": false
+          },
+          "data": "",
+          "dataOverrides": [],
           "datasource": {
             "type": "yesoreyeram-infinity-datasource",
             "uid": "codex-oauth-proxy-api"
           },
+          "expression": "",
+          "filterExpression": "",
+          "filters": [],
           "format": "table",
+          "global_query_id": "",
+          "groq": "",
+          "json_options": {
+            "columnar": false,
+            "root_is_not_array": false
+          },
           "method": "GET",
           "parser": "backend",
+          "query_mode": "standard",
           "refId": "A",
           "root_selector": "series",
+          "seriesCount": 0,
           "source": "url",
+          "summarizeAlias": "",
+          "summarizeBy": "",
+          "summarizeExpression": "",
           "type": "json",
-          "url": "/v0/management/usage/timeseries?window=7d&step=6h&group_by=user"
+          "uql": "",
+          "url": "/v0/management/usage/timeseries?window=30d&step=1d&group_by=user",
+          "url_options": {
+            "body_content_type": "",
+            "body_form": [],
+            "body_graphql_query": "",
+            "body_graphql_variables": "",
+            "body_type": "",
+            "data": "",
+            "headers": [],
+            "method": "GET",
+            "params": []
+          }
         }
       ],
+      "title": "Total tokens by user (30d, 1d)",
+      "type": "timeseries",
       "transformations": [
         {
           "id": "partitionByValues",
@@ -146,9 +186,207 @@
             }
           }
         }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "codex-oauth-proxy-api"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "tokens",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "alias": "",
+          "columns": [
+            {
+              "selector": "bucket_start",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "input_tokens",
+              "text": "input_tokens",
+              "type": "number"
+            },
+            {
+              "selector": "output_tokens",
+              "text": "output_tokens",
+              "type": "number"
+            },
+            {
+              "selector": "reasoning_tokens",
+              "text": "reasoning_tokens",
+              "type": "number"
+            },
+            {
+              "selector": "cached_input_tokens",
+              "text": "cached_input_tokens",
+              "type": "number"
+            }
+          ],
+          "computed_columns": [],
+          "csv_options": {
+            "columns": "",
+            "comment": "",
+            "delimiter": "",
+            "relax_column_count": false,
+            "skip_empty_lines": false,
+            "skip_lines_with_error": false
+          },
+          "data": "",
+          "dataOverrides": [],
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "codex-oauth-proxy-api"
+          },
+          "expression": "",
+          "filterExpression": "",
+          "filters": [],
+          "format": "table",
+          "global_query_id": "",
+          "groq": "",
+          "json_options": {
+            "columnar": false,
+            "root_is_not_array": false
+          },
+          "method": "GET",
+          "parser": "backend",
+          "query_mode": "standard",
+          "refId": "A",
+          "root_selector": "series",
+          "seriesCount": 0,
+          "source": "url",
+          "summarizeAlias": "",
+          "summarizeBy": "",
+          "summarizeExpression": "",
+          "type": "json",
+          "uql": "",
+          "url": "/v0/management/usage/timeseries?window=30d&step=1d",
+          "url_options": {
+            "body_content_type": "",
+            "body_form": [],
+            "body_graphql_query": "",
+            "body_graphql_variables": "",
+            "body_type": "",
+            "data": "",
+            "headers": [],
+            "method": "GET",
+            "params": []
+          }
+        }
       ],
-      "title": "User total tokens over time",
-      "type": "timeseries"
+      "title": "Token mix (30d, 1d)",
+      "type": "timeseries",
+      "transformations": [
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "cached_input_tokens": {
+                "aggregations": [
+                  "sum"
+                ],
+                "operation": "aggregate"
+              },
+              "input_tokens": {
+                "aggregations": [
+                  "sum"
+                ],
+                "operation": "aggregate"
+              },
+              "output_tokens": {
+                "aggregations": [
+                  "sum"
+                ],
+                "operation": "aggregate"
+              },
+              "reasoning_tokens": {
+                "aggregations": [
+                  "sum"
+                ],
+                "operation": "aggregate"
+              },
+              "time": {
+                "aggregations": [],
+                "operation": "groupby"
+              }
+            }
+          }
+        }
+      ]
     },
     {
       "datasource": {
@@ -194,9 +432,9 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 10
+        "y": 18
       },
-      "id": 2,
+      "id": 23,
       "options": {
         "cellHeight": "sm",
         "footer": {
@@ -209,14 +447,14 @@
         },
         "showHeader": true
       },
-      "pluginVersion": "12.0.0",
       "targets": [
         {
+          "alias": "",
           "columns": [
             {
               "selector": "bucket_start",
               "text": "bucket_start",
-              "type": "timestamp"
+              "type": "string"
             },
             {
               "selector": "name",
@@ -254,21 +492,58 @@
               "type": "number"
             }
           ],
+          "computed_columns": [],
+          "csv_options": {
+            "columns": "",
+            "comment": "",
+            "delimiter": "",
+            "relax_column_count": false,
+            "skip_empty_lines": false,
+            "skip_lines_with_error": false
+          },
+          "data": "",
+          "dataOverrides": [],
           "datasource": {
             "type": "yesoreyeram-infinity-datasource",
             "uid": "codex-oauth-proxy-api"
           },
+          "expression": "",
+          "filterExpression": "",
+          "filters": [],
           "format": "table",
+          "global_query_id": "",
+          "groq": "",
+          "json_options": {
+            "columnar": false,
+            "root_is_not_array": false
+          },
           "method": "GET",
           "parser": "backend",
+          "query_mode": "standard",
           "refId": "A",
           "root_selector": "series",
+          "seriesCount": 0,
           "source": "url",
+          "summarizeAlias": "",
+          "summarizeBy": "",
+          "summarizeExpression": "",
           "type": "json",
-          "url": "/v0/management/usage/timeseries?window=5h&step=10m&group_by=user"
+          "uql": "",
+          "url": "/v0/management/usage/timeseries?window=5h&step=10m&group_by=user",
+          "url_options": {
+            "body_content_type": "",
+            "body_form": [],
+            "body_graphql_query": "",
+            "body_graphql_variables": "",
+            "body_type": "",
+            "data": "",
+            "headers": [],
+            "method": "GET",
+            "params": []
+          }
         }
       ],
-      "title": "10-minute user token buckets",
+      "title": "Recent user token buckets (5h, 10m)",
       "type": "table"
     }
   ],
@@ -290,5 +565,5 @@
   "timezone": "utc",
   "title": "Codex OAuth Proxy Usage",
   "uid": "codex-oauth-proxy-usage",
-  "version": 1
+  "version": 3
 }

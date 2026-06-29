@@ -73,6 +73,7 @@ them for dashboard views:
 - `window=5h&step=10m`
 - `window=24h&step=1h`
 - `window=7d&step=6h`
+- `window=30d&step=1d`
 - `window=today&step=1h`
 
 Supported `group_by` values are `user`, `api_key`, `model`, `service_tier`, and
