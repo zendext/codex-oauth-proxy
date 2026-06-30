@@ -143,14 +143,17 @@ Public API routes:
 - `GET /v1/responses`
 - `POST /v1/responses/compact`
 - `POST /v1/alpha/search`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
 - `POST /v1/memories/trace_summarize`
 - `POST /v1/realtime/calls`
 - `GET /v1/realtime`
 
-Image generation is available only through `/v1/responses` by using the upstream
-Responses API `image_generation` tool, normally with `stream: true`. Raw
-`/v1/images/*` and `/backend-api/*` endpoints are not public API and should not
-be used by general clients.
+Image generation is available through `/v1/responses` by using the upstream
+Responses API `image_generation` tool, normally with `stream: true`. The proxy
+also exposes the narrow image compatibility routes `/v1/images/generations` and
+`/v1/images/edits`. Other raw `/v1/images/*` routes and `/backend-api/*` paths
+are not public API and should not be used by general clients.
 
 Protected proxy routes require a managed user API key:
 
