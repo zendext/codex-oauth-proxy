@@ -157,7 +157,7 @@
           "summarizeExpression": "",
           "type": "json",
           "uql": "",
-          "url": "/v0/management/usage/timeseries?window=30d&step=1h&group_by=user&fill=zero",
+          "url": "/v0/management/usage/timeseries?window=${usage_window}&step=1h&group_by=user&fill=zero",
           "url_options": {
             "body_content_type": "",
             "body_form": [],
@@ -171,7 +171,7 @@
           }
         }
       ],
-      "title": "Total tokens by user (30d, 1h)",
+      "title": "Total tokens by user (${usage_window}, 1h)",
       "type": "timeseries",
       "transformations": [
         {
@@ -277,23 +277,13 @@
               "type": "timestamp"
             },
             {
-              "selector": "input_tokens",
-              "text": "input_tokens",
-              "type": "number"
+              "selector": "name",
+              "text": "user",
+              "type": "string"
             },
             {
-              "selector": "output_tokens",
-              "text": "output_tokens",
-              "type": "number"
-            },
-            {
-              "selector": "reasoning_tokens",
-              "text": "reasoning_tokens",
-              "type": "number"
-            },
-            {
-              "selector": "cached_input_tokens",
-              "text": "cached_input_tokens",
+              "selector": "total_tokens",
+              "text": "total_tokens",
               "type": "number"
             }
           ],
@@ -334,7 +324,7 @@
           "summarizeExpression": "",
           "type": "json",
           "uql": "",
-          "url": "/v0/management/usage/timeseries?window=30d&step=1h&fill=zero",
+          "url": "/v0/management/usage/timeseries?window=${usage_window}&step=1d&group_by=user&fill=zero",
           "url_options": {
             "body_content_type": "",
             "body_form": [],
@@ -348,38 +338,169 @@
           }
         }
       ],
-      "title": "Token mix (30d, 1h)",
+      "title": "Total tokens by user (${usage_window}, 1d)",
       "type": "timeseries",
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "user"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "codex-oauth-proxy-api"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 24,
+      "options": {
+        "displayLabels": [
+          "name",
+          "percent"
+        ],
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "pieType": "pie",
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ],
+          "fields": "",
+          "values": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "alias": "",
+          "columns": [
+            {
+              "selector": "name",
+              "text": "user",
+              "type": "string"
+            },
+            {
+              "selector": "total_tokens",
+              "text": "total_tokens",
+              "type": "number"
+            }
+          ],
+          "computed_columns": [],
+          "csv_options": {
+            "columns": "",
+            "comment": "",
+            "delimiter": "",
+            "relax_column_count": false,
+            "skip_empty_lines": false,
+            "skip_lines_with_error": false
+          },
+          "data": "",
+          "dataOverrides": [],
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "codex-oauth-proxy-api"
+          },
+          "expression": "",
+          "filterExpression": "",
+          "filters": [],
+          "format": "table",
+          "global_query_id": "",
+          "groq": "",
+          "json_options": {
+            "columnar": false,
+            "root_is_not_array": false
+          },
+          "method": "GET",
+          "parser": "backend",
+          "query_mode": "standard",
+          "refId": "A",
+          "root_selector": "series",
+          "seriesCount": 0,
+          "source": "url",
+          "summarizeAlias": "",
+          "summarizeBy": "",
+          "summarizeExpression": "",
+          "type": "json",
+          "uql": "",
+          "url": "/v0/management/usage/timeseries?window=${usage_window}&step=1d&group_by=user",
+          "url_options": {
+            "body_content_type": "",
+            "body_form": [],
+            "body_graphql_query": "",
+            "body_graphql_variables": "",
+            "body_type": "",
+            "data": "",
+            "headers": [],
+            "method": "GET",
+            "params": []
+          }
+        }
+      ],
+      "title": "Total tokens share by user (${usage_window})",
+      "type": "piechart",
       "transformations": [
         {
           "id": "groupBy",
           "options": {
             "fields": {
-              "cached_input_tokens": {
+              "total_tokens": {
                 "aggregations": [
                   "sum"
                 ],
                 "operation": "aggregate"
               },
-              "input_tokens": {
-                "aggregations": [
-                  "sum"
-                ],
-                "operation": "aggregate"
-              },
-              "output_tokens": {
-                "aggregations": [
-                  "sum"
-                ],
-                "operation": "aggregate"
-              },
-              "reasoning_tokens": {
-                "aggregations": [
-                  "sum"
-                ],
-                "operation": "aggregate"
-              },
-              "time": {
+              "user": {
                 "aggregations": [],
                 "operation": "groupby"
               }
@@ -432,7 +553,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 27
       },
       "id": 23,
       "options": {
@@ -555,7 +676,51 @@
     "usage"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "30d",
+          "value": "30d"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Usage window",
+        "multi": false,
+        "name": "usage_window",
+        "options": [
+          {
+            "selected": false,
+            "text": "5h",
+            "value": "5h"
+          },
+          {
+            "selected": false,
+            "text": "24h",
+            "value": "24h"
+          },
+          {
+            "selected": false,
+            "text": "7d",
+            "value": "7d"
+          },
+          {
+            "selected": true,
+            "text": "30d",
+            "value": "30d"
+          },
+          {
+            "selected": false,
+            "text": "today",
+            "value": "today"
+          }
+        ],
+        "query": "5h,24h,7d,30d,today",
+        "queryValue": "",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
   },
   "time": {
     "from": "now-7d",
@@ -565,5 +730,5 @@
   "timezone": "utc",
   "title": "Codex OAuth Proxy Usage",
   "uid": "codex-oauth-proxy-usage",
-  "version": 3
+  "version": 4
 }
