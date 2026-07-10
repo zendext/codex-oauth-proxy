@@ -636,14 +636,19 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"models": codexClientModels(s.fastModeAllowed())})
 		return
 	}
-	data := make([]map[string]any, 0, len(codexModelIDs()))
-	for _, id := range codexModelIDs() {
-		data = append(data, map[string]any{
-			"id":       id,
-			"object":   "model",
-			"created":  0,
-			"owned_by": "openai",
-		})
+	models := codexClientModels(s.fastModeAllowed())
+	data := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		id, _ := model["slug"].(string)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		entry := cloneCodexClientModelMap(model)
+		entry["id"] = id
+		entry["object"] = "model"
+		entry["created"] = 0
+		entry["owned_by"] = "openai"
+		data = append(data, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -1163,6 +1168,10 @@ func writeError(w http.ResponseWriter, status int, message string) {
 
 func codexModelIDs() []string {
 	return []string{
+		"gpt-5.6-sol",
+		"gpt-5.6",
+		"gpt-5.6-terra",
+		"gpt-5.6-luna",
 		"gpt-5.5",
 		"gpt-5.4",
 		"gpt-5.4-mini",

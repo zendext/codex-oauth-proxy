@@ -636,6 +636,84 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	if !modelHasFastTier(model) {
 		t.Fatalf("Fast tier metadata not found in %#v", model)
 	}
+	model = findCodexClientModel(payload.Models, "gpt-5.6-sol")
+	if model == nil {
+		t.Fatalf("gpt-5.6-sol model metadata not found in %#v", payload.Models)
+	}
+	if got := model["display_name"]; got != "GPT-5.6-Sol" {
+		t.Fatalf("display_name = %#v, want GPT-5.6-Sol", got)
+	}
+	if got := model["max_context_window"]; got != float64(372000) {
+		t.Fatalf("max_context_window = %#v, want 372000", got)
+	}
+	if !reasoningLevelsContain(model, "max") {
+		t.Fatalf("supported_reasoning_levels does not include max: %#v", model["supported_reasoning_levels"])
+	}
+	if !reasoningLevelsContain(model, "ultra") {
+		t.Fatalf("supported_reasoning_levels does not include ultra: %#v", model["supported_reasoning_levels"])
+	}
+	if modelHasFastTier(model) {
+		t.Fatalf("gpt-5.6-sol unexpectedly advertises Fast tier: %#v", model)
+	}
+}
+
+func TestOpenAIModelsIncludeCodexMetadata(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "codex.json", `{
+		"type": "codex",
+		"access_token": "access-1",
+		"refresh_token": "refresh-1",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	handler, err := NewHandler(context.Background(), &Config{
+		Port:         8317,
+		AuthDir:      authDir,
+		AdminAPIKey:  "admin-key",
+		Database:     DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL: "http://127.0.0.1:1/backend-api/codex",
+		RequestRetry: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+userKey)
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Object string           `json:"object"`
+		Data   []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Object != "list" {
+		t.Fatalf("object = %q, want list", payload.Object)
+	}
+	model := findOpenAIModel(payload.Data, "gpt-5.6-sol")
+	if model == nil {
+		t.Fatalf("gpt-5.6-sol model not found in %#v", payload.Data)
+	}
+	if got := model["object"]; got != "model" {
+		t.Fatalf("object = %#v, want model", got)
+	}
+	if got := model["display_name"]; got != "GPT-5.6-Sol" {
+		t.Fatalf("display_name = %#v, want GPT-5.6-Sol", got)
+	}
+	if !reasoningLevelsContain(model, "ultra") {
+		t.Fatalf("supported_reasoning_levels does not include ultra: %#v", model["supported_reasoning_levels"])
+	}
+	if modelHasFastTier(model) {
+		t.Fatalf("gpt-5.6-sol unexpectedly advertises Fast tier: %#v", model)
+	}
 }
 
 func TestCodexClientModelsHideFastTierByDefault(t *testing.T) {
@@ -1264,6 +1342,15 @@ func captureStandardLogger(t *testing.T, buf *bytes.Buffer) func() {
 func findCodexClientModel(models []map[string]any, slug string) map[string]any {
 	for _, model := range models {
 		if model["slug"] == slug {
+			return model
+		}
+	}
+	return nil
+}
+
+func findOpenAIModel(models []map[string]any, id string) map[string]any {
+	for _, model := range models {
+		if model["id"] == id {
 			return model
 		}
 	}
