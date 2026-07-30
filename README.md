@@ -6,36 +6,15 @@
 
 ---
 
-`codex-oauth-proxy` is a small self-hosted HTTP proxy that forwards supported
-Codex traffic with OAuth credentials already stored by Codex CLI. It is intended
-for operators who want to expose their own Codex OAuth access through managed
-API keys without distributing the OAuth files themselves.
-
-The proxy is Codex-specific. It supports Codex CLI, a narrow OpenAI-compatible
-API surface for custom agents, local user administration, and per-user usage
-statistics. It is not a general OpenAI gateway or a multi-provider proxy.
+`codex-oauth-proxy` forwards Codex requests through managed API keys using OAuth
+credentials from Codex CLI.
 
 ## Features
 
-- Loads the official Codex CLI `~/.codex/auth.json` format and flat Codex token
-  JSON files.
-- Selects multiple active OAuth files in round-robin order and refreshes expired
-  access tokens.
-- Proxies whitelisted Responses, realtime, image, search, memory, file, account,
-  and hosted MCP routes used by Codex CLI.
-- Issues managed `cop_...` API keys backed by SQLite.
-- Provides an OpenAI-compatible `/v1/chat/completions` translation layer.
-- Records per-user token usage in 10-minute buckets with 30-day retention.
-- Includes a local admin CLI and an optional Grafana dashboard.
-
-## Requirements
-
-- Go 1.26 or later when building from source.
-- At least one usable Codex OAuth file, normally created by Codex CLI at
-  `~/.codex/auth.json`.
-
-Linux `amd64` release binaries are available from
-[GitHub Releases](https://github.com/zendext/codex-oauth-proxy/releases).
+- Proxies Codex CLI and supported OpenAI-compatible requests.
+- Manages `cop_...` API keys for proxy users.
+- Rotates multiple Codex OAuth credentials and refreshes expired tokens.
+- Records per-user token usage and provides an optional Grafana dashboard.
 
 ## Quick Start
 
@@ -105,16 +84,6 @@ details.
 - [Usage and Observability](docs/usage-and-observability.md)
 - [Architecture](docs/architecture.md)
 - [Development](docs/development.md)
-
-## Scope
-
-The proxy forwards only explicitly supported routes. `/v1/*` and project-owned
-`/v0/*` endpoints are the supported integration surface. Selected
-`/backend-api/*` paths exist for Codex CLI compatibility and are not a stable
-public API for third-party clients.
-
-The service listens over HTTP. Binding, TLS termination, and network exposure
-are deployment concerns outside the proxy.
 
 ## License
 
