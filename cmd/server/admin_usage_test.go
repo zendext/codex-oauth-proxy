@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,16 +20,9 @@ func TestAdminUsageSnapshotTable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newAdminClient(server.URL)
-	if err != nil {
-		t.Fatalf("newAdminClient returned error: %v", err)
-	}
-	var out bytes.Buffer
-	if err = runAdminUsage(context.Background(), client, adminOptions{}, []string{"snapshot", "--user-id", "usr_1"}, &out); err != nil {
-		t.Fatalf("runAdminUsage returned error: %v", err)
-	}
-	if !strings.Contains(out.String(), "TOKENS_5H") || !strings.Contains(out.String(), "50") {
-		t.Fatalf("output = %q, want snapshot table", out.String())
+	output := runAdminTestCommand(t, server.URL, "usage", "snapshot", "--user-id", "usr_1")
+	if !strings.Contains(output, "TOKENS_5H") || !strings.Contains(output, "50") {
+		t.Fatalf("output = %q, want snapshot table", output)
 	}
 }
 
@@ -52,15 +43,17 @@ func TestAdminUsageTimeseriesQueryAndJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newAdminClient(server.URL)
-	if err != nil {
-		t.Fatalf("newAdminClient returned error: %v", err)
-	}
-	var out bytes.Buffer
-	if err = runAdminUsage(context.Background(), client, adminOptions{json: true}, []string{"timeseries", "--window", "7d", "--step", "1h", "--group-by", "user,model", "--fill", "zero"}, &out); err != nil {
-		t.Fatalf("runAdminUsage returned error: %v", err)
-	}
-	if !strings.Contains(out.String(), `"series"`) || !strings.Contains(out.String(), `"gpt-5.3-codex"`) {
-		t.Fatalf("json output = %q, want timeseries payload", out.String())
+	output := runAdminTestCommand(
+		t,
+		server.URL,
+		"usage", "timeseries",
+		"--window", "7d",
+		"--step", "1h",
+		"--group-by", "user,model",
+		"--fill", "zero",
+		"--json",
+	)
+	if !strings.Contains(output, `"series"`) || !strings.Contains(output, `"gpt-5.3-codex"`) {
+		t.Fatalf("json output = %q, want timeseries payload", output)
 	}
 }

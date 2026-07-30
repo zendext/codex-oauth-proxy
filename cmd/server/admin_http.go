@@ -14,9 +14,11 @@ import (
 
 const defaultAdminBaseURL = "http://127.0.0.1:8317"
 
-type adminOptions struct {
-	baseURL string
-	json    bool
+type adminCommand struct {
+	URL   string            `name:"url" default:"${default_admin_url}" help:"Base URL of the running proxy server."`
+	JSON  bool              `name:"json" help:"Write machine-readable JSON output."`
+	Users adminUsersCommand `cmd:"" help:"Manage users and API keys."`
+	Usage adminUsageCommand `cmd:"" help:"Inspect usage data."`
 }
 
 type adminClient struct {
@@ -24,27 +26,8 @@ type adminClient struct {
 	httpClient *http.Client
 }
 
-func splitAdminFlags(args []string) (adminOptions, []string, error) {
-	opts := adminOptions{baseURL: defaultAdminBaseURL}
-	rest := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "--json":
-			opts.json = true
-		case arg == "--url":
-			if i+1 >= len(args) {
-				return adminOptions{}, nil, fmt.Errorf("--url requires a value")
-			}
-			i++
-			opts.baseURL = args[i]
-		case strings.HasPrefix(arg, "--url="):
-			opts.baseURL = strings.TrimPrefix(arg, "--url=")
-		default:
-			rest = append(rest, arg)
-		}
-	}
-	return opts, rest, nil
+func (c *adminCommand) ProvideAdminClient() (*adminClient, error) {
+	return newAdminClient(c.URL)
 }
 
 func newAdminClient(rawURL string) (*adminClient, error) {

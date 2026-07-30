@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,72 +12,81 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/zendext/codex-oauth-proxy/internal/codexonly"
 )
 
-type commandKind string
-
-const (
-	commandServe commandKind = "serve"
-	commandAdmin commandKind = "admin"
-)
-
-type cliOptions struct {
-	command    commandKind
-	configPath string
-	localModel bool
-	adminArgs  []string
+type cli struct {
+	Serve serveCommand `cmd:"" default:"withargs" help:"Run the proxy server."`
+	Admin adminCommand `cmd:"" help:"Manage users and usage on a running proxy server."`
 }
 
-func parseCLI(args []string) (cliOptions, error) {
-	if len(args) > 0 && args[0] == "admin" {
-		return cliOptions{command: commandAdmin, adminArgs: append([]string(nil), args[1:]...)}, nil
-	}
-	if len(args) > 0 && args[0] == "serve" {
-		return parseServeFlags(args[1:])
-	}
-	return parseServeFlags(args)
+type serveCommand struct {
+	ConfigPath string `name:"config" default:"${default_config}" help:"Configuration file path."`
+	LocalModel bool   `name:"local-model" help:"Accepted for compatibility; codex-oauth-proxy uses embedded models."`
 }
 
-func parseServeFlags(args []string) (cliOptions, error) {
-	fs := flag.NewFlagSet("codex-oauth-proxy serve", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	opts := cliOptions{command: commandServe}
-	fs.StringVar(&opts.configPath, "config", DefaultConfigPath, "Configuration file path")
-	fs.BoolVar(&opts.localModel, "local-model", false, "Accepted for compatibility; codex-oauth-proxy uses embedded models")
-	if err := fs.Parse(args); err != nil {
-		return cliOptions{}, err
+type commandRuntime struct {
+	ctx    context.Context
+	stdout io.Writer
+}
+
+type parsedCLI struct {
+	app           cli
+	context       *kong.Context
+	helpRequested bool
+}
+
+func parseCLI(args []string, stdout io.Writer, stderr io.Writer) (*parsedCLI, error) {
+	parsed := &parsedCLI{}
+	exitCode := -1
+	parser, err := kong.New(
+		&parsed.app,
+		kong.Name("codex-oauth-proxy"),
+		kong.Description("Proxy Codex CLI traffic using Codex OAuth credentials. Omit a command to run the proxy server."),
+		kong.Vars{
+			"default_admin_url": defaultAdminBaseURL,
+			"default_config":    DefaultConfigPath,
+		},
+		kong.Writers(stdout, stderr),
+		kong.Exit(func(code int) {
+			exitCode = code
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build CLI parser: %w", err)
 	}
-	return opts, nil
+	parsed.context, err = parser.Parse(args)
+	if exitCode == 0 {
+		parsed.helpRequested = true
+		return parsed, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return parsed, nil
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
-	opts, err := parseCLI(args)
+	parsed, err := parseCLI(args, stdout, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
-	switch opts.command {
-	case commandAdmin:
-		if err = runAdmin(ctx, opts.adminArgs, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "%v\n", err)
-			return 1
-		}
-		return 0
-	default:
-		fmt.Fprintf(stdout, "codex-oauth-proxy Version: %s, Commit: %s, BuiltAt: %s\n", Version, Commit, BuildDate)
-		if err = runServe(ctx, opts, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "%v\n", err)
-			return 1
-		}
+	if parsed.helpRequested {
 		return 0
 	}
+	if err = parsed.context.Run(&commandRuntime{ctx: ctx, stdout: stdout}); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+	return 0
 }
 
-func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.Writer) error {
-	_ = opts.localModel
-	_ = stderr
-	configPath := opts.configPath
+func (c *serveCommand) Run(runtime *commandRuntime) error {
+	_ = c.LocalModel
+	fmt.Fprintf(runtime.stdout, "codex-oauth-proxy Version: %s, Commit: %s, BuiltAt: %s\n", Version, Commit, BuildDate)
+	configPath := c.ConfigPath
 	if configPath == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -91,7 +99,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 	if err != nil {
 		return err
 	}
-	handler, err := codexonly.NewHandler(ctx, cfg)
+	handler, err := codexonly.NewHandler(runtime.ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -104,7 +112,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(stdout, "codex-oauth-proxy listening on %s\n", server.Addr)
+		fmt.Fprintf(runtime.stdout, "codex-oauth-proxy listening on %s\n", server.Addr)
 		errCh <- server.ListenAndServe()
 	}()
 
@@ -114,7 +122,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 
 	select {
 	case sig := <-sigCh:
-		fmt.Fprintf(stdout, "received %s, shutting down\n", sig)
+		fmt.Fprintf(runtime.stdout, "received %s, shutting down\n", sig)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err = server.Shutdown(shutdownCtx); err != nil {
@@ -124,7 +132,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("server failed: %w", err)
 		}
-	case <-ctx.Done():
+	case <-runtime.ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err = server.Shutdown(shutdownCtx); err != nil {
@@ -132,27 +140,4 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 		}
 	}
 	return nil
-}
-
-func runAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
-	_ = stderr
-	opts, rest, err := splitAdminFlags(args)
-	if err != nil {
-		return err
-	}
-	if len(rest) == 0 {
-		return fmt.Errorf("admin requires a resource: users or usage")
-	}
-	client, err := newAdminClient(opts.baseURL)
-	if err != nil {
-		return err
-	}
-	switch rest[0] {
-	case "users":
-		return runAdminUsers(ctx, client, opts, rest[1:], stdout)
-	case "usage":
-		return runAdminUsage(ctx, client, opts, rest[1:], stdout)
-	default:
-		return fmt.Errorf("unknown admin resource %q", rest[0])
-	}
 }

@@ -81,6 +81,9 @@ The explicit `serve` form is equivalent:
 codex-oauth-proxy serve --config config.yaml
 ```
 
+Run `codex-oauth-proxy --help` for the generated command tree, or append
+`--help` to a command for its arguments and flags.
+
 Confirm that the process is reachable:
 
 ```bash

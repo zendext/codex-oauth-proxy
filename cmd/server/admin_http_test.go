@@ -1,24 +1,35 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-func TestSplitAdminFlagsAllowsURLAfterLeafCommand(t *testing.T) {
-	opts, rest, err := splitAdminFlags([]string{"users", "list", "--url", "http://127.0.0.1:8318", "--json"})
+func runAdminTestCommand(t *testing.T, baseURL string, args ...string) string {
+	t.Helper()
+	commandArgs := append([]string{"admin"}, args...)
+	commandArgs = append(commandArgs, "--url", baseURL)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := run(context.Background(), commandArgs, &stdout, &stderr); code != 0 {
+		t.Fatalf("run exit = %d, want 0, stderr: %s", code, stderr.String())
+	}
+	return stdout.String()
+}
+
+func TestParseCLIAdminUsesDefaultURL(t *testing.T) {
+	parsed, err := parseCLI([]string{"admin", "users", "list"}, io.Discard, io.Discard)
 	if err != nil {
-		t.Fatalf("splitAdminFlags returned error: %v", err)
+		t.Fatalf("parseCLI returned error: %v", err)
 	}
-	if opts.baseURL != "http://127.0.0.1:8318" || !opts.json {
-		t.Fatalf("opts = %#v, want custom URL and json", opts)
-	}
-	if strings.Join(rest, " ") != "users list" {
-		t.Fatalf("rest = %q, want users list", strings.Join(rest, " "))
+	if parsed.app.Admin.URL != defaultAdminBaseURL {
+		t.Fatalf("url = %q, want %q", parsed.app.Admin.URL, defaultAdminBaseURL)
 	}
 }
 

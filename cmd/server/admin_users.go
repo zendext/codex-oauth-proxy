@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +10,45 @@ import (
 
 	"github.com/zendext/codex-oauth-proxy/internal/codexonly"
 )
+
+type adminUsersCommand struct {
+	List     adminUsersListCommand     `cmd:"" help:"List users."`
+	Create   adminUsersCreateCommand   `cmd:"" help:"Create a user and API key."`
+	Get      adminUsersGetCommand      `cmd:"" help:"Get a user."`
+	Update   adminUsersUpdateCommand   `cmd:"" help:"Rename a user."`
+	Enable   adminUsersEnableCommand   `cmd:"" help:"Enable a user."`
+	Disable  adminUsersDisableCommand  `cmd:"" help:"Disable a user."`
+	ResetKey adminUsersResetKeyCommand `cmd:"" name:"reset-key" help:"Replace a user's API key."`
+}
+
+type adminUsersListCommand struct {
+	Enabled string `help:"Filter by enabled state."`
+}
+
+type adminUsersCreateCommand struct {
+	Name string `arg:"" name:"name" help:"User name."`
+}
+
+type adminUsersGetCommand struct {
+	UserID string `arg:"" name:"user_id" help:"User ID."`
+}
+
+type adminUsersUpdateCommand struct {
+	UserID string `arg:"" name:"user_id" help:"User ID."`
+	Name   string `help:"New user name."`
+}
+
+type adminUsersEnableCommand struct {
+	UserID string `arg:"" name:"user_id" help:"User ID."`
+}
+
+type adminUsersDisableCommand struct {
+	UserID string `arg:"" name:"user_id" help:"User ID."`
+}
+
+type adminUsersResetKeyCommand struct {
+	UserID string `arg:"" name:"user_id" help:"User ID."`
+}
 
 type usersListResponse struct {
 	Users []codexonly.UserWithAPIKey `json:"users"`
@@ -26,132 +63,101 @@ type userUpdateRequest struct {
 	Enabled *bool   `json:"enabled,omitempty"`
 }
 
-func runAdminUsers(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("admin users requires a command")
-	}
-	switch args[0] {
-	case "list":
-		return runAdminUsersList(ctx, client, opts, args[1:], stdout)
-	case "create":
-		return runAdminUsersCreate(ctx, client, opts, args[1:], stdout)
-	case "get":
-		return runAdminUsersGet(ctx, client, opts, args[1:], stdout)
-	case "update":
-		return runAdminUsersUpdate(ctx, client, opts, args[1:], stdout)
-	case "enable":
-		return runAdminUsersSetEnabled(ctx, client, opts, args[1:], stdout, true)
-	case "disable":
-		return runAdminUsersSetEnabled(ctx, client, opts, args[1:], stdout, false)
-	case "reset-key":
-		return runAdminUsersResetKey(ctx, client, opts, args[1:], stdout)
-	default:
-		return fmt.Errorf("unknown admin users command %q", args[0])
-	}
-}
-
-func runAdminUsersList(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("admin users list", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	enabled := fs.String("enabled", "", "Filter by enabled state")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
+func (c *adminUsersListCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
 	query := url.Values{}
-	if strings.TrimSpace(*enabled) != "" {
-		query.Set("enabled", strings.TrimSpace(*enabled))
+	if strings.TrimSpace(c.Enabled) != "" {
+		query.Set("enabled", strings.TrimSpace(c.Enabled))
 	}
 	var payload usersListResponse
-	if err := client.doJSON(ctx, http.MethodGet, "/users", query, nil, &payload); err != nil {
+	if err := client.doJSON(runtime.ctx, http.MethodGet, "/users", query, nil, &payload); err != nil {
 		return err
 	}
-	if opts.json {
-		return writeJSONOutput(stdout, payload)
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, payload)
 	}
-	return writeUsersTable(stdout, payload.Users)
+	return writeUsersTable(runtime.stdout, payload.Users)
 }
 
-func runAdminUsersCreate(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: admin users create <name>")
-	}
+func (c *adminUsersCreateCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
 	var created codexonly.CreatedUserAPIKey
-	if err := client.doJSON(ctx, http.MethodPost, "/users", nil, userCreateRequest{Name: args[0]}, &created); err != nil {
+	if err := client.doJSON(runtime.ctx, http.MethodPost, "/users", nil, userCreateRequest{Name: c.Name}, &created); err != nil {
 		return err
 	}
-	if opts.json {
-		return writeJSONOutput(stdout, created)
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, created)
 	}
-	fmt.Fprintf(stdout, "USER_ID\tNAME\tENABLED\tAPI_KEY_ID\tMASKED_KEY\tAPI_KEY_VALUE\n")
-	fmt.Fprintf(stdout, "%s\t%s\t%t\t%s\t%s\t%s\n", created.User.ID, created.User.Name, created.User.Enabled, created.APIKey.ID, created.APIKey.MaskedKey, created.PlaintextAPIKey)
-	return nil
+	return writeCreatedUserTable(runtime.stdout, created)
 }
 
-func runAdminUsersGet(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: admin users get <user_id>")
-	}
+func (c *adminUsersGetCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
 	var user codexonly.UserWithAPIKey
-	if err := client.doJSON(ctx, http.MethodGet, "/users/"+url.PathEscape(args[0]), nil, nil, &user); err != nil {
+	if err := client.doJSON(runtime.ctx, http.MethodGet, "/users/"+url.PathEscape(c.UserID), nil, nil, &user); err != nil {
 		return err
 	}
-	if opts.json {
-		return writeJSONOutput(stdout, user)
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, user)
 	}
-	return writeUsersTable(stdout, []codexonly.UserWithAPIKey{user})
+	return writeUsersTable(runtime.stdout, []codexonly.UserWithAPIKey{user})
 }
 
-func runAdminUsersUpdate(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	name, rest, err := extractStringFlag(args, "--name")
-	if err != nil {
-		return err
-	}
-	if len(rest) != 1 {
-		return fmt.Errorf("usage: admin users update <user_id> --name <name>")
-	}
-	if strings.TrimSpace(name) == "" {
+func (c *adminUsersUpdateCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
+	if strings.TrimSpace(c.Name) == "" {
 		return fmt.Errorf("--name is required")
 	}
-	req := userUpdateRequest{Name: &name}
+	req := userUpdateRequest{Name: &c.Name}
 	var user codexonly.UserWithAPIKey
-	if err := client.doJSON(ctx, http.MethodPatch, "/users/"+url.PathEscape(rest[0]), nil, req, &user); err != nil {
+	if err := client.doJSON(runtime.ctx, http.MethodPatch, "/users/"+url.PathEscape(c.UserID), nil, req, &user); err != nil {
 		return err
 	}
-	if opts.json {
-		return writeJSONOutput(stdout, user)
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, user)
 	}
-	return writeUsersTable(stdout, []codexonly.UserWithAPIKey{user})
+	return writeUsersTable(runtime.stdout, []codexonly.UserWithAPIKey{user})
 }
 
-func runAdminUsersSetEnabled(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer, enabled bool) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: admin users enable|disable <user_id>")
-	}
+func (c *adminUsersEnableCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
+	enabled := true
 	req := userUpdateRequest{Enabled: &enabled}
 	var user codexonly.UserWithAPIKey
-	if err := client.doJSON(ctx, http.MethodPatch, "/users/"+url.PathEscape(args[0]), nil, req, &user); err != nil {
+	if err := client.doJSON(runtime.ctx, http.MethodPatch, "/users/"+url.PathEscape(c.UserID), nil, req, &user); err != nil {
 		return err
 	}
-	if opts.json {
-		return writeJSONOutput(stdout, user)
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, user)
 	}
-	return writeUsersTable(stdout, []codexonly.UserWithAPIKey{user})
+	return writeUsersTable(runtime.stdout, []codexonly.UserWithAPIKey{user})
 }
 
-func runAdminUsersResetKey(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: admin users reset-key <user_id>")
-	}
-	var created codexonly.CreatedUserAPIKey
-	if err := client.doJSON(ctx, http.MethodPost, "/users/"+url.PathEscape(args[0])+"/api-key/reset", nil, nil, &created); err != nil {
+func (c *adminUsersDisableCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
+	enabled := false
+	req := userUpdateRequest{Enabled: &enabled}
+	var user codexonly.UserWithAPIKey
+	if err := client.doJSON(runtime.ctx, http.MethodPatch, "/users/"+url.PathEscape(c.UserID), nil, req, &user); err != nil {
 		return err
 	}
-	if opts.json {
-		return writeJSONOutput(stdout, created)
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, user)
 	}
-	fmt.Fprintf(stdout, "USER_ID\tNAME\tENABLED\tAPI_KEY_ID\tMASKED_KEY\tAPI_KEY_VALUE\n")
-	fmt.Fprintf(stdout, "%s\t%s\t%t\t%s\t%s\t%s\n", created.User.ID, created.User.Name, created.User.Enabled, created.APIKey.ID, created.APIKey.MaskedKey, created.PlaintextAPIKey)
-	return nil
+	return writeUsersTable(runtime.stdout, []codexonly.UserWithAPIKey{user})
+}
+
+func (c *adminUsersResetKeyCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
+	var created codexonly.CreatedUserAPIKey
+	if err := client.doJSON(runtime.ctx, http.MethodPost, "/users/"+url.PathEscape(c.UserID)+"/api-key/reset", nil, nil, &created); err != nil {
+		return err
+	}
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, created)
+	}
+	return writeCreatedUserTable(runtime.stdout, created)
+}
+
+func writeCreatedUserTable(stdout io.Writer, created codexonly.CreatedUserAPIKey) error {
+	if _, err := fmt.Fprintln(stdout, "USER_ID\tNAME\tENABLED\tAPI_KEY_ID\tMASKED_KEY\tAPI_KEY_VALUE"); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "%s\t%s\t%t\t%s\t%s\t%s\n", created.User.ID, created.User.Name, created.User.Enabled, created.APIKey.ID, created.APIKey.MaskedKey, created.PlaintextAPIKey)
+	return err
 }
 
 func writeUsersTable(stdout io.Writer, users []codexonly.UserWithAPIKey) error {
@@ -169,24 +175,4 @@ func writeUsersTable(stdout io.Writer, users []codexonly.UserWithAPIKey) error {
 		fmt.Fprintf(tw, "%s\t%s\t%t\t%s\t%s\t%s\n", item.User.Name, item.User.ID, item.User.Enabled, keyID, masked, keyEnabled)
 	}
 	return tw.Flush()
-}
-
-func extractStringFlag(args []string, name string) (string, []string, error) {
-	rest := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == name:
-			if i+1 >= len(args) {
-				return "", nil, fmt.Errorf("%s requires a value", name)
-			}
-			i++
-			return args[i], append(rest, args[i+1:]...), nil
-		case strings.HasPrefix(arg, name+"="):
-			return strings.TrimPrefix(arg, name+"="), append(rest, args[i+1:]...), nil
-		default:
-			rest = append(rest, arg)
-		}
-	}
-	return "", rest, nil
 }
