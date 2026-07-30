@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,38 +13,55 @@ import (
 	"github.com/zendext/codex-oauth-proxy/internal/codexonly"
 )
 
+type adminUsageCommand struct {
+	Snapshot   adminUsageSnapshotCommand   `cmd:"" help:"Show rolling usage totals."`
+	Timeseries adminUsageTimeseriesCommand `cmd:"" help:"Show bucketed usage data."`
+}
+
+type adminUsageSnapshotCommand struct {
+	UserID   string `name:"user-id" help:"Filter by user ID."`
+	APIKeyID string `name:"api-key-id" help:"Filter by API key ID."`
+}
+
+type adminUsageTimeseriesCommand struct {
+	Window   string `help:"Usage window."`
+	Step     string `help:"Aggregation step."`
+	GroupBy  string `name:"group-by" help:"Comma-separated dimensions."`
+	Fill     string `help:"Fill mode."`
+	UserID   string `name:"user-id" help:"Filter by user ID."`
+	APIKeyID string `name:"api-key-id" help:"Filter by API key ID."`
+}
+
 type usageSnapshotResponse struct {
 	Usage []codexonly.ManagementUsageEntry `json:"usage"`
 }
 
-func runAdminUsage(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("admin usage requires a command")
-	}
-	switch args[0] {
-	case "snapshot":
-		return runAdminUsageSnapshot(ctx, client, opts, args[1:], stdout)
-	case "timeseries":
-		return runAdminUsageTimeseries(ctx, client, opts, args[1:], stdout)
-	default:
-		return fmt.Errorf("unknown admin usage command %q", args[0])
-	}
+func (c *adminUsageSnapshotCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
+	return runAdminUsageSnapshot(runtime.ctx, client, admin.options(), c.UserID, c.APIKeyID, runtime.stdout)
 }
 
-func runAdminUsageSnapshot(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("admin usage snapshot", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	userID := fs.String("user-id", "", "Filter by user ID")
-	apiKeyID := fs.String("api-key-id", "", "Filter by API key ID")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
+func (c *adminUsageTimeseriesCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
+	return runAdminUsageTimeseries(
+		runtime.ctx,
+		client,
+		admin.options(),
+		c.Window,
+		c.Step,
+		c.GroupBy,
+		c.Fill,
+		c.UserID,
+		c.APIKeyID,
+		runtime.stdout,
+	)
+}
+
+func runAdminUsageSnapshot(ctx context.Context, client *adminClient, opts adminOptions, userID string, apiKeyID string, stdout io.Writer) error {
 	query := url.Values{}
-	if strings.TrimSpace(*userID) != "" {
-		query.Set("user_id", strings.TrimSpace(*userID))
+	if strings.TrimSpace(userID) != "" {
+		query.Set("user_id", strings.TrimSpace(userID))
 	}
-	if strings.TrimSpace(*apiKeyID) != "" {
-		query.Set("api_key_id", strings.TrimSpace(*apiKeyID))
+	if strings.TrimSpace(apiKeyID) != "" {
+		query.Set("api_key_id", strings.TrimSpace(apiKeyID))
 	}
 	var payload usageSnapshotResponse
 	if err := client.doJSON(ctx, http.MethodGet, "/usage", query, nil, &payload); err != nil {
@@ -57,25 +73,25 @@ func runAdminUsageSnapshot(ctx context.Context, client *adminClient, opts adminO
 	return writeUsageSnapshotTable(stdout, payload.Usage)
 }
 
-func runAdminUsageTimeseries(ctx context.Context, client *adminClient, opts adminOptions, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("admin usage timeseries", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	window := fs.String("window", "", "Usage window")
-	step := fs.String("step", "", "Aggregation step")
-	groupBy := fs.String("group-by", "", "Comma-separated dimensions")
-	fill := fs.String("fill", "", "Fill mode")
-	userID := fs.String("user-id", "", "Filter by user ID")
-	apiKeyID := fs.String("api-key-id", "", "Filter by API key ID")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
+func runAdminUsageTimeseries(
+	ctx context.Context,
+	client *adminClient,
+	opts adminOptions,
+	window string,
+	step string,
+	groupBy string,
+	fill string,
+	userID string,
+	apiKeyID string,
+	stdout io.Writer,
+) error {
 	query := url.Values{}
-	addQueryValue(query, "window", *window)
-	addQueryValue(query, "step", *step)
-	addQueryValue(query, "fill", *fill)
-	addQueryValue(query, "user_id", *userID)
-	addQueryValue(query, "api_key_id", *apiKeyID)
-	for _, group := range strings.Split(*groupBy, ",") {
+	addQueryValue(query, "window", window)
+	addQueryValue(query, "step", step)
+	addQueryValue(query, "fill", fill)
+	addQueryValue(query, "user_id", userID)
+	addQueryValue(query, "api_key_id", apiKeyID)
+	for _, group := range strings.Split(groupBy, ",") {
 		group = strings.TrimSpace(group)
 		if group != "" {
 			query.Add("group_by", group)

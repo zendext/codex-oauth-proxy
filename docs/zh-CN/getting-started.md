@@ -76,6 +76,9 @@ codex-oauth-proxy --config config.yaml
 codex-oauth-proxy serve --config config.yaml
 ```
 
+运行 `codex-oauth-proxy --help` 可查看生成的命令树，也可以在具体命令后追加
+`--help` 查看该命令的参数和 Flag。
+
 确认进程可以访问：
 
 ```bash

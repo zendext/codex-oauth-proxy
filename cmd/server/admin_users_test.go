@@ -38,8 +38,8 @@ func TestAdminUsersCreatePrintsPlaintextKey(t *testing.T) {
 		t.Fatalf("newAdminClient returned error: %v", err)
 	}
 	var out bytes.Buffer
-	if err = runAdminUsers(context.Background(), client, adminOptions{}, []string{"create", "Alice"}, &out); err != nil {
-		t.Fatalf("runAdminUsers returned error: %v", err)
+	if err = runAdminUsersCreate(context.Background(), client, adminOptions{}, "Alice", &out); err != nil {
+		t.Fatalf("runAdminUsersCreate returned error: %v", err)
 	}
 	if !strings.Contains(out.String(), "cop_plain") {
 		t.Fatalf("output = %q, want plaintext key", out.String())
@@ -61,8 +61,8 @@ func TestAdminUsersListJSON(t *testing.T) {
 		t.Fatalf("newAdminClient returned error: %v", err)
 	}
 	var out bytes.Buffer
-	if err = runAdminUsers(context.Background(), client, adminOptions{json: true}, []string{"list"}, &out); err != nil {
-		t.Fatalf("runAdminUsers returned error: %v", err)
+	if err = runAdminUsersList(context.Background(), client, adminOptions{json: true}, "", &out); err != nil {
+		t.Fatalf("runAdminUsersList returned error: %v", err)
 	}
 	if !strings.Contains(out.String(), `"users"`) || !strings.Contains(out.String(), `"Alice"`) {
 		t.Fatalf("json output = %q, want users payload", out.String())
@@ -91,8 +91,8 @@ func TestAdminUsersDisableSendsPatch(t *testing.T) {
 		t.Fatalf("newAdminClient returned error: %v", err)
 	}
 	var out bytes.Buffer
-	if err = runAdminUsers(context.Background(), client, adminOptions{}, []string{"disable", "usr_1"}, &out); err != nil {
-		t.Fatalf("runAdminUsers returned error: %v", err)
+	if err = runAdminUsersSetEnabled(context.Background(), client, adminOptions{}, "usr_1", &out, false); err != nil {
+		t.Fatalf("runAdminUsersSetEnabled returned error: %v", err)
 	}
 	if !strings.Contains(out.String(), "false") {
 		t.Fatalf("output = %q, want disabled state", out.String())

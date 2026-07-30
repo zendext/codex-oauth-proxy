@@ -27,8 +27,8 @@ func TestAdminUsageSnapshotTable(t *testing.T) {
 		t.Fatalf("newAdminClient returned error: %v", err)
 	}
 	var out bytes.Buffer
-	if err = runAdminUsage(context.Background(), client, adminOptions{}, []string{"snapshot", "--user-id", "usr_1"}, &out); err != nil {
-		t.Fatalf("runAdminUsage returned error: %v", err)
+	if err = runAdminUsageSnapshot(context.Background(), client, adminOptions{}, "usr_1", "", &out); err != nil {
+		t.Fatalf("runAdminUsageSnapshot returned error: %v", err)
 	}
 	if !strings.Contains(out.String(), "TOKENS_5H") || !strings.Contains(out.String(), "50") {
 		t.Fatalf("output = %q, want snapshot table", out.String())
@@ -57,8 +57,19 @@ func TestAdminUsageTimeseriesQueryAndJSON(t *testing.T) {
 		t.Fatalf("newAdminClient returned error: %v", err)
 	}
 	var out bytes.Buffer
-	if err = runAdminUsage(context.Background(), client, adminOptions{json: true}, []string{"timeseries", "--window", "7d", "--step", "1h", "--group-by", "user,model", "--fill", "zero"}, &out); err != nil {
-		t.Fatalf("runAdminUsage returned error: %v", err)
+	if err = runAdminUsageTimeseries(
+		context.Background(),
+		client,
+		adminOptions{json: true},
+		"7d",
+		"1h",
+		"user,model",
+		"zero",
+		"",
+		"",
+		&out,
+	); err != nil {
+		t.Fatalf("runAdminUsageTimeseries returned error: %v", err)
 	}
 	if !strings.Contains(out.String(), `"series"`) || !strings.Contains(out.String(), `"gpt-5.3-codex"`) {
 		t.Fatalf("json output = %q, want timeseries payload", out.String())
