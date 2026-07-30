@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,6 +10,18 @@ import (
 	"strings"
 	"testing"
 )
+
+func runAdminTestCommand(t *testing.T, baseURL string, args ...string) string {
+	t.Helper()
+	commandArgs := append([]string{"admin"}, args...)
+	commandArgs = append(commandArgs, "--url", baseURL)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := run(context.Background(), commandArgs, &stdout, &stderr); code != 0 {
+		t.Fatalf("run exit = %d, want 0, stderr: %s", code, stderr.String())
+	}
+	return stdout.String()
+}
 
 func TestParseCLIAdminUsesDefaultURL(t *testing.T) {
 	parsed, err := parseCLI([]string{"admin", "users", "list"}, io.Discard, io.Discard)

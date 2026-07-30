@@ -247,6 +247,10 @@ func TestRunHelpPrintsUsage(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Usage: codex-oauth-proxy") {
 		t.Fatalf("stdout = %q, want generated usage", stdout.String())
 	}
+	normalized := strings.Join(strings.Fields(stdout.String()), " ")
+	if !strings.Contains(normalized, "Omit a command to run the proxy server.") {
+		t.Fatalf("stdout = %q, want default command explanation", stdout.String())
+	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}

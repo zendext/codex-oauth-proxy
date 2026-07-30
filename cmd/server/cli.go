@@ -16,11 +16,6 @@ import (
 	"github.com/zendext/codex-oauth-proxy/internal/codexonly"
 )
 
-type cliOptions struct {
-	configPath string
-	localModel bool
-}
-
 type cli struct {
 	Serve serveCommand `cmd:"" default:"withargs" help:"Run the proxy server."`
 	Admin adminCommand `cmd:"" help:"Manage users and usage on a running proxy server."`
@@ -34,7 +29,6 @@ type serveCommand struct {
 type commandRuntime struct {
 	ctx    context.Context
 	stdout io.Writer
-	stderr io.Writer
 }
 
 type parsedCLI struct {
@@ -49,8 +43,11 @@ func parseCLI(args []string, stdout io.Writer, stderr io.Writer) (*parsedCLI, er
 	parser, err := kong.New(
 		&parsed.app,
 		kong.Name("codex-oauth-proxy"),
-		kong.Description("Proxy Codex CLI traffic using Codex OAuth credentials."),
-		kong.Vars{"default_config": DefaultConfigPath},
+		kong.Description("Proxy Codex CLI traffic using Codex OAuth credentials. Omit a command to run the proxy server."),
+		kong.Vars{
+			"default_admin_url": defaultAdminBaseURL,
+			"default_config":    DefaultConfigPath,
+		},
 		kong.Writers(stdout, stderr),
 		kong.Exit(func(code int) {
 			exitCode = code
@@ -79,7 +76,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	if parsed.helpRequested {
 		return 0
 	}
-	if err = parsed.context.Run(&commandRuntime{ctx: ctx, stdout: stdout, stderr: stderr}); err != nil {
+	if err = parsed.context.Run(&commandRuntime{ctx: ctx, stdout: stdout}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
@@ -87,17 +84,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 }
 
 func (c *serveCommand) Run(runtime *commandRuntime) error {
+	_ = c.LocalModel
 	fmt.Fprintf(runtime.stdout, "codex-oauth-proxy Version: %s, Commit: %s, BuiltAt: %s\n", Version, Commit, BuildDate)
-	return runServe(runtime.ctx, cliOptions{
-		configPath: c.ConfigPath,
-		localModel: c.LocalModel,
-	}, runtime.stdout, runtime.stderr)
-}
-
-func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.Writer) error {
-	_ = opts.localModel
-	_ = stderr
-	configPath := opts.configPath
+	configPath := c.ConfigPath
 	if configPath == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -110,7 +99,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 	if err != nil {
 		return err
 	}
-	handler, err := codexonly.NewHandler(ctx, cfg)
+	handler, err := codexonly.NewHandler(runtime.ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -123,7 +112,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(stdout, "codex-oauth-proxy listening on %s\n", server.Addr)
+		fmt.Fprintf(runtime.stdout, "codex-oauth-proxy listening on %s\n", server.Addr)
 		errCh <- server.ListenAndServe()
 	}()
 
@@ -133,7 +122,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 
 	select {
 	case sig := <-sigCh:
-		fmt.Fprintf(stdout, "received %s, shutting down\n", sig)
+		fmt.Fprintf(runtime.stdout, "received %s, shutting down\n", sig)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err = server.Shutdown(shutdownCtx); err != nil {
@@ -143,7 +132,7 @@ func runServe(ctx context.Context, opts cliOptions, stdout io.Writer, stderr io.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("server failed: %w", err)
 		}
-	case <-ctx.Done():
+	case <-runtime.ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err = server.Shutdown(shutdownCtx); err != nil {

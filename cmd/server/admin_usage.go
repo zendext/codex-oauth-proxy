@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,74 +36,40 @@ type usageSnapshotResponse struct {
 }
 
 func (c *adminUsageSnapshotCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
-	return runAdminUsageSnapshot(runtime.ctx, client, admin.options(), c.UserID, c.APIKeyID, runtime.stdout)
+	query := url.Values{}
+	addQueryValue(query, "user_id", c.UserID)
+	addQueryValue(query, "api_key_id", c.APIKeyID)
+	var payload usageSnapshotResponse
+	if err := client.doJSON(runtime.ctx, http.MethodGet, "/usage", query, nil, &payload); err != nil {
+		return err
+	}
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, payload)
+	}
+	return writeUsageSnapshotTable(runtime.stdout, payload.Usage)
 }
 
 func (c *adminUsageTimeseriesCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
-	return runAdminUsageTimeseries(
-		runtime.ctx,
-		client,
-		admin.options(),
-		c.Window,
-		c.Step,
-		c.GroupBy,
-		c.Fill,
-		c.UserID,
-		c.APIKeyID,
-		runtime.stdout,
-	)
-}
-
-func runAdminUsageSnapshot(ctx context.Context, client *adminClient, opts adminOptions, userID string, apiKeyID string, stdout io.Writer) error {
 	query := url.Values{}
-	if strings.TrimSpace(userID) != "" {
-		query.Set("user_id", strings.TrimSpace(userID))
-	}
-	if strings.TrimSpace(apiKeyID) != "" {
-		query.Set("api_key_id", strings.TrimSpace(apiKeyID))
-	}
-	var payload usageSnapshotResponse
-	if err := client.doJSON(ctx, http.MethodGet, "/usage", query, nil, &payload); err != nil {
-		return err
-	}
-	if opts.json {
-		return writeJSONOutput(stdout, payload)
-	}
-	return writeUsageSnapshotTable(stdout, payload.Usage)
-}
-
-func runAdminUsageTimeseries(
-	ctx context.Context,
-	client *adminClient,
-	opts adminOptions,
-	window string,
-	step string,
-	groupBy string,
-	fill string,
-	userID string,
-	apiKeyID string,
-	stdout io.Writer,
-) error {
-	query := url.Values{}
-	addQueryValue(query, "window", window)
-	addQueryValue(query, "step", step)
-	addQueryValue(query, "fill", fill)
-	addQueryValue(query, "user_id", userID)
-	addQueryValue(query, "api_key_id", apiKeyID)
-	for _, group := range strings.Split(groupBy, ",") {
+	addQueryValue(query, "window", c.Window)
+	addQueryValue(query, "step", c.Step)
+	addQueryValue(query, "fill", c.Fill)
+	addQueryValue(query, "user_id", c.UserID)
+	addQueryValue(query, "api_key_id", c.APIKeyID)
+	for _, group := range strings.Split(c.GroupBy, ",") {
 		group = strings.TrimSpace(group)
 		if group != "" {
 			query.Add("group_by", group)
 		}
 	}
 	var payload codexonly.UsageTimeseries
-	if err := client.doJSON(ctx, http.MethodGet, "/usage/timeseries", query, nil, &payload); err != nil {
+	if err := client.doJSON(runtime.ctx, http.MethodGet, "/usage/timeseries", query, nil, &payload); err != nil {
 		return err
 	}
-	if opts.json {
-		return writeJSONOutput(stdout, payload)
+	if admin.JSON {
+		return writeJSONOutput(runtime.stdout, payload)
 	}
-	return writeUsageTimeseriesTable(stdout, payload.Series)
+	return writeUsageTimeseriesTable(runtime.stdout, payload.Series)
 }
 
 func addQueryValue(query url.Values, key string, value string) {

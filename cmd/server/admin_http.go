@@ -14,12 +14,8 @@ import (
 
 const defaultAdminBaseURL = "http://127.0.0.1:8317"
 
-type adminOptions struct {
-	json bool
-}
-
 type adminCommand struct {
-	URL   string            `name:"url" default:"http://127.0.0.1:8317" help:"Base URL of the running proxy server."`
+	URL   string            `name:"url" default:"${default_admin_url}" help:"Base URL of the running proxy server."`
 	JSON  bool              `name:"json" help:"Write machine-readable JSON output."`
 	Users adminUsersCommand `cmd:"" help:"Manage users and API keys."`
 	Usage adminUsageCommand `cmd:"" help:"Inspect usage data."`
@@ -32,10 +28,6 @@ type adminClient struct {
 
 func (c *adminCommand) ProvideAdminClient() (*adminClient, error) {
 	return newAdminClient(c.URL)
-}
-
-func (c *adminCommand) options() adminOptions {
-	return adminOptions{json: c.JSON}
 }
 
 func newAdminClient(rawURL string) (*adminClient, error) {
