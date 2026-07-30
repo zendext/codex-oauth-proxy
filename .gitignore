@@ -23,7 +23,6 @@ auths/*
 .codex/*
 .claude/*
 .gemini/*
-.superpowers/
 .serena/*
 .agent/*
 .agents/*

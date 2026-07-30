@@ -1,70 +1,66 @@
 # codex-oauth-proxy
 
-`codex-oauth-proxy` is a Codex OAuth-backed proxy for the Codex CLI and clients
-that can use OpenAI-compatible Responses or Chat Completions wire formats. It
-forwards supported Codex traffic to ChatGPT/Codex backend endpoints using
-existing Codex OAuth credentials stored on disk.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-Codex CLI is the primary target. The proxy also provides API-only managed-user
-endpoints and a small OpenAI-compatible public API surface for custom agents.
+> This project was written by AI. Use it at your own risk.
 
-## Build
+---
+
+`codex-oauth-proxy` is a small self-hosted HTTP proxy that forwards supported
+Codex traffic with OAuth credentials already stored by Codex CLI. It is intended
+for operators who want to expose their own Codex OAuth access through managed
+API keys without distributing the OAuth files themselves.
+
+The proxy is Codex-specific. It supports Codex CLI, a narrow OpenAI-compatible
+API surface for custom agents, local user administration, and per-user usage
+statistics. It is not a general OpenAI gateway or a multi-provider proxy.
+
+## Features
+
+- Loads the official Codex CLI `~/.codex/auth.json` format and flat Codex token
+  JSON files.
+- Selects multiple active OAuth files in round-robin order and refreshes expired
+  access tokens.
+- Proxies whitelisted Responses, realtime, image, search, memory, file, account,
+  and hosted MCP routes used by Codex CLI.
+- Issues managed `cop_...` API keys backed by SQLite.
+- Provides an OpenAI-compatible `/v1/chat/completions` translation layer.
+- Records per-user token usage in 10-minute buckets with 30-day retention.
+- Includes a local admin CLI and an optional Grafana dashboard.
+
+## Requirements
+
+- Go 1.26 or later when building from source.
+- At least one usable Codex OAuth file, normally created by Codex CLI at
+  `~/.codex/auth.json`.
+
+Linux `amd64` release binaries are available from
+[GitHub Releases](https://github.com/zendext/codex-oauth-proxy/releases).
+
+## Quick Start
+
+Build the proxy:
 
 ```bash
 go build -o codex-oauth-proxy ./cmd/server
+cp config.example.yaml config.yaml
+codex-oauth-proxy --config config.yaml
 ```
 
-## Docker
+In another terminal, create a managed user:
 
 ```bash
-docker run --rm -p 8317:8317 \
-  -v "$PWD/config.yaml:/codex-oauth-proxy/config.yaml:ro" \
-  -v "$PWD/auths:/root/.codex" \
-  zendext/codex-oauth-proxy:latest
+codex-oauth-proxy admin users create alice
 ```
 
-```bash
-docker compose up -d
-```
-
-## Configure
-
-Create `config.yaml` from `config.example.yaml`.
-
-| Field | Default | Description |
-| --- | --- | --- |
-| `host` | `127.0.0.1` | Bind host. Use `0.0.0.0` in containers. |
-| `port` | `8317` | Bind port. |
-| `auth-dir` | `~/.codex` | Codex auth directory. Supports official `auth.json` and flat token JSON files. |
-| `debug` | `false` | Enable masked request/proxy debug logs. |
-| `admin-api-key` | empty | Enables `/v0/management` when set. |
-| `database.path` | empty | SQLite path. Empty resolves to `<auth-dir>/codex-oauth-proxy.db`. |
-| `usage.enabled` | `true` | Track per-user token usage for managed API keys. |
-| `usage.debug-openai-response` | `false` | Log safe usage metadata from upstream responses. |
-| `allow-fast-mode` | `false` | Allow Codex Fast mode. When disabled, Fast tier metadata is hidden and `service_tier: "fast"` or `"priority"` requests return `400`. |
-| `proxy-url` | empty | Optional outbound proxy. Use `direct` or `none` to bypass proxy settings. |
-| `request-retry` | `3` | Upstream retry attempts for retry-aware calls. |
-| `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Codex upstream base URL. |
-| `chatgpt-base-url` | `https://chatgpt.com/backend-api` | ChatGPT backend base URL for Codex compatibility calls. |
-| `codex-user-agent` | empty | Optional upstream User-Agent override. |
-| `codex-beta-features` | empty | Optional `x-codex-beta-features` fallback. |
-| `codex-refresh-token-url` | empty | Optional OAuth refresh endpoint override. |
-
-Expired OAuth tokens are refreshed automatically and written back to the same
-auth file.
-
-Configure Codex CLI to use the proxy as a Responses provider. Use
-`supports_websockets = true` for realtime routes and
-`requires_openai_auth = false` so Codex sends the managed user API key from
-`COP_API_KEY` to this proxy. The `chatgpt_base_url` value below is for Codex
-client compatibility only; `/backend-api/*` is not a public API surface.
+The command prints the generated API key once. Configure Codex CLI to use it:
 
 ```toml
 model_provider = "proxy"
 chatgpt_base_url = "http://127.0.0.1:8317/backend-api/"
 
 [model_providers.proxy]
-name = "OpenAI using LLM proxy"
+name = "Codex OAuth Proxy"
 base_url = "http://127.0.0.1:8317/v1"
 env_key = "COP_API_KEY"
 wire_api = "responses"
@@ -72,156 +68,53 @@ supports_websockets = true
 requires_openai_auth = false
 ```
 
-Set `admin-api-key` to enable `/v0/management`. Generated user API keys
-authenticate proxy routes and `/v0/user`; set `COP_API_KEY` when running Codex
-through this proxy.
-
-Usage tracking stores 10-minute UTC buckets for managed user API keys and keeps
-30 days of bucket data. User totals are exposed at `/v0/user/usage/today`;
-5-hour and 7-day management snapshots are exposed at `/v0/management/usage`.
-Model breakdowns include `model`, `reasoning_effort`, and `service_tier`
-(`standard` or `fast`). Dashboard-oriented timeseries are exposed at
-`/v0/management/usage/timeseries`; they read the same 10-minute buckets and can
-aggregate them with `step=10m`, `30m`, `1h`, `6h`, or `1d`.
-
-Set `debug: true` for masked request/proxy logs. Add
-`usage.debug-openai-response: true` for request IDs, model, key metadata, and
-token summaries; secrets and response bodies are not logged.
-
-OpenAI-compatible clients can also point their base URL at
-`http://127.0.0.1:8317/v1` and send `POST /v1/chat/completions` with a managed
-user API key. Chat requests are translated to upstream Responses requests; both
-streaming and non-streaming calls are supported.
-
-## Run
-
 ```bash
-./codex-oauth-proxy --config config.yaml
-./codex-oauth-proxy serve --config config.yaml
+export COP_API_KEY="cop_..."
+codex
 ```
 
-## Admin CLI
+The local admin CLI calls a loopback-only endpoint and does not require
+`admin-api-key`. Set `admin-api-key` only when remote management API or Grafana
+access is needed.
 
-The same binary includes a local admin CLI. It calls the running proxy at
-`http://127.0.0.1:8317` by default through a loopback-only local admin route and
-does not require `--config` or the configured `admin-api-key`.
+## Docker
 
-```bash
-./codex-oauth-proxy admin users list
-./codex-oauth-proxy admin users create alice
-./codex-oauth-proxy admin users reset-key usr_xxx
-./codex-oauth-proxy admin usage snapshot
-./codex-oauth-proxy admin usage timeseries --window 7d --step 1h --group-by user
-```
-
-Use `--url` for a non-default local instance:
+For containers, set `host: "0.0.0.0"` in `config.yaml`, place Codex OAuth JSON
+files under `./auths`, and start the service:
 
 ```bash
-./codex-oauth-proxy admin users list --url http://127.0.0.1:8318
+docker compose up -d
 ```
 
-All admin commands support `--json` for scripting. User creation and key reset
-print the plaintext user API key once.
-
-Public API routes:
-
-- `GET /`
-- `GET /healthz`
-- `POST /v0/management/users`
-- `GET /v0/management/users`
-- `GET /v0/management/users/{user_id}`
-- `PATCH /v0/management/users/{user_id}`
-- `POST /v0/management/users/{user_id}/api-key/reset`
-- `GET /v0/management/usage`
-- `GET /v0/management/usage/timeseries`
-- `GET /v0/user/api-key`
-- `POST /v0/user/api-key/reset`
-- `GET /v0/user/usage/today`
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `GET /v1/responses`
-- `POST /v1/responses/compact`
-- `POST /v1/alpha/search`
-- `POST /v1/images/generations`
-- `POST /v1/images/edits`
-- `POST /v1/memories/trace_summarize`
-- `POST /v1/realtime/calls`
-- `GET /v1/realtime`
-
-Image generation is available through `/v1/responses` by using the upstream
-Responses API `image_generation` tool, normally with `stream: true`. The proxy
-also exposes the narrow image compatibility routes `/v1/images/generations` and
-`/v1/images/edits`. Other raw `/v1/images/*` routes and `/backend-api/*` paths
-are not public API and should not be used by general clients.
-
-Protected proxy routes require a managed user API key:
+Run local administration inside the container:
 
 ```bash
-curl http://localhost:8317/v1/models \
-  -H 'Authorization: Bearer cop_...'
+docker exec codex-oauth-proxy \
+  /codex-oauth-proxy/codex-oauth-proxy admin users create alice
 ```
 
-Create a managed user and one generated API key:
+See [Getting Started](docs/getting-started.md) for native and Docker setup
+details.
 
-```bash
-curl -X POST http://localhost:8317/v0/management/users \
-  -H 'Authorization: Bearer admin-change-me' \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"alice"}'
-```
+## Documentation
 
-The plaintext user API key is returned only by user creation and key reset
-responses. List/detail responses only return key metadata such as `masked_key`.
+- [Getting Started](docs/getting-started.md)
+- [Configuration](docs/configuration.md)
+- [Administration](docs/administration.md)
+- [API Reference](docs/api-reference.md)
+- [Usage and Observability](docs/usage-and-observability.md)
+- [Architecture](docs/architecture.md)
+- [Development](docs/development.md)
 
-## Dashboard
+## Scope
 
-An optional Grafana dashboard bundle is available under `observability/`.
+The proxy forwards only explicitly supported routes. `/v1/*` and project-owned
+`/v0/*` endpoints are the supported integration surface. Selected
+`/backend-api/*` paths exist for Codex CLI compatibility and are not a stable
+public API for third-party clients.
 
-```bash
-export CODEX_OAUTH_PROXY_ADMIN_API_KEY="admin-change-me"
-docker compose -f docker-compose.yml -f observability/docker-compose.dashboard.yml up -d
-```
-
-Open Grafana at `http://localhost:3000`. The dashboard calls
-`/v0/management/usage/timeseries` through the configured admin API key.
-
-If Grafana shows `No data`, make sure `observability/grafana` is readable by the
-Grafana container and recreate the Grafana volume after provisioning changes.
-The proxy usage database is separate from the Grafana volume.
-
-## Verify
-
-```bash
-gofmt -w .
-go test ./...
-go build -o test-output ./cmd/server && rm test-output
-```
-
-## Release
-
-Pushing a version tag that starts with `v` runs
-`.github/workflows/release.yml`.
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-The workflow:
-
-- runs `go test -count=1 ./...`
-- builds `codex-oauth-proxy-linux-amd64`
-- uploads the binary and its SHA-256 file to the GitHub Release
-- builds and pushes a `linux/amd64` Docker image to Docker Hub
-
-Required GitHub repository secrets:
-
-- `DOCKERHUB_USERNAME`
-- `DOCKERHUB_TOKEN`
-
-Docker Hub image tags are published under `zendext/codex-oauth-proxy` with the
-release tag, semver aliases, and `latest`.
+The service listens over HTTP. Binding, TLS termination, and network exposure
+are deployment concerns outside the proxy.
 
 ## License
 

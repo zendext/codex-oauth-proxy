@@ -29,7 +29,12 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Comments in English only
 - If editing code that already contains non-English comments, translate them to English (don’t add new non-English comments)
 - For user-visible strings, keep the existing language used in that file/area
-- New Markdown docs should be in English unless the file is explicitly language-specific.
+- English is the authoritative language for project documentation.
+- Keep `README.md` synchronized with `README.zh-CN.md`.
+- Keep each `docs/*.md` file synchronized with its matching
+  `docs/zh-CN/*.md` translation.
+- `AGENTS.md`, `LICENSE`, workflow files, configuration comments, and source
+  code comments are not part of the bilingual documentation mirror.
 - Follow `gofmt`; keep imports goimports-style; wrap errors with context where helpful
 - Do not use `log.Fatal`/`log.Fatalf` (terminates the process); prefer returning errors
 - Shadowed variables: use method suffix (`errStart := server.Start()`)
