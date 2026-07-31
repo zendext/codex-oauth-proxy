@@ -1,9 +1,13 @@
 package codexonly
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -350,5 +354,121 @@ func TestAuthHealthConcurrentTransitionsKeepPersistenceInSync(t *testing.T) {
 		} else if len(rows) != 0 {
 			t.Fatalf("memory cleared with persisted rows remaining: %#v", rows)
 		}
+	}
+}
+
+func TestNormalizeModelIdentifier(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		want  string
+		ok    bool
+	}{
+		{name: "normalizes surrounding space", model: "  gpt-5.3-codex  ", want: "gpt-5.3-codex", ok: true},
+		{name: "allows codex separators", model: "openai/gpt-5.3:codex_preview", want: "openai/gpt-5.3:codex_preview", ok: true},
+		{name: "rejects empty", model: "  ", ok: false},
+		{name: "rejects control", model: "gpt-5\nsecret", ok: false},
+		{name: "rejects space inside", model: "gpt 5", ok: false},
+		{name: "rejects oversized", model: strings.Repeat("m", maxModelIdentifierBytes+1), ok: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := normalizeModelIdentifier(test.model)
+			if ok != test.ok || got != test.want {
+				t.Fatalf("normalizeModelIdentifier(%q) = %q, %t, want %q, %t", test.model, got, ok, test.want, test.ok)
+			}
+		})
+	}
+}
+
+func TestAuthHealthRejectsUnsafeModelExclusionsWithoutLoggingThem(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenUserStore(ctx, filepath.Join(t.TempDir(), "users.db"))
+	if err != nil {
+		t.Fatalf("OpenUserStore returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	registry := newAuthHealthRegistry(store)
+	auth := &Auth{
+		ID:           "account:acct_a",
+		AccountID:    "acct_a",
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}
+	var logs bytes.Buffer
+	restore := captureStandardLogger(t, &logs)
+	defer restore()
+
+	for _, model := range []string{
+		"gpt-5\nsecret-log-line",
+		strings.Repeat("m", maxModelIdentifierBytes+1),
+	} {
+		err = registry.MarkModelUnsupported(ctx, auth, model, upstreamFailure{
+			Kind:       upstreamFailureModelUnsupported,
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  "model_not_supported",
+		})
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("MarkModelUnsupported(%q) error = %v, want ErrInvalidInput", model, err)
+		}
+	}
+	if len(registry.modelExclusions) != 0 {
+		t.Fatalf("unsafe models were cached: %#v", registry.modelExclusions)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("unsafe models were logged:\n%s", logs.String())
+	}
+}
+
+func TestAuthHealthModelExclusionsAreBoundedWithDeterministicEviction(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenUserStore(ctx, filepath.Join(t.TempDir(), "users.db"))
+	if err != nil {
+		t.Fatalf("OpenUserStore returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	registry := newAuthHealthRegistry(store)
+	registry.now = func() time.Time { return now }
+	auth := &Auth{
+		ID:           "account:acct_a",
+		AccountID:    "acct_a",
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}
+	var logs bytes.Buffer
+	restore := captureStandardLogger(t, &logs)
+	defer restore()
+
+	total := maxModelExclusionsPerAuth + 10
+	for index := range total {
+		model := fmt.Sprintf("model-%03d", index)
+		if err = registry.MarkModelUnsupported(ctx, auth, model, upstreamFailure{
+			Kind:       upstreamFailureModelUnsupported,
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  "model_not_supported",
+		}); err != nil {
+			t.Fatalf("MarkModelUnsupported(%s): %v", model, err)
+		}
+		now = now.Add(time.Second)
+	}
+
+	registry.mu.RLock()
+	exclusions := registry.modelExclusions[auth.ID]
+	count := len(exclusions)
+	registry.mu.RUnlock()
+	if count != maxModelExclusionsPerAuth {
+		t.Fatalf("model exclusion count = %d, want %d", count, maxModelExclusionsPerAuth)
+	}
+	if _, ok := registry.State(auth.ID, "model-000"); ok {
+		t.Fatal("oldest model exclusion was not evicted")
+	}
+	latest := fmt.Sprintf("model-%03d", total-1)
+	state, ok := registry.State(auth.ID, latest)
+	if !ok || state.Kind != AuthHealthModelUnsupported {
+		t.Fatalf("latest model state = %#v, ok=%t, want model exclusion", state, ok)
 	}
 }

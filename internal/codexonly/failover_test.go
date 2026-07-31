@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -173,6 +174,20 @@ func TestClassifyUpstreamResponseTransitions(t *testing.T) {
 			model:    "gpt-test",
 			wantKind: upstreamFailureRequestScoped,
 		},
+		{
+			name:     "control model is not cached as capability",
+			status:   400,
+			body:     `{"error":{"code":"model_not_supported","message":"The requested model is not supported."}}`,
+			model:    "gpt-5\nsecret",
+			wantKind: upstreamFailureRequestScoped,
+		},
+		{
+			name:     "oversized model is not cached as capability",
+			status:   400,
+			body:     `{"error":{"code":"model_not_supported","message":"The requested model is not supported."}}`,
+			model:    strings.Repeat("m", maxModelIdentifierBytes+1),
+			wantKind: upstreamFailureRequestScoped,
+		},
 		{name: "request timeout", status: 408, wantKind: upstreamFailureTransient},
 		{name: "retryable upstream", status: 503, wantKind: upstreamFailureTransient},
 	}
@@ -202,6 +217,135 @@ func TestClassifyUpstreamResponseTransitions(t *testing.T) {
 				t.Fatalf("restored response body = %q, want %q", restored, test.body)
 			}
 		})
+	}
+}
+
+func TestClassifyUpstreamResponseUsesPrefixBeforeBodyReadError(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	prefix := `{"error":{"type":"usage_limit_reached","resets_in_seconds":90}}`
+	readErr := errors.New("injected upstream body read failure")
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     make(http.Header),
+		Body:       newFailingResponseBody(prefix, readErr),
+	}
+
+	failure, err := classifyUpstreamResponse(resp, "gpt-test", now)
+	if err != nil {
+		t.Fatalf("classifyUpstreamResponse returned error: %v", err)
+	}
+	if failure.Kind != upstreamFailureQuota || !failure.RetryAt.Equal(now.Add(90*time.Second)) {
+		t.Fatalf("failure = %#v, want quota with prefix recovery deadline", failure)
+	}
+	restored, err := io.ReadAll(resp.Body)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("restored body error = %v, want %v", err, readErr)
+	}
+	if string(restored) != prefix {
+		t.Fatalf("restored body = %q, want prefix %q", restored, prefix)
+	}
+}
+
+func TestServerReplayableResponseBodyReadErrorStillFailsOver(t *testing.T) {
+	authDir := t.TempDir()
+	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
+	writeSessionAffinityAuth(t, authDir, "b.json", "acct_b", "access-b", false)
+
+	server, apiKey := newFailoverTestServer(t, authDir, "http://127.0.0.1:1", func(cfg *Config) {
+		cfg.RequestRetry = 0
+		cfg.requestRetrySet = true
+	})
+	var mu sync.Mutex
+	var authorizations []string
+	server.httpClient.Transport = failoverRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		authorization := req.Header.Get("Authorization")
+		mu.Lock()
+		authorizations = append(authorizations, authorization)
+		mu.Unlock()
+		if authorization == "Bearer access-a" {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     http.Header{"Content-Type": {"text/plain"}},
+				Body: newFailingResponseBody(
+					"temporary-prefix",
+					errors.New("injected upstream body read failure"),
+				),
+				Request: req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	server.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	mu.Lock()
+	got := slices.Clone(authorizations)
+	mu.Unlock()
+	want := []string{"Bearer access-a", "Bearer access-b"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("upstream auths = %v, want failover %v", got, want)
+	}
+	state, ok := server.health.State("account:acct_a", "gpt-test")
+	if !ok || state.Kind != AuthHealthTransient {
+		t.Fatalf("first auth health = %#v, ok=%t, want transient", state, ok)
+	}
+}
+
+func TestServerNonReplayableResponseBodyReadErrorPreservesUpstreamResponse(t *testing.T) {
+	authDir := t.TempDir()
+	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
+	writeSessionAffinityAuth(t, authDir, "b.json", "acct_b", "access-b", false)
+
+	server, apiKey := newFailoverTestServer(t, authDir, "http://127.0.0.1:1", nil)
+	var calls atomic.Int32
+	server.httpClient.Transport = failoverRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header: http.Header{
+				"Content-Type":      {"text/plain"},
+				"X-Upstream-Result": {"preserved"},
+			},
+			Body: newFailingResponseBody(
+				"temporary-prefix",
+				errors.New("injected upstream body read failure"),
+			),
+			Request: req,
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-test","input":"unknown"}`))
+	req.ContentLength = -1
+	req.GetBody = nil
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	server.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want upstream 503, body: %s", resp.Code, resp.Body.String())
+	}
+	if resp.Header().Get("X-Upstream-Result") != "preserved" {
+		t.Fatalf("upstream header = %q, want preserved", resp.Header().Get("X-Upstream-Result"))
+	}
+	if resp.Body.String() != "temporary-prefix" {
+		t.Fatalf("body = %q, want preserved upstream prefix", resp.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want one-shot response", calls.Load())
 	}
 }
 
@@ -1161,4 +1305,40 @@ func newFailoverTestServer(t *testing.T, authDir string, upstreamURL string, con
 	t.Cleanup(func() { _ = server.Close() })
 	apiKey := createManagedUser(t, server, "admin-key", "Alice").PlaintextAPIKey
 	return server, apiKey
+}
+
+type failoverRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f failoverRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type failingResponseBody struct {
+	prefix []byte
+	err    error
+	failed bool
+}
+
+func newFailingResponseBody(prefix string, err error) *failingResponseBody {
+	return &failingResponseBody{
+		prefix: []byte(prefix),
+		err:    err,
+	}
+}
+
+func (b *failingResponseBody) Read(p []byte) (int, error) {
+	if len(b.prefix) > 0 {
+		n := copy(p, b.prefix)
+		b.prefix = b.prefix[n:]
+		return n, nil
+	}
+	if !b.failed {
+		b.failed = true
+		return 0, b.err
+	}
+	return 0, io.EOF
+}
+
+func (b *failingResponseBody) Close() error {
+	return nil
 }

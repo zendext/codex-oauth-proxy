@@ -195,7 +195,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 			credential.APIKey.KeyHash,
 			credential.APIKey.MaskedKey,
 			capture.AuthID,
-			normalizeUsageText(capture.Model, "unknown"),
+			safeLogModel(capture.Model),
 			normalizeUsageText(capture.ReasoningEffort, "unknown"),
 			normalizeServiceTier(capture.ServiceTier),
 			capture.StatusCode,

@@ -261,7 +261,7 @@ func (s *Server) executeUpstream(
 			round,
 			round+1,
 			delay.Milliseconds(),
-			safeHealthText(model),
+			safeLogModel(model),
 		)
 		wait := s.waitRetry
 		if wait == nil {
@@ -743,10 +743,7 @@ func classifyUpstreamResponse(resp *http.Response, model string, now time.Time) 
 	if resp.StatusCode < http.StatusBadRequest {
 		return upstreamFailure{}, nil
 	}
-	body, err := inspectResponseBody(resp)
-	if err != nil {
-		return upstreamFailure{}, err
-	}
+	body := inspectResponseBody(resp)
 	info := parseUpstreamErrorInfo(body)
 	failure := upstreamFailure{
 		StatusCode: resp.StatusCode,
@@ -816,9 +813,9 @@ func parseUpstreamErrorInfo(body []byte) upstreamErrorInfo {
 	}
 }
 
-func inspectResponseBody(resp *http.Response) ([]byte, error) {
+func inspectResponseBody(resp *http.Response) []byte {
 	if resp == nil || resp.Body == nil || resp.Body == http.NoBody {
-		return nil, nil
+		return nil
 	}
 	original := resp.Body
 	body, err := io.ReadAll(io.LimitReader(original, maxFailureInspectionBytes+1))
@@ -827,22 +824,22 @@ func inspectResponseBody(resp *http.Response) ([]byte, error) {
 			Reader:  io.MultiReader(bytes.NewReader(body), &replayErrorReader{err: err}, original),
 			closers: []io.Closer{original},
 		}
-		return nil, fmt.Errorf("inspect upstream error response: %w", err)
+		return body
 	}
 	if len(body) > maxFailureInspectionBytes {
 		resp.Body = &replayReadCloser{
 			Reader:  io.MultiReader(bytes.NewReader(body), original),
 			closers: []io.Closer{original},
 		}
-		return body[:maxFailureInspectionBytes], nil
+		return body[:maxFailureInspectionBytes]
 	}
 	_ = original.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return body, nil
+	return body
 }
 
 func isModelUnsupportedFailure(status int, model string, info upstreamErrorInfo, body []byte) bool {
-	if strings.TrimSpace(model) == "" {
+	if _, ok := normalizeModelIdentifier(model); !ok {
 		return false
 	}
 	switch status {

@@ -129,7 +129,9 @@ The proxy classifies upstream outcomes before committing a downstream response:
 - Network failures, `408`, and retryable `5xx` responses create a short
   in-memory cooldown.
 - Model-not-supported responses create a credential/model exclusion rather than
-  an auth-global cooldown.
+  an auth-global cooldown. Cacheable model IDs use a safe 128-byte identifier
+  format, and each auth retains at most 64 exclusions with deterministic
+  oldest-entry eviction.
 
 Retry uses three independent budgets. Same-auth `401` repair is outside the
 credential budget. One execution round tries distinct eligible auths up to

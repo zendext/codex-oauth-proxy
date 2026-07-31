@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+const (
+	maxModelIdentifierBytes   = 128
+	maxModelExclusionsPerAuth = 64
+)
+
 type AuthHealthKind string
 
 const (
@@ -307,10 +312,10 @@ func (r *authHealthRegistry) State(authID string, model string) (AuthHealthState
 		return AuthHealthState{}, false
 	}
 	authID = strings.TrimSpace(authID)
-	model = strings.TrimSpace(model)
+	model, modelValid := normalizeModelIdentifier(model)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if model != "" {
+	if modelValid {
 		if models := r.modelExclusions[authID]; models != nil {
 			if exclusion, ok := models[model]; ok {
 				return AuthHealthState{
@@ -366,10 +371,14 @@ func (r *authHealthRegistry) MarkCredentialHealthy(ctx context.Context, auth *Au
 }
 
 func (r *authHealthRegistry) MarkModelUnsupported(ctx context.Context, auth *Auth, model string, failure upstreamFailure) error {
-	if r == nil || auth == nil || strings.TrimSpace(auth.ID) == "" || strings.TrimSpace(model) == "" {
+	if r == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return ErrInvalidInput
 	}
-	model = strings.TrimSpace(model)
+	var modelValid bool
+	model, modelValid = normalizeModelIdentifier(model)
+	if !modelValid {
+		return ErrInvalidInput
+	}
 	exclusion := authModelExclusion{
 		Fingerprint: authCredentialFingerprint(auth),
 		Reason:      "model_not_supported",
@@ -387,6 +396,9 @@ func (r *authHealthRegistry) MarkModelUnsupported(ctx context.Context, auth *Aut
 		r.modelExclusions[auth.ID] = make(map[string]authModelExclusion)
 	}
 	_, existed := r.modelExclusions[auth.ID][model]
+	if !existed && len(r.modelExclusions[auth.ID]) >= maxModelExclusionsPerAuth {
+		delete(r.modelExclusions[auth.ID], oldestModelExclusion(r.modelExclusions[auth.ID]))
+	}
 	r.modelExclusions[auth.ID][model] = exclusion
 	r.mu.Unlock()
 	if cleared {
@@ -397,7 +409,7 @@ func (r *authHealthRegistry) MarkModelUnsupported(ctx context.Context, auth *Aut
 			"auth health transition auth_id=%s account_id=%s state=model_not_supported model=%s status=%d error_code=%s",
 			auth.ID,
 			safeLogAccountID(auth.AccountID),
-			model,
+			safeLogModel(model),
 			failure.StatusCode,
 			failure.ErrorCode,
 		)
@@ -544,8 +556,8 @@ func (r *authHealthRegistry) markHealthyLocked(ctx context.Context, auth *Auth, 
 	if !preserveQuota {
 		delete(r.states, auth.ID)
 	}
-	model = strings.TrimSpace(model)
-	if model != "" {
+	model, modelValid := normalizeModelIdentifier(model)
+	if modelValid {
 		if exclusions := r.modelExclusions[auth.ID]; exclusions != nil {
 			delete(exclusions, model)
 			if len(exclusions) == 0 {
@@ -568,6 +580,53 @@ func preserveExistingHealthState(existing AuthHealthState, incoming AuthHealthSt
 	}
 	return credentialHealthKind(existing.Kind) ||
 		existing.Kind == AuthHealthQuota && existing.Authoritative
+}
+
+func normalizeModelIdentifier(model string) (string, bool) {
+	model = strings.Trim(model, " ")
+	if model == "" || len(model) > maxModelIdentifierBytes {
+		return "", false
+	}
+	for _, char := range model {
+		switch {
+		case char >= 'a' && char <= 'z',
+			char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9',
+			char == '-',
+			char == '_',
+			char == '.',
+			char == '/',
+			char == ':',
+			char == '@':
+		default:
+			return "", false
+		}
+	}
+	return model, true
+}
+
+func oldestModelExclusion(exclusions map[string]authModelExclusion) string {
+	oldestModel := ""
+	var oldest authModelExclusion
+	for model, exclusion := range exclusions {
+		if oldestModel == "" ||
+			exclusion.UpdatedAt.Before(oldest.UpdatedAt) ||
+			exclusion.UpdatedAt.Equal(oldest.UpdatedAt) && model < oldestModel {
+			oldestModel = model
+			oldest = exclusion
+		}
+	}
+	return oldestModel
+}
+
+func safeLogModel(model string) string {
+	if normalized, ok := normalizeModelIdentifier(model); ok {
+		return normalized
+	}
+	if strings.TrimSpace(model) == "" {
+		return "unknown"
+	}
+	return "invalid"
 }
 
 func logAuthHealthy(auth *Auth, reason string) {
