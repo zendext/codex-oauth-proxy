@@ -201,16 +201,17 @@ func matchingAuth(auths []*Auth, target *Auth) *Auth {
 }
 
 type Server struct {
-	cfg            *Config
-	auths          *AuthManager
-	users          *UserStore
-	httpClient     *http.Client
-	baseURL        *url.URL
-	chatGPTBaseURL *url.URL
-	ctx            context.Context
-	cancel         context.CancelFunc
-	closeOnce      sync.Once
-	closeErr       error
+	cfg                        *Config
+	auths                      *AuthManager
+	users                      *UserStore
+	httpClient                 *http.Client
+	baseURL                    *url.URL
+	chatGPTBaseURL             *url.URL
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	sessionAffinityReplayStore func() *sessionAffinityReplayStore
+	closeOnce                  sync.Once
+	closeErr                   error
 }
 
 type upstreamRoute struct {
@@ -479,7 +480,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			writeAuthError(w, err)
 			return
 		}
-		signals := extractSessionAffinitySignals(r)
+		signals := s.extractSessionAffinitySignals(r)
 		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
 			writeError(w, http.StatusBadRequest, "fast mode is disabled")
 			return
@@ -491,7 +492,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			writeAuthError(w, err)
 			return
 		}
-		signals := extractSessionAffinitySignals(r)
+		signals := s.extractSessionAffinitySignals(r)
 		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
 			writeError(w, http.StatusBadRequest, "fast mode is disabled")
 			return
@@ -1068,8 +1069,7 @@ func requestHasFastServiceTier(r *http.Request) bool {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		_ = r.Body.Close()
-		r.Body = io.NopCloser(bytes.NewReader(nil))
+		resetRequestBody(r, nil)
 		return false
 	}
 	resetRequestBody(r, body)
@@ -1096,6 +1096,13 @@ func payloadHasFastServiceTier(payload []byte) bool {
 	}
 	serviceTier, ok := value["service_tier"].(string)
 	return ok && isFastServiceTier(serviceTier)
+}
+
+func (s *Server) extractSessionAffinitySignals(r *http.Request) []sessionAffinitySignal {
+	if s != nil && s.sessionAffinityReplayStore != nil {
+		return extractSessionAffinitySignalsWithReplayStore(r, s.sessionAffinityReplayStore())
+	}
+	return extractSessionAffinitySignals(r)
 }
 
 func resetRequestBody(r *http.Request, body []byte) {

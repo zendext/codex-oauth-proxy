@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -250,6 +251,85 @@ func TestServerSessionAffinityUsesSignalFromLargeJSONBody(t *testing.T) {
 		if gotBody != body {
 			t.Fatalf("upstream body #%d length = %d, want exact %d-byte body", i+1, len(gotBody), len(body))
 		}
+	}
+}
+
+func TestServerSessionAffinitySpillFailuresRemainBoundedAndDoNotBind(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*sessionAffinityReplayStore)
+	}{
+		{
+			name: "create",
+			configure: func(store *sessionAffinityReplayStore) {
+				store.createTemp = func() (*os.File, error) {
+					return nil, errors.New("injected create failure")
+				}
+			},
+		},
+		{
+			name: "write",
+			configure: func(store *sessionAffinityReplayStore) {
+				writes := 0
+				store.writeFile = func(file *os.File, p []byte) (int, error) {
+					writes++
+					if writes == 2 {
+						return 0, errors.New("injected write failure")
+					}
+					return file.Write(p)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
+			writeSessionAffinityAuth(t, authDir, "b.json", "acct_b", "access-b", false)
+
+			var upstreamBody string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				upstreamBody = string(body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer upstream.Close()
+
+			server := newSessionAffinityServer(t, authDir, filepath.Join(t.TempDir(), "users.db"), upstream.URL)
+			server.cfg.AllowFastMode = true
+			defer server.Close()
+			var replayStore *sessionAffinityReplayStore
+			server.sessionAffinityReplayStore = func() *sessionAffinityReplayStore {
+				replayStore = &sessionAffinityReplayStore{}
+				tt.configure(replayStore)
+				return replayStore
+			}
+			user := createManagedUser(t, server, "admin-key", "Alice")
+			body := largeSessionAffinityJSON("must-not-bind")
+
+			sendResponseRequest(t, server, user.PlaintextAPIKey, "", body)
+
+			if upstreamBody != body {
+				t.Fatalf("upstream body length = %d, want exact %d-byte body", len(upstreamBody), len(body))
+			}
+			var bindings int
+			if err := server.users.db.QueryRow(`SELECT COUNT(*) FROM session_affinity_bindings`).Scan(&bindings); err != nil {
+				t.Fatalf("count session affinity bindings: %v", err)
+			}
+			if bindings != 0 {
+				t.Fatalf("session affinity bindings = %d, want 0 after incomplete inspection", bindings)
+			}
+			if replayStore == nil {
+				t.Fatal("session affinity replay store was not created")
+			}
+			if got := replayStore.memory.Len() + len(replayStore.tail); got > sessionAffinityReplayMemoryBytes {
+				t.Fatalf("replay heap bytes = %d, want at most %d", got, sessionAffinityReplayMemoryBytes)
+			}
+			if replayStore.file != nil || replayStore.path != "" {
+				t.Fatalf("spill failure leaked replay store: file=%v path=%q", replayStore.file, replayStore.path)
+			}
+		})
 	}
 }
 

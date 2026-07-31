@@ -62,8 +62,11 @@ are isolated by the matched stable OAuth identity.
 Values over 512 bytes, empty values, invalid UTF-8, and values containing
 control characters are ignored for affinity. JSON bodies are inspected as a
 token stream without an affinity-specific body-size cutoff, and the exact body
-is restored before forwarding. Ignored or missing signals do not fail the
-request; selection falls back to normal round-robin behavior.
+is restored before forwarding. If temporary replay storage cannot be created or
+written, body inspection stops, body-derived signals are ignored, and the
+stored prefix plus untouched request stream are forwarded unchanged. Ignored or
+missing signals do not fail the request; selection falls back to normal
+round-robin behavior.
 
 ## Error Format
 

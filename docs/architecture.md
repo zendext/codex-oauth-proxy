@@ -159,9 +159,12 @@ Signal values are trimmed, limited to 512 bytes, and rejected for affinity when
 empty, invalid UTF-8, or containing control characters. JSON request bodies are
 tokenized as a stream without an affinity-specific body-size cutoff. Replay
 keeps up to 64 KiB in memory and uses a `0600` temporary file beyond that
-threshold so the exact body can still be forwarded. An invalid, missing, or
-oversized signal does not reject or truncate the proxied request; it uses normal
-round-robin selection instead.
+threshold so the exact body can still be forwarded. If temporary replay storage
+cannot be created or written, inspection stops before additional unbounded
+buffering, body-derived signals are discarded, and the stored prefix is joined
+with the untouched source stream for exact one-shot forwarding. An invalid,
+missing, or oversized signal does not reject or truncate the proxied request; it
+uses normal round-robin selection instead.
 
 Managed requests are scoped by stable user ID, so API-key rotation preserves
 bindings and two users cannot collide. OAuth compatibility requests are scoped
@@ -314,7 +317,8 @@ only at creation or reset; only hashes and masked metadata are persisted.
 Raw session affinity signals are not written to SQLite, returned by management
 APIs, or written to debug logs. A large JSON request body may be staged in a
 process-owned `0600` temporary replay file for the lifetime of that request; the
-file is removed when replay closes.
+file is removed when replay closes, including when another request-processing
+step replaces the replay body.
 
 The server itself provides HTTP. Listen address selection and transport
 termination belong to the deployment environment.

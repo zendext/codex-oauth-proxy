@@ -287,15 +287,10 @@ func captureProxyRequestUsageMetadata(r *http.Request) proxyRequestUsageMetadata
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		_ = r.Body.Close()
-		r.Body = io.NopCloser(bytes.NewReader(nil))
+		resetRequestBody(r, nil)
 		return metadata
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
-	}
+	resetRequestBody(r, body)
 	if bodyMetadata, ok := usageMetadataFromJSON(body); ok {
 		metadata = mergeUsageMetadata(metadata, bodyMetadata)
 	}

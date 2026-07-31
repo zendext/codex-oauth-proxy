@@ -21,6 +21,7 @@ import (
 const (
 	maxSessionAffinitySignalBytes    = 512
 	sessionAffinityReplayMemoryBytes = 64 << 10
+	sessionAffinityReplayReadBytes   = 32 << 10
 	sessionAffinityExpiry            = time.Hour
 	sessionAffinityRenewalThreshold  = 30 * time.Minute
 	sessionAffinityCleanupInterval   = 5 * time.Minute
@@ -71,10 +72,14 @@ type sessionAffinitySignalAccumulator struct {
 }
 
 type sessionAffinityReplayStore struct {
-	memory        bytes.Buffer
-	file          *os.File
-	path          string
-	spillDisabled bool
+	memory     bytes.Buffer
+	file       *os.File
+	fileBytes  int64
+	path       string
+	tail       []byte
+	spillErr   error
+	createTemp func() (*os.File, error)
+	writeFile  func(*os.File, []byte) (int, error)
 }
 
 type sessionAffinitySourceReader struct {
@@ -82,6 +87,11 @@ type sessionAffinitySourceReader struct {
 	err         error
 	bytesRead   int64
 	errorOffset int64
+}
+
+type sessionAffinityReplayReader struct {
+	source *sessionAffinitySourceReader
+	replay *sessionAffinityReplayStore
 }
 
 func (r *replayErrorReader) Read([]byte) (int, error) {
@@ -166,6 +176,13 @@ func (a *sessionAffinitySignalAccumulator) signals() []sessionAffinitySignal {
 }
 
 func extractSessionAffinitySignals(r *http.Request) []sessionAffinitySignal {
+	return extractSessionAffinitySignalsWithReplayStore(r, nil)
+}
+
+func extractSessionAffinitySignalsWithReplayStore(
+	r *http.Request,
+	replay *sessionAffinityReplayStore,
+) []sessionAffinitySignal {
 	if r == nil {
 		return nil
 	}
@@ -181,7 +198,7 @@ func extractSessionAffinitySignals(r *http.Request) []sessionAffinitySignal {
 	}
 
 	if requestMayContainSessionAffinityJSON(r) {
-		bodySignals, valid := extractSessionAffinityJSONSignals(r)
+		bodySignals, valid := extractSessionAffinityJSONSignals(r, replay)
 		if valid {
 			signals.merge(bodySignals)
 		}
@@ -200,28 +217,30 @@ func requestMayContainSessionAffinityJSON(r *http.Request) bool {
 	return contentType == "" && r.Method != http.MethodGet && r.Method != http.MethodHead
 }
 
-func extractSessionAffinityJSONSignals(r *http.Request) (*sessionAffinitySignalAccumulator, bool) {
+func extractSessionAffinityJSONSignals(
+	r *http.Request,
+	replay *sessionAffinityReplayStore,
+) (*sessionAffinitySignalAccumulator, bool) {
 	if r == nil || r.Body == nil || r.Body == http.NoBody {
 		return nil, false
 	}
 	original := r.Body
-	replay := &sessionAffinityReplayStore{}
+	if replay == nil {
+		replay = &sessionAffinityReplayStore{}
+	}
 	source := &sessionAffinitySourceReader{reader: original}
-	decoder := json.NewDecoder(io.TeeReader(source, replay))
+	inspectionReader := &sessionAffinityReplayReader{
+		source: source,
+		replay: replay,
+	}
+	decoder := json.NewDecoder(inspectionReader)
 	decoder.UseNumber()
 	signals, valid := parseSessionAffinityJSONObject(decoder)
-	if source.err == nil {
-		_, _ = io.Copy(replay, source)
+	if source.err == nil && replay.spillErr == nil {
+		_, _ = io.Copy(io.Discard, inspectionReader)
 	}
-	replayedBody, err := replay.body(original, source.err, source.errorOffset)
-	if err != nil {
-		replayedBody = &replayReadCloser{
-			Reader:  bytes.NewReader(replay.memory.Bytes()),
-			closers: []io.Closer{original, replay},
-		}
-	}
-	r.Body = replayedBody
-	return signals, valid && source.err == nil
+	r.Body = replay.body(original, source.err, source.errorOffset)
+	return signals, valid && source.err == nil && replay.spillErr == nil
 }
 
 func parseSessionAffinityJSONObject(decoder *json.Decoder) (*sessionAffinitySignalAccumulator, bool) {
@@ -377,31 +396,63 @@ func (r *sessionAffinitySourceReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *sessionAffinityReplayStore) Write(p []byte) (int, error) {
-	if s == nil {
-		return len(p), nil
+func (r *sessionAffinityReplayReader) Read(p []byte) (int, error) {
+	if r == nil || r.source == nil || r.replay == nil {
+		return 0, io.EOF
 	}
-	if s.file == nil && (s.spillDisabled || s.memory.Len()+len(p) <= sessionAffinityReplayMemoryBytes) {
-		return s.memory.Write(p)
+	if r.replay.spillErr != nil {
+		return 0, r.replay.spillErr
+	}
+	if len(p) > sessionAffinityReplayReadBytes {
+		p = p[:sessionAffinityReplayReadBytes]
+	}
+	if err := r.replay.prepareRead(len(p)); err != nil {
+		r.replay.spillErr = err
+		return 0, err
+	}
+	n, errSource := r.source.Read(p)
+	if n == 0 {
+		return 0, errSource
+	}
+	if errReplay := r.replay.append(p[:n]); errReplay != nil {
+		return n, errReplay
+	}
+	return n, errSource
+}
+
+func (s *sessionAffinityReplayStore) prepareRead(size int) error {
+	if s == nil || s.file != nil || s.memory.Len()+size <= sessionAffinityReplayMemoryBytes {
+		return nil
+	}
+	return s.spillToFile()
+}
+
+func (s *sessionAffinityReplayStore) append(p []byte) error {
+	if s == nil || len(p) == 0 {
+		return nil
 	}
 	if s.file == nil {
-		if err := s.spillToFile(); err != nil {
-			s.spillDisabled = true
-			return s.memory.Write(p)
+		_, err := s.memory.Write(p)
+		return err
+	}
+	n, err := s.writeReplayFile(p)
+	if n > 0 {
+		s.fileBytes += int64(n)
+	}
+	if n < len(p) {
+		s.tail = append(s.tail, p[n:]...)
+		if err == nil {
+			err = io.ErrShortWrite
 		}
 	}
-	n, err := s.file.Write(p)
-	if err == nil {
-		return n, nil
+	if err != nil {
+		s.spillErr = err
 	}
-	if errFallback := s.fallbackToMemory(p[n:]); errFallback != nil {
-		return n, err
-	}
-	return len(p), nil
+	return err
 }
 
 func (s *sessionAffinityReplayStore) spillToFile() error {
-	file, err := os.CreateTemp("", "codex-oauth-proxy-session-affinity-*")
+	file, err := s.createReplayTemp()
 	if err != nil {
 		return err
 	}
@@ -410,11 +461,16 @@ func (s *sessionAffinityReplayStore) spillToFile() error {
 		_ = os.Remove(file.Name())
 		return err
 	}
-	if _, err = file.Write(s.memory.Bytes()); err != nil {
+	n, err := s.writeReplayFileTo(file, s.memory.Bytes())
+	if err == nil && n != s.memory.Len() {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(file.Name())
 		return err
 	}
+	s.fileBytes = int64(n)
 	s.memory.Reset()
 	s.file = file
 	s.path = file.Name()
@@ -424,51 +480,60 @@ func (s *sessionAffinityReplayStore) spillToFile() error {
 	return nil
 }
 
-func (s *sessionAffinityReplayStore) fallbackToMemory(remaining []byte) error {
+func (s *sessionAffinityReplayStore) createReplayTemp() (*os.File, error) {
+	if s != nil && s.createTemp != nil {
+		return s.createTemp()
+	}
+	return os.CreateTemp("", "codex-oauth-proxy-session-affinity-*")
+}
+
+func (s *sessionAffinityReplayStore) writeReplayFile(p []byte) (int, error) {
 	if s == nil || s.file == nil {
-		return nil
+		return 0, io.ErrClosedPipe
 	}
-	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
-		return err
+	return s.writeReplayFileTo(s.file, p)
+}
+
+func (s *sessionAffinityReplayStore) writeReplayFileTo(file *os.File, p []byte) (int, error) {
+	if s != nil && s.writeFile != nil {
+		return s.writeFile(file, p)
 	}
-	if _, err := io.Copy(&s.memory, s.file); err != nil {
-		return err
+	return file.Write(p)
+}
+
+func (s *sessionAffinityReplayStore) replayReader() io.Reader {
+	readers := make([]io.Reader, 0, 3)
+	if s != nil && s.file != nil && s.fileBytes > 0 {
+		readers = append(readers, io.NewSectionReader(s.file, 0, s.fileBytes))
+	} else if s != nil && s.memory.Len() > 0 {
+		readers = append(readers, bytes.NewReader(s.memory.Bytes()))
 	}
-	if _, err := s.memory.Write(remaining); err != nil {
-		return err
+	if s != nil && len(s.tail) > 0 {
+		readers = append(readers, bytes.NewReader(s.tail))
 	}
-	if err := s.closeFile(); err != nil {
-		return err
-	}
-	s.spillDisabled = true
-	return nil
+	return io.MultiReader(readers...)
 }
 
 func (s *sessionAffinityReplayStore) body(
-	original io.Closer,
+	original io.ReadCloser,
 	sourceErr error,
 	errorOffset int64,
-) (io.ReadCloser, error) {
-	var reader io.Reader
-	if s.file != nil {
-		if _, err := s.file.Seek(0, io.SeekStart); err != nil {
-			return nil, err
-		}
-		reader = s.file
-	} else {
-		reader = bytes.NewReader(s.memory.Bytes())
-	}
+) io.ReadCloser {
+	reader := s.replayReader()
 	if sourceErr != nil {
 		reader = io.LimitReader(reader, errorOffset)
 	}
 	readers := []io.Reader{reader}
-	if sourceErr != nil {
+	switch {
+	case sourceErr != nil:
 		readers = append(readers, &replayErrorReader{err: sourceErr})
+	case s != nil && s.spillErr != nil:
+		readers = append(readers, original)
 	}
 	return &replayReadCloser{
 		Reader:  io.MultiReader(readers...),
 		closers: []io.Closer{original, s},
-	}, nil
+	}
 }
 
 func (s *sessionAffinityReplayStore) Close() error {
@@ -484,6 +549,8 @@ func (s *sessionAffinityReplayStore) closeFile() error {
 	}
 	errClose := s.file.Close()
 	s.file = nil
+	s.fileBytes = 0
+	s.tail = nil
 	if s.path != "" {
 		errRemove := os.Remove(s.path)
 		s.path = ""

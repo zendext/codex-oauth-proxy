@@ -107,6 +107,35 @@ func TestExtractSessionAffinitySignalsFromLargeJSONBodyAndRestoresIt(t *testing.
 	}
 }
 
+func TestCaptureProxyRequestUsageMetadataClosesSessionAffinityReplay(t *testing.T) {
+	body := largeSessionAffinityJSON("large-session")
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	replayStore := &sessionAffinityReplayStore{}
+
+	if signals := extractSessionAffinitySignalsWithReplayStore(req, replayStore); len(signals) == 0 {
+		t.Fatal("signals are empty, want body-derived session affinity")
+	}
+	if replayStore.file == nil {
+		t.Fatal("replay store did not spill to a temporary file")
+	}
+
+	metadata := captureProxyRequestUsageMetadata(req)
+	if metadata.Model != "" {
+		t.Fatalf("captured model = %q, want empty", metadata.Model)
+	}
+	if replayStore.file != nil || replayStore.path != "" {
+		t.Fatalf("usage metadata replacement leaked replay store: file=%v path=%q", replayStore.file, replayStore.path)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read metadata-restored body: %v", err)
+	}
+	if string(restored) != body {
+		t.Fatalf("metadata-restored body length = %d, want %d", len(restored), len(body))
+	}
+}
+
 func TestExtractSessionAffinitySignalsPreservesBodyReadError(t *testing.T) {
 	errBody := errors.New("injected body read error")
 	body := &singleErrorReadCloser{
