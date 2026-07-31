@@ -779,12 +779,17 @@ func (s *Server) fetchModelCatalogAttempt(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		failure, errClassify := classifyUpstreamResponse(resp, "", s.health.currentTime())
+		now := s.health.currentTime()
+		failure, errClassify := classifyUpstreamResponse(resp, "", now)
 		if errClassify != nil {
 			return modelCatalogFetchResult{}, upstreamFailure{}, errClassify
 		}
-		return modelCatalogFetchResult{RetryAt: failure.RetryAt}, failure, &modelCatalogFetchError{
-			RetryAt: failure.RetryAt,
+		retryAt := failure.RetryAt
+		if retryAt.IsZero() && failure.Kind == upstreamFailureTransient {
+			retryAt = parseRetryAfterDeadline(resp.Header.Get(proxyRetryAfterHeader), now)
+		}
+		return modelCatalogFetchResult{RetryAt: retryAt}, failure, &modelCatalogFetchError{
+			RetryAt: retryAt,
 			Err:     fmt.Errorf("model catalog upstream status %d", resp.StatusCode),
 		}
 	}

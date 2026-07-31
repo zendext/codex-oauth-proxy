@@ -314,6 +314,42 @@ func TestServerModelFetchRateLimitSetsCooldownWithoutRebindingSession(t *testing
 	assertRuntimeModelsBindingUnchanged(t, server, binding)
 }
 
+func TestServerModelFetchTransientRetryAfterDelaysBackgroundRetry(t *testing.T) {
+	authDir := t.TempDir()
+	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]any{"code": "service_unavailable"},
+		})
+	}))
+	defer upstream.Close()
+
+	server, apiKey := newRuntimeModelsServer(t, authDir, upstream.URL, nil)
+	server.models.retryJitter = func(time.Duration) time.Duration { return 0 }
+	retryDelays := make(chan time.Duration, 1)
+	server.models.waitRetry = func(_ context.Context, delay time.Duration) error {
+		retryDelays <- delay
+		return context.Canceled
+	}
+
+	resp := doModelRequest(t, server, apiKey, "/v1/models?client_version=0.146.0")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want embedded fallback 200, body: %s", resp.Code, resp.Body.String())
+	}
+	select {
+	case delay := <-retryDelays:
+		if delay < 119*time.Second {
+			t.Fatalf("background retry delay = %s, want Retry-After near 120s", delay)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for background retry delay")
+	}
+	if state, ok := server.health.State("account:acct_a", ""); ok {
+		t.Fatalf("transient model fetch changed auth cooldown state: %#v", state)
+	}
+}
+
 func TestServerModelSupportRebindsWholeSession(t *testing.T) {
 	authDir := t.TempDir()
 	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
