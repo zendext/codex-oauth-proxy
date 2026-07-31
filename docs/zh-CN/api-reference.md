@@ -372,7 +372,8 @@ Query 参数：
 
 ### `GET /v1/models`
 
-不包含 `client_version` 时，返回 OpenAI 风格的模型列表：
+不包含 `client_version` 时，返回从 `codex-user-agent` 派生版本所对应同步目录
+的 OpenAI 风格视图：
 
 ```json
 {
@@ -387,14 +388,25 @@ Query 参数：
 }
 ```
 
-Query 中存在 `client_version` Key 时，响应使用嵌入式 Codex CLI 模型目录格式：
+Query 中存在 `client_version` Key 时，响应使用该精确规范化版本的 Codex CLI
+目录格式。空值使用相同的已配置 User-Agent 版本：
 
 ```json
 {"models":[]}
 ```
 
-实际列表来自 `internal/codexonly/codex_client_models.json`。除非启用
-`allow-fast-mode`，否则会移除 Fast Tier 元数据。
+版本为冷缓存或已过期时，代理会为每个有效逻辑凭据并发 Fetch 已认证上游目录，
+等待所有结果，然后返回确定性的模型 Slug 并集。重复 Slug 只选择一个完整的
+按认证对象，不会跨账户合并字段。
+
+成功的按认证 Snapshot TTL 为三小时。刷新失败时复用过期 Snapshot，并安排一个
+去重的后台任务执行三次额外重试。一个认证失败不会阻止其他成功认证。如果没有
+任何认证拥有可用 Snapshot，则回退到
+`internal/codexonly/codex_client_models.json`。
+
+版本最大为 64 个安全 ASCII 字节；无效值返回 `400`。内存中最多保留 16 个
+规范化版本并使用 LRU 淘汰。除非启用 `allow-fast-mode`，否则会移除 Fast Tier
+元数据。
 
 ### `POST /v1/chat/completions`
 

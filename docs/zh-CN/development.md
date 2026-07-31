@@ -71,6 +71,7 @@ WebSocket 连接的 Read/Write Timeout。
 | 管理 CLI | `cmd/server/admin_*.go` |
 | 配置与 OAuth | `internal/codexonly/config.go`、`auth.go`、`refresh.go` |
 | 路由与代理 | `internal/codexonly/server.go`、`usage_proxy.go` |
+| 运行时模型目录 | `internal/codexonly/models.go` |
 | Chat 兼容 | `internal/codexonly/chat_completions.go` |
 | 用户与 SQLite | `internal/codexonly/user_store.go` |
 | 用量查询 | `internal/codexonly/usage.go` |
@@ -79,6 +80,20 @@ WebSocket 连接的 Read/Write Timeout。
 
 测试与所属 Package 放在一起。HTTP 测试使用 `httptest`，Store 测试使用临时
 SQLite 数据库。
+
+## 嵌入式目录维护
+
+嵌入式目录是最终运行时回退。其 `go:generate` 指令固定到显式的官方
+`openai/codex` Git Ref，不会在运行时发现最新版本：
+
+```bash
+go generate ./internal/codexonly
+go run ./cmd/update-model-catalog --ref rust-v0.146.0 --check
+```
+
+更新前必须先从官方仓库确认最新稳定 Codex CLI Release，然后同时更新固定的
+`--ref`、`DefaultCodexUA` 和 vendored JSON。Updater 会验证下载的目录并以
+原子方式写入。
 
 ## 文档策略
 

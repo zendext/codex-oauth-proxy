@@ -20,7 +20,8 @@
 | `internal/codexonly/auth_health.go` | 全局凭据健康、模型排除、冷却协调和权威状态持久化。 |
 | `internal/codexonly/refresh.go` | OAuth 刷新和出站 HTTP Transport 构建。 |
 | `internal/codexonly/failover.go` | 重放资格、上游响应分类、重试层次和确定性聚合错误。 |
-| `internal/codexonly/server.go` | 路由、认证、模型目录、Header、HTTP Reverse Proxy 以及管理和用户 Handler。 |
+| `internal/codexonly/models.go` | 按认证运行时同步模型、版本 LRU、聚合和嵌入式回退。 |
+| `internal/codexonly/server.go` | 路由、认证、Header、HTTP Reverse Proxy 以及管理和用户 Handler。 |
 | `internal/codexonly/chat_completions.go` | Chat Completions 到 Responses 的转换和响应翻译。 |
 | `internal/codexonly/user_store.go` | SQLite Schema、用户、API Key 和认证。 |
 | `internal/codexonly/session_affinity.go` | 有界信号提取、Digest、持久化绑定、续期和 CAS 重绑定。 |
@@ -128,6 +129,33 @@ Handshake 可以在 Upgrade 成功前故障转移。HTTP Stream 和 WebSocket �
 会在实际 Token 材料变化后使持久化凭据故障失效，而同账户 Token 更新会保留
 未过期的配额 Deadline。
 
+## 运行时模型目录
+
+`GET /v1/models` 会按每个有效稳定认证 ID 和规范化 Codex CLI 版本同步已认证的
+Codex `/models` 端点。冷缓存或过期请求会并发启动这些按认证 Fetch，并等待每个
+认证成功或失败。同一认证和版本的并发 Miss 共享一次前台 Fetch。
+
+成功的按认证 Snapshot 保持三小时新鲜。内存缓存最多保留 16 个规范化客户端
+版本，并淘汰最近最少使用的版本。模型 Payload 不会写入 SQLite。被删除的认证
+身份会从所有缓存版本中清除。
+
+聚合结果公开模型 Slug 并集。重复 Slug 会按稳定认证 ID 和确定性模型编码选择
+一个完整 Canonical 对象，绝不会组合不同账户的字段。独立且有序的支持集合记录
+每个 Slug 由哪些认证 ID 提供。当请求的 Codex 客户端版本已有同步支持集合时，
+路由仅在健康绑定认证支持请求模型时保留它；否则现有亲和性 CAS 会将整个会话
+重绑定到支持该模型的健康认证。模型名称仍不属于亲和性 Key。
+
+刷新失败时会复用该认证最近一次成功 Snapshot。没有 Snapshot 时，其独有模型
+不会出现在当前并集中。一个去重的后台任务会使用指数退避、Jitter 和
+`Retry-After` 最多执行三次额外重试。目录重试预算独立于代理请求重试。耗尽的
+周期只会在认证被证明健康、进入下一个三小时刷新周期或请求另一个客户端版本时
+重新打开。
+
+模型 Fetch 收到 `401` 时会执行协调的同认证 OAuth 刷新和一次重试。继续
+`401` 或收到 `429` 会更新共享认证健康和冷却状态，但不会仅因目录刷新失败而
+修改会话绑定。如果所有认证都没有可用 Snapshot，则返回嵌入式发布目录作为最终
+回退；该回退不会为路由声明按认证支持能力。
+
 ## 认证边界
 
 传入的托管 API Key 与传出的 OAuth Access Token 是两种独立凭据。
@@ -202,7 +230,7 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 | `/v0/local-admin/*` | 回环管理 |
 | `/v0/management/*` | 管理 Key API |
 | `/v0/user/*` | 托管用户自助 API |
-| `/v1/models` | 嵌入式模型目录 |
+| `/v1/models` | 按认证运行时模型聚合和嵌入式回退 |
 | `/v1/chat/completions` | 本地协议转换 |
 | 白名单 `/v1/*` | Codex 上游 Reverse Proxy |
 | 部分 `/backend-api/*` | Codex CLI 兼容 Reverse Proxy |
@@ -215,7 +243,8 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 
 1. 认证传入的托管 Key 或允许的 OAuth 兼容 Token。
 2. Fast 模式禁用时拒绝 Fast Service Tier。
-3. 协调认证文件和全局健康，然后解析健康的会话亲和性，或选择下一个可用凭据。
+3. 协调认证文件和全局健康；存在已同步模型支持时先应用该支持集合，然后解析
+   健康的会话亲和性或选择下一个可用凭据。
 4. 将目标 URL 重写到配置的 Codex 或 ChatGPT Base。
 5. 使用选中的 OAuth Access Token 替换 `Authorization`。
 6. 可用时添加 ChatGPT Account ID 和兼容 Header。

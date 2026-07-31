@@ -102,6 +102,7 @@ func (s *Server) executeUpstream(
 	authorization proxyAuthorization,
 	signals []sessionAffinitySignal,
 	model string,
+	clientVersion string,
 	replayable bool,
 	attempt upstreamAttemptFunc,
 ) (upstreamExecution, error) {
@@ -116,6 +117,23 @@ func (s *Server) executeUpstream(
 	for _, auth := range initial.Auths {
 		if auth != nil {
 			allowed[auth.ID] = struct{}{}
+		}
+	}
+	if _, modelValid := normalizeModelIdentifier(model); modelValid && s.models != nil {
+		catalog := s.models.CachedCatalog(clientVersion, initial.Active)
+		if catalog.CapabilityKnown {
+			supportingAuths := catalog.SupportingAuthIDs(model)
+			if len(supportingAuths) == 0 {
+				return upstreamExecution{}, &proxyFinalError{
+					StatusCode: http.StatusNotFound,
+					Code:       proxyErrorCodeModelNotFound,
+					Message:    "requested model is unavailable for all configured Codex auths",
+				}
+			}
+			allowed = make(map[string]struct{}, len(supportingAuths))
+			for _, authID := range supportingAuths {
+				allowed[authID] = struct{}{}
+			}
 		}
 	}
 	aggregate := failureAggregate{}
@@ -613,6 +631,7 @@ func (t *proxyAttemptTransport) RoundTrip(base *http.Request) (*http.Response, e
 		t.authorization,
 		t.signals,
 		t.model,
+		requestClientVersion(t.incoming, t.server.cfg),
 		t.replayable,
 		t.roundTrip,
 	)

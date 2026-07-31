@@ -36,7 +36,7 @@ file.
 | `max-retry-interval` | `30` | Maximum seconds to wait for the nearest credential cooldown before another round. `0` disables cooldown waiting. |
 | `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Upstream base for Codex Responses-compatible routes. |
 | `chatgpt-base-url` | `https://chatgpt.com/backend-api` | Upstream base for file, account, and hosted MCP compatibility routes. |
-| `codex-user-agent` | empty | Upstream User-Agent override. Empty forwards the client value or uses a Codex CLI fallback. |
+| `codex-user-agent` | empty | Upstream User-Agent override. Its version is used by `/v1/models` when `client_version` is absent or empty; an unparseable value falls back to the bundled Codex CLI version. |
 | `codex-beta-features` | empty | Fallback `x-codex-beta-features` header when the client did not provide one. |
 | `codex-refresh-token-url` | empty | OAuth refresh endpoint override. Empty uses `https://auth.openai.com/oauth/token`. |
 
@@ -173,6 +173,26 @@ rejected merely because replay is unavailable. Eligible buffered requests may
 be repeated after an ambiguous network failure, which accepts a rare duplicate
 generation or billing risk in favor of availability.
 
+## Runtime Model Catalogs
+
+Runtime synchronization is always enabled; there is no static-only flag.
+`/v1/models?client_version=<version>` fetches the authenticated upstream catalog
+for each active logical credential. Without `client_version`, or with an empty
+value, the server derives the version from `codex-user-agent`; when that setting
+is empty or has no parseable product version, it uses the bundled Codex CLI
+version.
+
+Client versions are trimmed, limited to 64 bytes, and restricted to safe
+letters, digits, `.`, `-`, `_`, and `+`. Invalid values return `400`. The server
+keeps successful per-auth snapshots in memory for three hours and retains at
+most 16 client versions by least-recently-used order.
+
+One failed auth does not hide successful catalogs from other auths. Stale
+per-auth data remains usable, and a deduplicated background refresh gets three
+additional attempts with backoff, jitter, and `Retry-After`. If every auth lacks
+a usable snapshot, the embedded catalog is returned. Catalog payloads are not
+stored in SQLite.
+
 ## Managed Users and Database
 
 The SQLite database stores:
@@ -281,6 +301,6 @@ The `codex-base-url`, `chatgpt-base-url`, and
 `codex-refresh-token-url` settings are primarily useful for controlled testing
 or alternate network routing. Values must include a URL scheme and host.
 
-`codex-user-agent` and `codex-beta-features` override compatibility headers only
-when their configured behavior applies. Normal client headers are otherwise
-preserved where supported.
+`codex-user-agent` overrides the compatibility header and supplies the default
+model catalog version. `codex-beta-features` overrides its compatibility header
+only when configured. Other client headers are preserved where supported.

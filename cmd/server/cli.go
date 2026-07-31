@@ -23,7 +23,7 @@ type cli struct {
 
 type serveCommand struct {
 	ConfigPath string `name:"config" default:"${default_config}" help:"Configuration file path."`
-	LocalModel bool   `name:"local-model" help:"Accepted for compatibility; codex-oauth-proxy uses embedded models."`
+	LocalModel bool   `name:"local-model" help:"Accepted for compatibility; runtime model synchronization is always enabled."`
 }
 
 type commandRuntime struct {

@@ -387,7 +387,8 @@ Returns totals from `00:00:00` UTC through the current usage bucket:
 
 ### `GET /v1/models`
 
-Without `client_version`, returns an OpenAI-style model list:
+Without `client_version`, returns an OpenAI-style view of the synchronized
+catalog for the version derived from `codex-user-agent`:
 
 ```json
 {
@@ -402,16 +403,28 @@ Without `client_version`, returns an OpenAI-style model list:
 }
 ```
 
-When the `client_version` query key is present, the response uses the embedded
-Codex CLI model catalog shape:
+When the `client_version` query key is present, the response uses the Codex CLI
+catalog shape for that exact normalized version. An empty value uses the same
+configured User-Agent version:
 
 ```json
 {"models":[]}
 ```
 
-The actual list comes from
-`internal/codexonly/codex_client_models.json`. Fast tier metadata is removed
-unless `allow-fast-mode` is enabled.
+On a cold or expired version, the proxy concurrently fetches the authenticated
+upstream catalog for every active logical credential, waits for all results, and
+returns the deterministic union of model slugs. One complete per-auth object is
+selected for duplicate slugs; fields are not merged across accounts.
+
+Successful per-auth snapshots have a three-hour TTL. Failed refreshes reuse
+stale snapshots and schedule one deduplicated background task with three
+additional retries. One failed auth does not block successful auths. If no auth
+has a usable snapshot, the response falls back to
+`internal/codexonly/codex_client_models.json`.
+
+Versions are limited to 64 safe ASCII bytes, and invalid values return `400`.
+At most 16 normalized versions are retained in memory with LRU eviction. Fast
+tier metadata is removed unless `allow-fast-mode` is enabled.
 
 ### `POST /v1/chat/completions`
 

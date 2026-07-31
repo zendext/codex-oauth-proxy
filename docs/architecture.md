@@ -21,7 +21,8 @@ storage backends.
 | `internal/codexonly/auth_health.go` | Global credential health, model exclusions, cooldown reconciliation, and authoritative-state persistence. |
 | `internal/codexonly/refresh.go` | OAuth refresh and outbound HTTP transport construction. |
 | `internal/codexonly/failover.go` | Replay eligibility, upstream response classification, retry layers, and deterministic aggregate errors. |
-| `internal/codexonly/server.go` | Routing, authentication, model catalog, headers, HTTP reverse proxy, and management/user handlers. |
+| `internal/codexonly/models.go` | Per-auth runtime model synchronization, version LRU, aggregation, and embedded fallback. |
+| `internal/codexonly/server.go` | Routing, authentication, headers, HTTP reverse proxy, and management/user handlers. |
 | `internal/codexonly/chat_completions.go` | Chat Completions to Responses conversion and response translation. |
 | `internal/codexonly/user_store.go` | SQLite schema, users, API keys, and authentication. |
 | `internal/codexonly/session_affinity.go` | Bounded signal extraction, digesting, persistent binding, renewal, and CAS rebind. |
@@ -153,6 +154,42 @@ exclusions remain in memory. Credential-state fingerprints invalidate persisted
 credential failures after real token material changes, while same-account token
 updates preserve unexpired quota deadlines.
 
+## Runtime Model Catalogs
+
+`GET /v1/models` synchronizes the authenticated Codex `/models` endpoint for
+every active stable auth ID and the normalized Codex CLI version. A cold or
+expired request starts those per-auth fetches concurrently and waits for every
+auth to resolve. Concurrent misses for the same auth and version share one
+foreground fetch.
+
+Successful per-auth snapshots remain fresh for three hours. The in-memory cache
+keeps at most 16 normalized client versions and evicts the least recently used
+version. Model payloads are never written to SQLite. Removed auth identities are
+pruned from every cached version.
+
+Aggregation exposes the union of model slugs. Duplicate slugs select one
+complete canonical object by stable auth ID and deterministic model encoding;
+fields from different accounts are never combined. A separate sorted support
+set records which auth IDs advertised each slug. When a synchronized support set
+exists for the request's Codex client version, routing preserves a healthy bound
+auth only if it supports the requested model. Otherwise the existing affinity
+CAS rebind moves the whole session to a healthy supporting auth. Model name
+remains outside the affinity key.
+
+A failed refresh reuses that auth's last successful snapshot when available.
+Otherwise its unique models are absent from the current union. One deduplicated
+background task performs up to three additional retries with exponential
+backoff, jitter, and `Retry-After`. The catalog retry budget is independent from
+proxy request retries. An exhausted cycle reopens only after the auth is proven
+healthy, the next three-hour refresh period begins, or another client version
+is requested.
+
+Model fetch `401` responses use coordinated same-auth OAuth refresh and one
+retry. Continued `401` and `429` responses update the shared auth health and
+cooldown state but never mutate session bindings by themselves. If no auth has
+a usable snapshot, the embedded release catalog is returned as the final
+fallback; it does not claim per-auth support for routing.
+
 ## Authentication Boundaries
 
 The incoming managed API key and the outgoing OAuth access token are separate
@@ -239,7 +276,7 @@ The HTTP handler checks project-owned routes before the reverse proxy whitelist.
 | `/v0/local-admin/*` | Loopback administration |
 | `/v0/management/*` | Admin-key management API |
 | `/v0/user/*` | Managed user self-service API |
-| `/v1/models` | Embedded model catalog |
+| `/v1/models` | Runtime per-auth model aggregation with embedded fallback |
 | `/v1/chat/completions` | Local protocol conversion |
 | Whitelisted `/v1/*` | Codex upstream reverse proxy |
 | Selected `/backend-api/*` | Codex CLI compatibility reverse proxy |
@@ -253,8 +290,9 @@ For a whitelisted proxy request:
 
 1. Authenticate the incoming managed key or permitted OAuth compatibility token.
 2. Reject Fast service tiers when Fast mode is disabled.
-3. Reconcile auth files and global health, then resolve healthy session affinity
-   or choose the next eligible credential.
+3. Reconcile auth files and global health, apply synchronized model support when
+   available, then resolve healthy session affinity or choose the next eligible
+   credential.
 4. Rewrite the target URL to the configured Codex or ChatGPT base.
 5. Replace `Authorization` with the selected OAuth access token.
 6. Add the ChatGPT account ID and compatibility headers when available.

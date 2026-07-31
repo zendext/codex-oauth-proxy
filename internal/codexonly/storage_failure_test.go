@@ -304,6 +304,51 @@ func TestRuntimeAuthHealthSQLiteFailuresSignalFatal(t *testing.T) {
 	})
 }
 
+func TestRuntimeModelCatalogHealthWriteFailureReturnsFatal(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []map[string]any{{
+			"slug":         "runtime-model",
+			"display_name": "Runtime Model",
+		}}})
+	}))
+	defer upstream.Close()
+
+	server := newStorageFailureTestServer(
+		t,
+		upstream.URL+"/backend-api/codex",
+		upstream.URL+"/backend-api",
+	)
+	auths, err := server.auths.Store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load auths: %v", err)
+	}
+	err = server.health.MarkUnavailable(context.Background(), auths[0], AuthHealthState{
+		Kind:       AuthHealthTransient,
+		Reason:     "temporary",
+		RetryAt:    time.Now().Add(time.Minute),
+		StatusCode: http.StatusServiceUnavailable,
+	})
+	if err != nil {
+		t.Fatalf("seed auth health state: %v", err)
+	}
+	if err = server.users.db.Close(); err != nil {
+		t.Fatalf("close SQLite database: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.146.0", nil)
+	req.Header.Set("Authorization", "Bearer access-1")
+	resp := httptest.NewRecorder()
+	server.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body: %s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "runtime-model") {
+		t.Fatalf("fatal response included successful model catalog: %s", resp.Body.String())
+	}
+	assertFatalStorageError(t, server.FatalErrors())
+}
+
 func TestExpectedStoreErrorsDoNotSignalFatal(t *testing.T) {
 	server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
 	store := server.users
