@@ -1,9 +1,13 @@
 package codexonly
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +20,106 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+func TestFatalStorageFailureWinsBeforeSuccessfulResponseCommit(t *testing.T) {
+	server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
+	server.cfg.Debug = true
+	writer := newBlockingHeaderResponseWriter()
+	req := httptest.NewRequest(http.MethodGet, "/v0/local-admin/users", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	handlerDone := make(chan struct{})
+	var logs bytes.Buffer
+	restore := captureStandardLogger(t, &logs)
+	defer restore()
+
+	go func() {
+		defer close(handlerDone)
+		server.ServeHTTP(writer, req)
+	}()
+
+	select {
+	case <-writer.headerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for successful handler response")
+	}
+
+	fatalErr := server.users.databaseError("injected runtime read", errors.New("injected SQLite failure"))
+	if !errors.Is(fatalErr, ErrStorageFailure) {
+		t.Fatalf("databaseError = %v, want ErrStorageFailure", fatalErr)
+	}
+	close(writer.allowHeader)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for handler completion")
+	}
+
+	if writer.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body: %s", writer.Code, writer.Body.String())
+	}
+	if bytes.Contains(writer.Body.Bytes(), []byte(`"users"`)) {
+		t.Fatalf("fatal response committed successful body: %s", writer.Body.String())
+	}
+	if !strings.Contains(logs.String(), "status=500") {
+		t.Fatalf("debug log did not record fatal status:\n%s", logs.String())
+	}
+	assertFatalStorageError(t, server.FatalErrors())
+}
+
+func TestStorageResponseWriterBlocksImplicitCommitsAfterFatal(t *testing.T) {
+	t.Run("write", func(t *testing.T) {
+		failures := failedStorageState()
+		recorder := httptest.NewRecorder()
+		writer := newStorageResponseWriter(recorder, failures)
+		successBody := []byte(`{"ok":true}`)
+
+		written, err := writer.Write(successBody)
+		if err != nil {
+			t.Fatalf("Write returned error: %v", err)
+		}
+		if written != len(successBody) {
+			t.Fatalf("Write count = %d, want %d", written, len(successBody))
+		}
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", recorder.Code)
+		}
+		if bytes.Contains(recorder.Body.Bytes(), successBody) {
+			t.Fatalf("fatal response committed successful body: %s", recorder.Body.String())
+		}
+	})
+
+	t.Run("flush", func(t *testing.T) {
+		failures := failedStorageState()
+		recorder := httptest.NewRecorder()
+		writer := newStorageResponseWriter(recorder, failures)
+
+		writer.Flush()
+
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", recorder.Code)
+		}
+		if !recorder.Flushed {
+			t.Fatal("underlying response was not flushed")
+		}
+	})
+
+	t.Run("hijack", func(t *testing.T) {
+		failures := failedStorageState()
+		underlying := &trackingHijackResponseWriter{ResponseRecorder: httptest.NewRecorder()}
+		writer := newStorageResponseWriter(underlying, failures)
+
+		_, _, err := writer.Hijack()
+		if !errors.Is(err, ErrStorageFailure) {
+			t.Fatalf("Hijack error = %v, want ErrStorageFailure", err)
+		}
+		if underlying.hijacked {
+			t.Fatal("underlying response was hijacked after fatal storage error")
+		}
+		if underlying.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", underlying.Code)
+		}
+	})
+}
 
 func TestOpenUserStoreFailsForSQLiteStartupErrors(t *testing.T) {
 	t.Run("unavailable path", func(t *testing.T) {
@@ -300,4 +404,43 @@ func assertFatalStorageError(t *testing.T, fatalErrors <-chan error) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for fatal storage error")
 	}
+}
+
+func failedStorageState() *storageFailureState {
+	failures := newStorageFailureState(nil)
+	failures.report(fmt.Errorf("%w: injected SQLite failure", ErrStorageFailure))
+	return failures
+}
+
+type trackingHijackResponseWriter struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (w *trackingHijackResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.hijacked = true
+	return nil, nil, nil
+}
+
+type blockingHeaderResponseWriter struct {
+	*httptest.ResponseRecorder
+	headerStarted chan struct{}
+	allowHeader   chan struct{}
+	headerOnce    sync.Once
+}
+
+func newBlockingHeaderResponseWriter() *blockingHeaderResponseWriter {
+	return &blockingHeaderResponseWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		headerStarted:    make(chan struct{}),
+		allowHeader:      make(chan struct{}),
+	}
+}
+
+func (w *blockingHeaderResponseWriter) Header() http.Header {
+	w.headerOnce.Do(func() {
+		close(w.headerStarted)
+		<-w.allowHeader
+	})
+	return w.ResponseRecorder.Header()
 }

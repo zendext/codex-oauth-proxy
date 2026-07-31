@@ -57,6 +57,20 @@ func (s *storageFailureState) channel() <-chan error {
 	return s.errors
 }
 
+func (s *storageFailureState) commit(commit func()) error {
+	if s == nil {
+		commit()
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	commit()
+	return nil
+}
+
 func expectedStoreError(err error) bool {
 	return errors.Is(err, ErrInvalidInput) ||
 		errors.Is(err, ErrDuplicateUserName) ||

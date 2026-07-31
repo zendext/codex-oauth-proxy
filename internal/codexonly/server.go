@@ -216,6 +216,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cancel()
 	}()
 	r = r.WithContext(requestCtx)
+	var recorder *debugResponseWriter
+	if s.debugEnabled() {
+		recorder = &debugResponseWriter{ResponseWriter: w}
+		w = recorder
+	}
+	w = newStorageResponseWriter(w, s.users.failures)
 	if s.ctx.Err() != nil {
 		if fatalErr := s.users.failures.current(); fatalErr != nil {
 			writeStoreError(w, fatalErr)
@@ -224,9 +230,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
 		return
 	}
-	if s.debugEnabled() {
+	if recorder != nil {
 		start := time.Now()
-		recorder := &debugResponseWriter{ResponseWriter: w}
 		route, routeOK := s.proxyRoute(r.URL.Path)
 		s.debugf(
 			"request received method=%s path=%s route=%s remote=%s user_agent=%q token_sources=%s",
@@ -246,7 +251,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				time.Since(start).Milliseconds(),
 			)
 		}()
-		s.serveHTTP(recorder, r, route, routeOK)
+		s.serveHTTP(w, r, route, routeOK)
 		return
 	}
 	route, routeOK := s.proxyRoute(r.URL.Path)
@@ -963,6 +968,10 @@ func safeURLString(raw *url.URL) string {
 type debugResponseWriter struct {
 	http.ResponseWriter
 	status int
+}
+
+func (w *debugResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *debugResponseWriter) WriteHeader(status int) {
