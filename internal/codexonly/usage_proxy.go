@@ -157,6 +157,8 @@ func (c *usageCaptureReadCloser) flushUsageLine() {
 
 func (s *Server) shouldRecordUsage(authorization proxyAuthorization) bool {
 	return s != nil &&
+		s.ctx != nil &&
+		s.ctx.Err() == nil &&
 		s.users != nil &&
 		authorization.Credential != nil &&
 		usageTrackingEnabled(s.cfg)
@@ -202,7 +204,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 			capture.RetryAfter,
 		)
 	}
-	err := s.users.RecordUsage(context.Background(), UsageRecordParams{
+	err := s.users.RecordUsage(s.ctx, UsageRecordParams{
 		Timestamp:       time.Now().UTC(),
 		User:            credential.User,
 		APIKey:          credential.APIKey,
@@ -589,6 +591,8 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 			_ = upstreamConn.Close()
 		})
 	}
+	stopShutdown := context.AfterFunc(r.Context(), closeBoth)
+	defer stopShutdown()
 
 	go func() {
 		defer func() {

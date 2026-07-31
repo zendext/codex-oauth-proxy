@@ -34,11 +34,28 @@
 3. 解析 `auth-dir` 并验证两个上游 Base URL。
 4. 构建上游 Client 和带超时的 OAuth 刷新 Client。
 5. 扫描认证目录以验证可读性。
-6. 解析 SQLite 路径并执行幂等 Schema Migration。
+6. 解析 SQLite 路径、执行幂等 Schema Migration，并验证初始持久化用户状态。
 7. 启动一个 `net/http` 服务器。
 
 服务器将 `ReadHeaderTimeout` 设置为 10 秒。它不会设置可能中断已建立 Stream
-或 WebSocket 流量的 Read/Write Timeout。优雅关闭超时为 10 秒。
+或 WebSocket 流量的 Read/Write Timeout。优雅关闭超时为 10 秒；超过该期限后，
+会强制关闭剩余 HTTP 连接。
+
+## 存储故障生命周期
+
+SQLite 是进程级硬依赖。数据库路径、打开、Migration 或初始状态加载失败都会
+阻止启动。
+
+运行期间，第一个非预期 SQLite 读写故障会成为进程级致命错误。它会取消活动的
+代理请求 Context、关闭已建立 WebSocket 桥接的两端、启动有界 HTTP 关闭，并使
+服务器进程带错误退出。后续并发故障会复用第一个致命错误，不会启动额外关闭
+流程。
+
+预期应用错误不会触发该生命周期，包括无效输入、记录不存在、凭据已禁用或
+无效、已处理的约束冲突以及已取消的请求 Context。
+
+进程不提供降级、仅内存或自动数据库恢复。生产部署必须使用 systemd、Docker、
+Kubernetes 或其他外部 Supervisor，在修复底层 SQLite 问题后重启进程。
 
 ## OAuth 凭据流
 
@@ -125,8 +142,9 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 7. 转发 HTTP Stream 响应或桥接 WebSocket Frame。
 8. 为托管用户请求采集用量元数据。
 
-代理会保持已建立的 HTTP Stream。WebSocket 转发使用 Gorilla WebSocket，并在
-上游 Upgrade 路径强制使用 HTTP/1.1 ALPN。
+正常运行期间，代理会保持已建立的 HTTP Stream。WebSocket 转发使用 Gorilla
+WebSocket，并在上游 Upgrade 路径强制使用 HTTP/1.1 ALPN。服务器关闭或发生
+致命存储故障时，会取消已建立的 Stream 并关闭 WebSocket 两端。
 
 ## Chat Completions 转换
 

@@ -128,7 +128,13 @@ func usageConfigTrackingEnabled(cfg UsageConfig) bool {
 }
 
 func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, cfg UsageConfig) error {
-	if s == nil || s.db == nil || !usageConfigTrackingEnabled(cfg) {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	if err := s.checkReady(); err != nil {
+		return err
+	}
+	if !usageConfigTrackingEnabled(cfg) {
 		return nil
 	}
 	if strings.TrimSpace(params.User.ID) == "" || strings.TrimSpace(params.APIKey.ID) == "" {
@@ -165,7 +171,7 @@ func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, c
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin record usage: %w", err)
+		return s.databaseError("begin record usage", err)
 	}
 	defer rollbackUnlessCommitted(tx)
 
@@ -209,21 +215,21 @@ func (s *UserStore) RecordUsage(ctx context.Context, params UsageRecordParams, c
 		updatedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("upsert usage bucket: %w", err)
+		return s.databaseError("upsert usage bucket", err)
 	}
 
 	if err = pruneUsageData(ctx, tx, timestamp); err != nil {
-		return err
+		return s.databaseError("prune usage data", err)
 	}
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit record usage: %w", err)
+		return s.databaseError("commit record usage", err)
 	}
 	return nil
 }
 
 func (s *UserStore) GetTodayUsage(ctx context.Context, userID string, apiKeyID string, now time.Time) (UserUsageToday, error) {
-	if s == nil || s.db == nil {
-		return UserUsageToday{}, ErrInvalidInput
+	if err := s.checkReady(); err != nil {
+		return UserUsageToday{}, err
 	}
 	now = now.UTC()
 	if now.IsZero() {
@@ -233,11 +239,11 @@ func (s *UserStore) GetTodayUsage(ctx context.Context, userID string, apiKeyID s
 	dayEnd := dayStart.Add(24 * time.Hour)
 	counters, err := s.aggregateUsageRange(ctx, strings.TrimSpace(userID), strings.TrimSpace(apiKeyID), dayStart, dayEnd)
 	if err != nil {
-		return UserUsageToday{}, err
+		return UserUsageToday{}, s.databaseError("read today usage", err)
 	}
 	models, err := aggregateUsageDimensionsRange(ctx, s.db, strings.TrimSpace(userID), strings.TrimSpace(apiKeyID), dayStart, dayEnd)
 	if err != nil {
-		return UserUsageToday{}, err
+		return UserUsageToday{}, s.databaseError("read today usage dimensions", err)
 	}
 	return UserUsageToday{
 		UserID:        strings.TrimSpace(userID),
@@ -249,8 +255,8 @@ func (s *UserStore) GetTodayUsage(ctx context.Context, userID string, apiKeyID s
 }
 
 func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFilter, now time.Time, cfg UsageConfig) ([]ManagementUsageEntry, error) {
-	if s == nil || s.db == nil {
-		return nil, ErrInvalidInput
+	if err := s.checkReady(); err != nil {
+		return nil, err
 	}
 	now = now.UTC()
 	if now.IsZero() {
@@ -277,7 +283,7 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list usage snapshot identities: %w", err)
+		return nil, s.databaseError("list usage snapshot identities", err)
 	}
 	defer rows.Close()
 
@@ -285,15 +291,15 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 	for rows.Next() {
 		var entry ManagementUsageEntry
 		if errScan := rows.Scan(&entry.UserID, &entry.Name, &entry.APIKeyID, &entry.KeyHash, &entry.MaskedKey); errScan != nil {
-			return nil, fmt.Errorf("scan usage snapshot identity: %w", errScan)
+			return nil, s.databaseError("scan usage snapshot identity", errScan)
 		}
 		identities = append(identities, entry)
 	}
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("list usage snapshot rows: %w", err)
+		return nil, s.databaseError("list usage snapshot rows", err)
 	}
 	if err = rows.Close(); err != nil {
-		return nil, fmt.Errorf("close usage snapshot rows: %w", err)
+		return nil, s.databaseError("close usage snapshot rows", err)
 	}
 
 	entries := make([]ManagementUsageEntry, 0, len(identities))
@@ -303,13 +309,13 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 			start := usageWindowStart(now, spec.bucketCount)
 			counters, errAggregate := s.aggregateUsageRange(ctx, entry.UserID, entry.APIKeyID, start, windowEnd)
 			if errAggregate != nil {
-				return nil, errAggregate
+				return nil, s.databaseError("read usage snapshot window", errAggregate)
 			}
 			entry.Windows[spec.name] = buildUsageWindow(counters)
 		}
 		models, errModels := s.usageDimensionsSnapshot(ctx, entry.UserID, entry.APIKeyID, sevenDayStart, windowEnd, now, cfg)
 		if errModels != nil {
-			return nil, errModels
+			return nil, s.databaseError("read usage snapshot dimensions", errModels)
 		}
 		entry.Models = models
 		entries = append(entries, entry)
@@ -318,8 +324,8 @@ func (s *UserStore) GetUsageSnapshot(ctx context.Context, filter UsageSnapshotFi
 }
 
 func (s *UserStore) GetUsageTimeseries(ctx context.Context, params UsageTimeseriesParams, cfg UsageConfig) (UsageTimeseries, error) {
-	if s == nil || s.db == nil {
-		return UsageTimeseries{}, ErrInvalidInput
+	if err := s.checkReady(); err != nil {
+		return UsageTimeseries{}, err
 	}
 	now := params.Now.UTC()
 	if now.IsZero() {
@@ -343,7 +349,7 @@ func (s *UserStore) GetUsageTimeseries(ctx context.Context, params UsageTimeseri
 	}
 	points, err := s.queryUsageTimeseries(ctx, start, end, step, groupBy, strings.TrimSpace(params.UserID), strings.TrimSpace(params.APIKeyID))
 	if err != nil {
-		return UsageTimeseries{}, err
+		return UsageTimeseries{}, s.databaseError("read usage timeseries", err)
 	}
 	if fill == "zero" {
 		points = fillUsageTimeseriesZeros(points, start, end, step)

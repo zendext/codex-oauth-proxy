@@ -83,7 +83,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	return 0
 }
 
-func (c *serveCommand) Run(runtime *commandRuntime) error {
+func (c *serveCommand) Run(runtime *commandRuntime) (err error) {
 	_ = c.LocalModel
 	fmt.Fprintf(runtime.stdout, "codex-oauth-proxy Version: %s, Commit: %s, BuiltAt: %s\n", Version, Commit, BuildDate)
 	configPath := c.ConfigPath
@@ -103,6 +103,11 @@ func (c *serveCommand) Run(runtime *commandRuntime) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if errClose := handler.Close(); errClose != nil {
+			err = errors.Join(err, fmt.Errorf("close handler: %w", errClose))
+		}
+	}()
 
 	server := &http.Server{
 		Addr:              codexonly.ListenAddr(cfg),
@@ -120,24 +125,52 @@ func (c *serveCommand) Run(runtime *commandRuntime) error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
+	return waitForServer(runtime, server, handler, errCh, sigCh, 10*time.Second)
+}
+
+type serverLifecycle interface {
+	FatalErrors() <-chan error
+	Shutdown()
+}
+
+func waitForServer(
+	runtime *commandRuntime,
+	server *http.Server,
+	handler serverLifecycle,
+	errCh <-chan error,
+	sigCh <-chan os.Signal,
+	shutdownTimeout time.Duration,
+) error {
 	select {
 	case sig := <-sigCh:
 		fmt.Fprintf(runtime.stdout, "received %s, shutting down\n", sig)
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err = server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shutdown failed: %w", err)
-		}
-	case err = <-errCh:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("server failed: %w", err)
+		return shutdownHTTPServer(server, handler, shutdownTimeout)
+	case errFatal := <-handler.FatalErrors():
+		errShutdown := shutdownHTTPServer(server, handler, shutdownTimeout)
+		return errors.Join(fmt.Errorf("storage failed: %w", errFatal), errShutdown)
+	case errServer := <-errCh:
+		if errServer != nil && !errors.Is(errServer, http.ErrServerClosed) {
+			return fmt.Errorf("server failed: %w", errServer)
 		}
 	case <-runtime.ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err = server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shutdown failed: %w", err)
+		return shutdownHTTPServer(server, handler, shutdownTimeout)
+	}
+	return nil
+}
+
+func shutdownHTTPServer(server *http.Server, handler serverLifecycle, timeout time.Duration) error {
+	handler.Shutdown()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		errClose := server.Close()
+		if errClose != nil {
+			return errors.Join(
+				fmt.Errorf("shutdown failed: %w", err),
+				fmt.Errorf("force close failed: %w", errClose),
+			)
 		}
+		return fmt.Errorf("shutdown failed: %w", err)
 	}
 	return nil
 }
