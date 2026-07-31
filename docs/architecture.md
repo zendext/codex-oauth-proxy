@@ -44,21 +44,30 @@ Graceful shutdown has a 10-second timeout.
 
 ## OAuth Credential Flow
 
-`FileAuthStore` recursively scans the configured directory on selection rather
-than keeping a long-lived in-memory token snapshot.
+`FileAuthStore` recursively scans the configured directory on selection and
+reconciles the result with the previous successful scan.
 
 For every upstream request:
 
-1. Load active Codex auth files.
-2. Sort them by relative file ID.
-3. Select the next file in round-robin order.
-4. Treat credentials expiring within five minutes as expired.
-5. Refresh an expired credential with its refresh token.
-6. Write refreshed values back to the same JSON shape and file.
-7. Forward the request with the selected access token and account ID.
+1. Parse Codex auth files, including disabled records for reconciliation.
+2. Resolve stable identity from `account_id`, token claims, or a normalized path
+   fallback.
+3. Group duplicate files for one account into one logical credential.
+4. Sort selectable logical credentials by stable identity.
+5. Select the next logical credential in round-robin order.
+6. Treat credentials expiring within five minutes as expired.
+7. Refresh an expired credential and reparse account and email claims.
+8. Write refreshed values back to the selected source file.
+9. Forward the request with the selected access token and account ID.
 
-This model allows file additions, removals, disables, and external token updates
-to be observed without a config reload.
+Reconciliation reports additions, removals, credential changes, metadata
+changes, eligibility changes, and source-file changes without including token
+contents. Stable account IDs survive file renames and same-account token
+replacement. Replacing one path with another account produces an old-identity
+removal and a new-identity addition. Disabled logical credentials remain known
+but are excluded from new selection. A five-second parse-error grace retains the
+last good representation during partial editor writes; persistently malformed
+files are then excluded.
 
 ## Authentication Boundaries
 
@@ -184,7 +193,7 @@ logical bucket key contains:
 - Model.
 - Reasoning effort.
 - Service tier.
-- OAuth auth file ID.
+- Stable OAuth credential ID.
 
 Counters are added with an SQLite upsert. New writes prune buckets older than
 the 30-day retention window.

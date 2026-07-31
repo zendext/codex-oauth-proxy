@@ -102,6 +102,7 @@ func (r *Refresher) Refresh(ctx context.Context, auth *Auth) error {
 	if parsed.ExpiresIn > 0 {
 		auth.ExpiresAt = now().Add(time.Duration(parsed.ExpiresIn) * time.Second)
 	}
+	auth.ReparseIdentity()
 	if err = auth.Save(); err != nil {
 		return fmt.Errorf("save refreshed auth: %w", err)
 	}

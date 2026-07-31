@@ -87,15 +87,35 @@ Supported records include:
 Files are ignored when they:
 
 - Are not JSON files.
-- Cannot be parsed.
 - Declare a non-Codex `type`.
 - Do not look like either supported Codex format.
-- Set `disabled: true`.
 - Contain neither an access token nor a refresh token.
 
-When multiple credentials are active, requests select them in sorted-file
-round-robin order. A credential expiring within five minutes is refreshed before
-use. Updated tokens are written back to the source file.
+Credentials use `account_id` as their stable identity. When that field is
+missing, the loader attempts to recover `chatgpt_account_id` and email metadata
+from the ID token and then the access token. If no account claim is available,
+the normalized relative file path is used as a compatibility identity. Such an
+unidentified credential remains eligible for proxy traffic but is not an
+account-targetable management resource. Runtime and usage IDs use
+`account:<account_id>` for identified credentials and
+`path:<normalized-relative-path>` for compatibility credentials.
+
+Multiple files resolving to the same account form one logical credential and
+therefore one round-robin slot. Logical credentials are sorted by stable
+identity, so file renames and token replacement do not change account ordering.
+Records marked `disabled: true` remain part of reconciliation but are excluded
+from new request selection when no enabled source for that account remains.
+
+The directory is rescanned during request-time auth loading. Additions,
+removals, renames, external token updates, and disabled changes are observed
+without restarting the process. If a previously valid file becomes malformed,
+its last successfully parsed representation is retained for five seconds. A
+file that remains malformed after that grace period is reported by
+reconciliation and excluded.
+
+A credential expiring within five minutes is refreshed before use. Updated
+tokens are written back to the selected source file, and account and email
+claims are reparsed from refreshed tokens.
 
 ## Managed Users and Database
 
