@@ -260,6 +260,39 @@ func TestChatCompletionsCommittedFailuresEmitSanitizedSSEError(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsStreamUsesPrefetchedResponseIdentity(t *testing.T) {
+	server, apiKey := newChatTerminalTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeChatUpstreamSSE(w,
+			`{"type":"response.created","response":{"id":"resp_upstream","model":"upstream-model"}}`,
+			`{"type":"response.output_text.delta","delta":"ok"}`,
+			`{"type":"response.completed","response":{"id":"resp_upstream","model":"upstream-model"}}`,
+		)
+	}, nil)
+
+	resp := doJSONRequest(t, server, http.MethodPost, "/v1/chat/completions", chatTerminalRequestBody(true, "request-model"), apiKey)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	events := chatStreamDataLines(resp.Body.String())
+	if len(events) < 4 {
+		t.Fatalf("stream events = %#v, want role, text, finish, done", events)
+	}
+	for index, event := range events[:len(events)-1] {
+		chunk := decodeChatStreamChunk(t, event)
+		if chunk.ID != "resp_upstream" || chunk.Model != "upstream-model" {
+			t.Fatalf("chunk #%d identity = %q/%q, want resp_upstream/upstream-model: %s", index, chunk.ID, chunk.Model, resp.Body.String())
+		}
+	}
+	roleChunk := decodeChatStreamChunk(t, events[0])
+	if len(roleChunk.Choices) != 1 || roleChunk.Choices[0].Delta.Role != "assistant" {
+		t.Fatalf("first chunk = %#v, want assistant role", roleChunk)
+	}
+	textChunk := decodeChatStreamChunk(t, events[1])
+	if len(textChunk.Choices) != 1 || textChunk.Choices[0].Delta.Content != "ok" {
+		t.Fatalf("second chunk = %#v, want first text delta after role", textChunk)
+	}
+}
+
 func TestChatCompletionsRejectsMalformedTerminalSequences(t *testing.T) {
 	tests := []struct {
 		name   string

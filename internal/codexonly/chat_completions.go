@@ -78,6 +78,11 @@ type chatStreamFailure struct {
 	body       []byte
 }
 
+type preparedChatCompletionStreamBody struct {
+	*replayReadCloser
+	firstEvent sseEvent
+}
+
 func (e *chatStreamFailure) Error() string {
 	return "upstream Responses stream failed"
 }
@@ -593,22 +598,22 @@ func (s *Server) streamChatCompletion(
 	stopSequences []string,
 	cancelUpstream context.CancelFunc,
 ) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(map[string]any{"role": "assistant"}, nil, nil, false)); errWrite != nil {
-		cancelUpstream()
-		s.recordChatCompletionUsage(r, authorization, auth, metadata, UsageCounters{}, false, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
-		return
+	var firstUpdate *chatStreamUpdate
+	if preparedBody, ok := upstreamResp.Body.(*preparedChatCompletionStreamBody); ok {
+		update, err := state.applyResponsesEvent(preparedBody.firstEvent, true)
+		if err != nil {
+			finalErr, statusCode := chatProxyErrorFromStreamError(err, metadata.Model)
+			s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusCode, usageRequestID(r, upstreamResp), chatOutcomeUpstreamFailure)
+			writeProxyError(w, finalErr)
+			cancelUpstream()
+			return
+		}
+		firstUpdate = &update
 	}
 
 	var writeErr error
 	stopFilter := newChatStopFilter(stopSequences)
-	readErr := readResponsesSSE(upstreamResp.Body, func(event sseEvent) error {
-		update, err := state.applyResponsesEvent(event, true)
-		if err != nil {
-			return err
-		}
+	emitUpdate := func(update chatStreamUpdate) error {
 		if update.ResponseID != "" {
 			state.id = update.ResponseID
 		}
@@ -641,6 +646,30 @@ func (s *Server) streamChatCompletion(
 			s.debugf("chat completions unknown incomplete reason=%s", safeChatLogValue(update.UnknownReason))
 		}
 		return nil
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(map[string]any{"role": "assistant"}, nil, nil, false)); errWrite != nil {
+		cancelUpstream()
+		s.recordChatCompletionUsage(r, authorization, auth, metadata, UsageCounters{}, false, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+		return
+	}
+
+	if firstUpdate != nil {
+		if errEmit := emitUpdate(*firstUpdate); errEmit != nil {
+			s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+			return
+		}
+	}
+
+	readErr := readResponsesSSE(upstreamResp.Body, func(event sseEvent) error {
+		update, err := state.applyResponsesEvent(event, true)
+		if err != nil {
+			return err
+		}
+		return emitUpdate(update)
 	})
 	if readErr != nil && state.terminal && !isChatStreamFailure(readErr) {
 		readErr = nil
@@ -1436,7 +1465,7 @@ func prepareChatCompletionUpstreamResponse(ctx context.Context, resp *http.Respo
 	originalBody := resp.Body
 	reader := newResponsesSSEReader(originalBody)
 	if streaming {
-		event, raw, err := reader.next()
+		event, _, err := reader.next()
 		if err != nil {
 			if ctx.Err() != nil {
 				_ = originalBody.Close()
@@ -1448,9 +1477,12 @@ func prepareChatCompletionUpstreamResponse(ctx context.Context, resp *http.Respo
 		if _, err = state.applyResponsesEvent(event, true); err != nil {
 			return replaceChatCompletionResponse(resp, chatStreamFailureFromError(err)), nil
 		}
-		resp.Body = &replayReadCloser{
-			Reader:  io.MultiReader(bytes.NewReader(raw), reader.buffered),
-			closers: []io.Closer{originalBody},
+		resp.Body = &preparedChatCompletionStreamBody{
+			replayReadCloser: &replayReadCloser{
+				Reader:  reader.buffered,
+				closers: []io.Closer{originalBody},
+			},
+			firstEvent: event,
 		}
 		return resp, nil
 	}
