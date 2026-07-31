@@ -97,7 +97,7 @@ func (m *AuthManager) prepareAuth(ctx context.Context, auth *Auth) (*Auth, error
 		if m.Refresher == nil {
 			return nil, fmt.Errorf("codex auth %s is expired and refresher is not configured", auth.ID)
 		}
-		if err = m.refresh(ctx, auth, auth.AccessToken, false); err != nil {
+		if err := m.refresh(ctx, auth, auth.AccessToken, false); err != nil {
 			return nil, err
 		}
 	}
