@@ -87,11 +87,23 @@ type sessionAffinitySourceReader struct {
 	err         error
 	bytesRead   int64
 	errorOffset int64
+	unicode     sessionAffinityJSONUnicodeValidator
 }
 
 type sessionAffinityReplayReader struct {
 	source *sessionAffinitySourceReader
 	replay *sessionAffinityReplayStore
+}
+
+type sessionAffinityJSONUnicodeValidator struct {
+	utf8Pending     [utf8.UTFMax]byte
+	utf8PendingLen  int
+	inString        bool
+	escaped         bool
+	unicodeDigits   int
+	unicodeValue    uint16
+	pendingHigh     bool
+	invalidEncoding bool
 }
 
 func (r *replayErrorReader) Read([]byte) (int, error) {
@@ -240,7 +252,7 @@ func extractSessionAffinityJSONSignals(
 		_, _ = io.Copy(io.Discard, inspectionReader)
 	}
 	r.Body = replay.body(original, source.err, source.errorOffset)
-	return signals, valid && source.err == nil && replay.spillErr == nil
+	return signals, valid && source.err == nil && replay.spillErr == nil && source.unicode.valid()
 }
 
 func parseSessionAffinityJSONObject(decoder *json.Decoder) (*sessionAffinitySignalAccumulator, bool) {
@@ -389,11 +401,153 @@ func (r *sessionAffinitySourceReader) Read(p []byte) (int, error) {
 	}
 	n, err := r.reader.Read(p)
 	r.bytesRead += int64(n)
+	r.unicode.write(p[:n])
 	if err != nil && err != io.EOF && r.err == nil {
 		r.err = err
 		r.errorOffset = r.bytesRead
 	}
 	return n, err
+}
+
+func (v *sessionAffinityJSONUnicodeValidator) write(p []byte) {
+	if v == nil || len(p) == 0 {
+		return
+	}
+	v.validateUTF8(p)
+	for _, b := range p {
+		v.validateJSONStringByte(b)
+	}
+}
+
+func (v *sessionAffinityJSONUnicodeValidator) validateUTF8(p []byte) {
+	if v == nil {
+		return
+	}
+	if v.utf8PendingLen > 0 {
+		for len(p) > 0 && !utf8.FullRune(v.utf8Pending[:v.utf8PendingLen]) {
+			v.utf8Pending[v.utf8PendingLen] = p[0]
+			v.utf8PendingLen++
+			p = p[1:]
+		}
+		if !utf8.FullRune(v.utf8Pending[:v.utf8PendingLen]) {
+			return
+		}
+		if r, size := utf8.DecodeRune(v.utf8Pending[:v.utf8PendingLen]); r == utf8.RuneError && size == 1 {
+			v.invalidEncoding = true
+		}
+		v.utf8PendingLen = 0
+	}
+	for len(p) > 0 {
+		if p[0] < utf8.RuneSelf {
+			p = p[1:]
+			continue
+		}
+		if !utf8.FullRune(p) {
+			v.utf8PendingLen = copy(v.utf8Pending[:], p)
+			return
+		}
+		r, size := utf8.DecodeRune(p)
+		if r == utf8.RuneError && size == 1 {
+			v.invalidEncoding = true
+		}
+		p = p[size:]
+	}
+}
+
+func (v *sessionAffinityJSONUnicodeValidator) validateJSONStringByte(b byte) {
+	if v == nil {
+		return
+	}
+	if !v.inString {
+		if b == '"' {
+			v.inString = true
+		}
+		return
+	}
+	if v.unicodeDigits > 0 {
+		digit, ok := sessionAffinityHexDigit(b)
+		if !ok {
+			v.invalidEncoding = true
+			v.unicodeDigits = 0
+			v.unicodeValue = 0
+			return
+		}
+		v.unicodeValue = v.unicodeValue<<4 | uint16(digit)
+		v.unicodeDigits--
+		if v.unicodeDigits == 0 {
+			v.finishUnicodeEscape()
+		}
+		return
+	}
+	if v.escaped {
+		v.escaped = false
+		if b == 'u' {
+			v.unicodeDigits = 4
+			v.unicodeValue = 0
+			return
+		}
+		if v.pendingHigh {
+			v.invalidEncoding = true
+			v.pendingHigh = false
+		}
+		return
+	}
+	if v.pendingHigh {
+		if b == '\\' {
+			v.escaped = true
+			return
+		}
+		v.invalidEncoding = true
+		v.pendingHigh = false
+	}
+	switch b {
+	case '\\':
+		v.escaped = true
+	case '"':
+		v.inString = false
+	}
+}
+
+func (v *sessionAffinityJSONUnicodeValidator) finishUnicodeEscape() {
+	switch {
+	case v.unicodeValue >= 0xd800 && v.unicodeValue <= 0xdbff:
+		if v.pendingHigh {
+			v.invalidEncoding = true
+		}
+		v.pendingHigh = true
+	case v.unicodeValue >= 0xdc00 && v.unicodeValue <= 0xdfff:
+		if !v.pendingHigh {
+			v.invalidEncoding = true
+		}
+		v.pendingHigh = false
+	default:
+		if v.pendingHigh {
+			v.invalidEncoding = true
+			v.pendingHigh = false
+		}
+	}
+	v.unicodeValue = 0
+}
+
+func (v *sessionAffinityJSONUnicodeValidator) valid() bool {
+	return v != nil &&
+		!v.invalidEncoding &&
+		v.utf8PendingLen == 0 &&
+		v.unicodeDigits == 0 &&
+		!v.pendingHigh
+}
+
+func sessionAffinityHexDigit(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 func (r *sessionAffinityReplayReader) Read(p []byte) (int, error) {

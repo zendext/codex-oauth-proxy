@@ -1,6 +1,7 @@
 package codexonly
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -68,6 +69,49 @@ func TestExtractSessionAffinitySignalsRejectsInvalidValuesWithoutChangingRequest
 	}
 	if string(restored) != body {
 		t.Fatalf("restored body = %q, want %q", string(restored), body)
+	}
+}
+
+func TestExtractSessionAffinitySignalsRejectsDecoderNormalizedUnicode(t *testing.T) {
+	invalidUTF8 := append([]byte(`{"session_id":"bad-`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`","input":"hello"}`)...)
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "invalid UTF-8", body: invalidUTF8},
+		{name: "unpaired UTF-16 surrogate", body: []byte(`{"prompt_cache_key":"bad-\uD800","input":"hello"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			req.Body = &chunkedReadCloser{reader: bytes.NewReader(tt.body), size: 1}
+			req.Header.Set("Content-Type", "application/json")
+
+			if signals := extractSessionAffinitySignals(req); len(signals) != 0 {
+				t.Fatalf("signals = %#v, want none", signals)
+			}
+			restored, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read restored body: %v", err)
+			}
+			if !bytes.Equal(restored, tt.body) {
+				t.Fatalf("restored body = %q, want exact %q", restored, tt.body)
+			}
+		})
+	}
+}
+
+func TestExtractSessionAffinitySignalsAcceptsValidSurrogatePair(t *testing.T) {
+	body := []byte(`{"conversation_id":"emoji-\uD83D\uDE00","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Body = &chunkedReadCloser{reader: bytes.NewReader(body), size: 1}
+	req.Header.Set("Content-Type", "application/json")
+
+	if signals := extractSessionAffinitySignals(req); !slices.Equal(signals, []sessionAffinitySignal{
+		{Kind: sessionAffinitySignalConversationID, Value: "emoji-\U0001f600"},
+	}) {
+		t.Fatalf("signals = %#v, want valid surrogate-pair conversation ID", signals)
 	}
 }
 
@@ -536,6 +580,22 @@ type singleErrorReadCloser struct {
 	err    error
 	suffix []byte
 	stage  int
+}
+
+type chunkedReadCloser struct {
+	reader io.Reader
+	size   int
+}
+
+func (r *chunkedReadCloser) Read(p []byte) (int, error) {
+	if r.size > 0 && len(p) > r.size {
+		p = p[:r.size]
+	}
+	return r.reader.Read(p)
+}
+
+func (*chunkedReadCloser) Close() error {
+	return nil
 }
 
 func (r *singleErrorReadCloser) Read(p []byte) (int, error) {

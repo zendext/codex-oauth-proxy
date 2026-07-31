@@ -489,6 +489,70 @@ func TestServerInvalidOrMissingSessionSignalsFallBackWithoutBinding(t *testing.T
 	}
 }
 
+func TestServerInvalidBodyUnicodeDoesNotBindAndForwardsExactBytes(t *testing.T) {
+	authDir := t.TempDir()
+	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
+	writeSessionAffinityAuth(t, authDir, "b.json", "acct_b", "access-b", false)
+
+	var mu sync.Mutex
+	var authorizations []string
+	var bodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		bodies = append(bodies, slices.Clone(body))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	server := newSessionAffinityServer(t, authDir, filepath.Join(t.TempDir(), "users.db"), upstream.URL)
+	defer server.Close()
+	user := createManagedUser(t, server, "admin-key", "Alice")
+	invalidUTF8 := append([]byte(`{"model":"gpt-5.3-codex","session_id":"bad-`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`","input":"utf8"}`)...)
+	requestBodies := [][]byte{
+		invalidUTF8,
+		[]byte(`{"model":"gpt-5.3-codex","conversation":{"id":"bad-\uD800"},"input":"surrogate"}`),
+	}
+
+	for _, body := range requestBodies {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+user.PlaintextAPIKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp := httptest.NewRecorder()
+		server.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("invalid Unicode signal status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+		}
+	}
+
+	var rows int
+	if err := server.users.db.QueryRow(`SELECT COUNT(*) FROM session_affinity_bindings`).Scan(&rows); err != nil {
+		t.Fatalf("count session affinity rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("invalid Unicode signals created %d affinity rows, want 0", rows)
+	}
+	mu.Lock()
+	gotAuths := slices.Clone(authorizations)
+	gotBodies := slices.Clone(bodies)
+	mu.Unlock()
+	if want := []string{"Bearer access-a", "Bearer access-b"}; !slices.Equal(gotAuths, want) {
+		t.Fatalf("fallback authorizations = %v, want %v", gotAuths, want)
+	}
+	if len(gotBodies) != len(requestBodies) {
+		t.Fatalf("upstream body count = %d, want %d", len(gotBodies), len(requestBodies))
+	}
+	for i := range requestBodies {
+		if !bytes.Equal(gotBodies[i], requestBodies[i]) {
+			t.Fatalf("upstream body #%d = %q, want exact %q", i+1, gotBodies[i], requestBodies[i])
+		}
+	}
+}
+
 func TestServerSessionAffinityPreservesChatStreamingAndWebSockets(t *testing.T) {
 	authDir := t.TempDir()
 	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
