@@ -38,6 +38,7 @@ type Auth struct {
 	codexCLI     bool
 	relativePath string
 	sourceIDs    []string
+	renameFile   func(string, string) error
 }
 
 func (a *Auth) Expired(now time.Time) bool {
@@ -149,9 +150,40 @@ func (a *Auth) Save() error {
 	if err = os.MkdirAll(filepath.Dir(a.Path), 0o700); err != nil {
 		return fmt.Errorf("create auth dir: %w", err)
 	}
-	if err = os.WriteFile(a.Path, append(raw, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write auth: %w", err)
+	temp, err := os.CreateTemp(filepath.Dir(a.Path), "."+filepath.Base(a.Path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create auth temp file: %w", err)
 	}
+	tempPath := temp.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err = temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("set auth temp permissions: %w", err)
+	}
+	if _, err = temp.Write(append(raw, '\n')); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write auth temp file: %w", err)
+	}
+	if err = temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("sync auth temp file: %w", err)
+	}
+	if err = temp.Close(); err != nil {
+		return fmt.Errorf("close auth temp file: %w", err)
+	}
+	renameFile := os.Rename
+	if a.renameFile != nil {
+		renameFile = a.renameFile
+	}
+	if err = renameFile(tempPath, a.Path); err != nil {
+		return fmt.Errorf("replace auth file: %w", err)
+	}
+	renamed = true
 	a.Metadata = data
 	a.codexCLI = mapField(data, "tokens") != nil
 	return nil
@@ -617,6 +649,13 @@ func cloneAuth(auth *Auth) *Auth {
 	cloned.SourcePaths = slices.Clone(auth.SourcePaths)
 	cloned.sourceIDs = slices.Clone(auth.sourceIDs)
 	return &cloned
+}
+
+func copyAuth(target *Auth, source *Auth) {
+	if target == nil || source == nil {
+		return
+	}
+	*target = *cloneAuth(source)
 }
 
 func cloneAuths(auths []*Auth) []*Auth {

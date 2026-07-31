@@ -45,7 +45,15 @@ type AuthManager struct {
 	Refresher AuthRefresher
 	Now       func() time.Time
 
-	next atomic.Uint64
+	next      atomic.Uint64
+	refreshMu sync.Mutex
+	refreshes map[string]*authRefreshCall
+}
+
+type authRefreshCall struct {
+	done chan struct{}
+	auth *Auth
+	err  error
 }
 
 func (m *AuthManager) Select(ctx context.Context) (*Auth, error) {
@@ -69,7 +77,7 @@ func (m *AuthManager) Select(ctx context.Context) (*Auth, error) {
 		if m.Refresher == nil {
 			return nil, fmt.Errorf("codex auth %s is expired and refresher is not configured", auth.ID)
 		}
-		if err = m.Refresher.Refresh(ctx, auth); err != nil {
+		if err = m.refresh(ctx, auth, auth.AccessToken, false); err != nil {
 			return nil, err
 		}
 	}
@@ -77,6 +85,99 @@ func (m *AuthManager) Select(ctx context.Context) (*Auth, error) {
 		return nil, fmt.Errorf("codex auth %s has no access token", auth.ID)
 	}
 	return auth, nil
+}
+
+func (m *AuthManager) RefreshAfterUnauthorized(ctx context.Context, auth *Auth, failedAccessToken string) error {
+	if strings.TrimSpace(failedAccessToken) == "" && auth != nil {
+		failedAccessToken = auth.AccessToken
+	}
+	return m.refresh(ctx, auth, failedAccessToken, true)
+}
+
+func (m *AuthManager) refresh(ctx context.Context, auth *Auth, failedAccessToken string, reuseChangedToken bool) error {
+	if m == nil || m.Store == nil || m.Refresher == nil {
+		return newOAuthRefreshError("refresher unavailable", 0, "", nil)
+	}
+	if auth == nil {
+		return newOAuthRefreshError("invalid auth", 0, "", nil)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key := strings.TrimSpace(auth.ID)
+	if key == "" {
+		key = stableAuthID(auth.AccountID, auth.relativePath)
+	}
+
+	m.refreshMu.Lock()
+	if m.refreshes == nil {
+		m.refreshes = make(map[string]*authRefreshCall)
+	}
+	if call := m.refreshes[key]; call != nil {
+		m.refreshMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return newOAuthRefreshError("canceled", 0, "", ctx.Err())
+		case <-call.done:
+			if call.err != nil {
+				return call.err
+			}
+			copyAuth(auth, call.auth)
+			return nil
+		}
+	}
+	call := &authRefreshCall{done: make(chan struct{})}
+	m.refreshes[key] = call
+	m.refreshMu.Unlock()
+
+	refreshed, err := m.refreshCurrentAuth(ctx, auth, failedAccessToken, reuseChangedToken)
+
+	m.refreshMu.Lock()
+	call.auth = cloneAuth(refreshed)
+	call.err = err
+	delete(m.refreshes, key)
+	close(call.done)
+	m.refreshMu.Unlock()
+
+	if err != nil {
+		return err
+	}
+	copyAuth(auth, refreshed)
+	return nil
+}
+
+func (m *AuthManager) refreshCurrentAuth(ctx context.Context, auth *Auth, failedAccessToken string, reuseChangedToken bool) (*Auth, error) {
+	auths, err := m.Store.Load(ctx)
+	if err != nil {
+		return nil, newOAuthRefreshError("auth reload failed", 0, "", err)
+	}
+	current := matchingAuth(auths, auth)
+	if current == nil {
+		return nil, newOAuthRefreshError("auth is no longer available", 0, "", nil)
+	}
+	if current.AccessToken != "" && current.AccessToken != failedAccessToken {
+		now := time.Now
+		if m.Now != nil {
+			now = m.Now
+		}
+		if reuseChangedToken || !current.Expired(now()) {
+			return current, nil
+		}
+	}
+	candidate := cloneAuth(current)
+	if err = m.Refresher.Refresh(ctx, candidate); err != nil {
+		return nil, err
+	}
+	return candidate, nil
+}
+
+func matchingAuth(auths []*Auth, target *Auth) *Auth {
+	for _, auth := range auths {
+		if auth != nil && auth.ID == target.ID {
+			return auth
+		}
+	}
+	return nil
 }
 
 type Server struct {
@@ -101,6 +202,24 @@ type upstreamRoute struct {
 
 type proxyAuthorization struct {
 	Credential *AuthenticatedAPIKey
+}
+
+type upstreamAuthRefreshError struct {
+	err error
+}
+
+func (e *upstreamAuthRefreshError) Error() string {
+	if e == nil || e.err == nil {
+		return "upstream authentication unavailable"
+	}
+	return "upstream authentication unavailable: " + e.err.Error()
+}
+
+func (e *upstreamAuthRefreshError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
@@ -801,7 +920,7 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 	auth, err := s.auths.Select(r.Context())
 	if err != nil {
 		s.debugf("proxy upstream auth unavailable method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(w, http.StatusServiceUnavailable, "upstream authentication unavailable")
 		return
 	}
 	if route.responsesWebsocket && websocketRequested(r) {
@@ -832,6 +951,9 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 		},
 		Transport: s.httpClient.Transport,
 		ModifyResponse: func(resp *http.Response) error {
+			if errRetry := s.retryUnauthorizedProxyResponse(resp, r, route, auth); errRetry != nil {
+				return errRetry
+			}
 			s.debugf(
 				"proxy upstream response method=%s path=%s status=%d target_host=%s target_path=%s",
 				r.Method,
@@ -862,6 +984,13 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
+			statusCode := http.StatusBadGateway
+			message := proxyErr.Error()
+			var authErr *upstreamAuthRefreshError
+			if errors.As(proxyErr, &authErr) {
+				statusCode = http.StatusServiceUnavailable
+				message = "upstream authentication unavailable"
+			}
 			s.debugf(
 				"proxy upstream error method=%s path=%s target_host=%s target_path=%s error=%q",
 				r.Method,
@@ -877,14 +1006,84 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 					Model:           metadata.Model,
 					ReasoningEffort: metadata.ReasoningEffort,
 					ServiceTier:     metadata.ServiceTier,
-					StatusCode:      http.StatusBadGateway,
+					StatusCode:      statusCode,
 					RequestID:       requestIDFromRequest(req),
 				})
 			}
-			writeError(rw, http.StatusBadGateway, proxyErr.Error())
+			writeError(rw, statusCode, message)
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func (s *Server) retryUnauthorizedProxyResponse(resp *http.Response, incoming *http.Request, route upstreamRoute, auth *Auth) error {
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		return nil
+	}
+	retryReq, err := cloneRequestForRetry(resp.Request)
+	if err != nil {
+		s.debugf(
+			"proxy upstream unauthorized method=%s path=%s auth_id=%s action=skip_retry reason=request_not_replayable",
+			incoming.Method,
+			incoming.URL.Path,
+			auth.ID,
+		)
+		return nil
+	}
+	failedAccessToken := auth.AccessToken
+	refreshCtx := incoming.Context()
+	if resp.Request != nil {
+		refreshCtx = resp.Request.Context()
+	}
+	discardAndCloseResponse(resp)
+	s.debugf(
+		"proxy upstream unauthorized method=%s path=%s auth_id=%s action=refresh",
+		incoming.Method,
+		incoming.URL.Path,
+		auth.ID,
+	)
+	refreshed := cloneAuth(auth)
+	if err := s.auths.RefreshAfterUnauthorized(refreshCtx, refreshed, failedAccessToken); err != nil {
+		if retryReq.Body != nil {
+			_ = retryReq.Body.Close()
+		}
+		return &upstreamAuthRefreshError{err: err}
+	}
+	applyCodexProxyHeaders(retryReq, incoming, refreshed, s.cfg, route.responsesWebsocket)
+	retryResp, err := s.httpClient.Transport.RoundTrip(retryReq)
+	if err != nil {
+		return err
+	}
+	*resp = *retryResp
+	copyAuth(auth, refreshed)
+	return nil
+}
+
+func cloneRequestForRetry(req *http.Request) (*http.Request, error) {
+	if req == nil {
+		return nil, fmt.Errorf("upstream request is nil")
+	}
+	retryReq := req.Clone(req.Context())
+	if req.Body == nil || req.Body == http.NoBody {
+		return retryReq, nil
+	}
+	if req.GetBody == nil {
+		return nil, fmt.Errorf("upstream request body is not replayable")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	retryReq.Body = body
+	return retryReq, nil
+}
+
+func discardAndCloseResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
 }
 
 func (s *Server) debugEnabled() bool {
@@ -1187,6 +1386,7 @@ func applyCodexProxyHeaders(out *http.Request, in *http.Request, auth *Auth, cfg
 	if out.Header.Get("Content-Type") == "" && in.Method != http.MethodGet {
 		out.Header.Set("Content-Type", "application/json")
 	}
+	out.Header.Del("Chatgpt-Account-Id")
 	if strings.TrimSpace(auth.AccountID) != "" {
 		out.Header.Set("Chatgpt-Account-Id", auth.AccountID)
 	}

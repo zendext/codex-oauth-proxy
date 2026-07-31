@@ -70,15 +70,25 @@ Kubernetes 或其他外部 Supervisor，在修复底层 SQLite 问题后重启�
 4. 按稳定身份排序可选择的逻辑凭据。
 5. 以轮询方式选择下一个逻辑凭据。
 6. 将五分钟内过期的凭据视为已过期。
-7. 刷新过期凭据，并重新解析账户和邮箱声明。
-8. 将刷新后的值写回选中的源文件。
-9. 使用选中的 Access Token 和 Account ID 转发请求。
+7. 按稳定凭据 ID 在进程内协调刷新，使同一凭据的并发调用方共享一次有效刷新。
+8. 当其他调用方已经替换过期或收到 `401` 的 Token 时，仅在相同稳定凭据 ID
+   仍然存在的情况下复用较新的 Access Token。
+9. 刷新过期凭据，并重新解析账户和邮箱声明。
+10. 同目录 `0600` 临时文件完成 Sync 后，原子替换选中的源文件。
+11. 使用选中的 Access Token 和 Account ID 转发请求。
 
 协调结果会报告新增、删除、凭据变化、元数据变化、可用性变化和源文件变化，
 且不包含 Token 内容。稳定账户 ID 在文件重命名和同账户 Token 替换后保持不变。
 在同一路径换入另一账户时，会产生旧身份删除和新身份新增。禁用的逻辑凭据仍然
 保留在状态中，但不会用于新请求选择。五秒解析错误宽限期会在编辑器部分写入
 期间保留最近一次有效表示；持续格式错误的文件随后会被排除。
+
+每次有效 Token 刷新共用一个 30 秒 Deadline，最多尝试三次。仅临时网络故障和
+HTTP `408`、`429`、`500`、`502`、`503`、`504` 可以重试；有效的
+`Retry-After` 仅在刷新 Deadline 内执行。缺少刷新凭据、`invalid_grant`、
+确定性的 `400`/`401`/`403`、格式错误的响应以及不含 Access Token 的成功响应
+都是终止错误。刷新错误只公开安全的状态码和 OAuth 错误码上下文，不包含 Token
+端点原始响应 Body。
 
 ## 认证边界
 
@@ -139,12 +149,17 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 4. 将目标 URL 重写到配置的 Codex 或 ChatGPT Base。
 5. 使用选中的 OAuth Access Token 替换 `Authorization`。
 6. 可用时添加 ChatGPT Account ID 和兼容 Header。
-7. 转发 HTTP Stream 响应或桥接 WebSocket Frame。
-8. 为托管用户请求采集用量元数据。
+7. HTTP 上游在客户端响应提交前返回 `401`，且原始请求 Body 已经可重放时，
+   刷新同一凭据并重试一次。
+8. 不为重试缓冲不可重放的请求，而是仅转发一次。
+9. 转发 HTTP Stream 响应或桥接 WebSocket Frame。
+10. 为托管用户请求采集用量元数据。
 
 正常运行期间，代理会保持已建立的 HTTP Stream。WebSocket 转发使用 Gorilla
 WebSocket，并在上游 Upgrade 路径强制使用 HTTP/1.1 ALPN。服务器关闭或发生
-致命存储故障时，会取消已建立的 Stream 并关闭 WebSocket 两端。
+致命存储故障时，会取消已建立的 Stream 并关闭 WebSocket 两端。OAuth 响应式
+恢复不会切换到其他凭据，也不会在响应提交后重试。不可重放的请求 Body 会保留
+第一次上游响应，不进行修改。
 
 ## Chat Completions 转换
 
@@ -154,9 +169,10 @@ WebSocket，并在上游 Upgrade 路径强制使用 HTTP/1.1 ALPN。服务器关
 2. 将消息、Tool、Response Format、Reasoning 和 Service Tier 转换为 Responses
    请求。
 3. 强制上游使用 `stream: true` 和 `store: false`。
-4. 读取 Responses SSE Event。
-5. 聚合为普通 Chat Completions 响应，或转换为 Chat Completions SSE Chunk。
-6. 应用本地 Stop Sequence 过滤并记录用量。
+4. 上游返回 `401` 时，在提交客户端响应前刷新同一凭据并重试一次。
+5. 读取 Responses SSE Event。
+6. 聚合为普通 Chat Completions 响应，或转换为 Chat Completions SSE Chunk。
+7. 应用本地 Stop Sequence 过滤并记录用量。
 
 这是专用兼容层，不是通用的 Schema 保留型转换引擎。
 
