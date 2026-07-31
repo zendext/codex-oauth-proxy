@@ -174,6 +174,7 @@ func (s *UserStore) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS session_affinity_bindings (
 			session_digest TEXT PRIMARY KEY,
 			binding_digest TEXT NOT NULL,
+			tenant_scope_digest TEXT NOT NULL DEFAULT '',
 			auth_id TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
@@ -201,6 +202,9 @@ func (s *UserStore) migrate(ctx context.Context) error {
 	if err := s.migrateUsageServiceTier(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateSessionAffinityTenantScopeDigest(ctx); err != nil {
+		return err
+	}
 	indexStatements := []string{
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_one_active_per_user
 			ON api_keys(user_id) WHERE enabled = 1`,
@@ -212,6 +216,8 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			ON session_affinity_bindings(auth_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_affinity_binding_digest
 			ON session_affinity_bindings(binding_digest)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_affinity_tenant_scope_digest
+			ON session_affinity_bindings(tenant_scope_digest)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_affinity_expires_at
 			ON session_affinity_bindings(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_auth_health_retry_at
@@ -221,6 +227,24 @@ func (s *UserStore) migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate user store: %w", err)
 		}
+	}
+	return nil
+}
+
+func (s *UserStore) migrateSessionAffinityTenantScopeDigest(ctx context.Context) error {
+	hasColumn, err := tableColumnExists(ctx, s.db, "session_affinity_bindings", "tenant_scope_digest")
+	if err != nil {
+		return fmt.Errorf("inspect session affinity tenant scope: %w", err)
+	}
+	if hasColumn {
+		return nil
+	}
+	if _, err = s.db.ExecContext(
+		ctx,
+		`ALTER TABLE session_affinity_bindings
+		 ADD COLUMN tenant_scope_digest TEXT NOT NULL DEFAULT ''`,
+	); err != nil {
+		return fmt.Errorf("add session affinity tenant scope: %w", err)
 	}
 	return nil
 }

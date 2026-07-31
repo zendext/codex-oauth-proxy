@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -57,6 +60,14 @@ type authModelExclusion struct {
 	StatusCode  int
 	ErrorCode   string
 	UpdatedAt   time.Time
+}
+
+type authModelHealthState struct {
+	Model      string
+	Reason     string
+	StatusCode int
+	ErrorCode  string
+	UpdatedAt  time.Time
 }
 
 type authHealthRegistry struct {
@@ -333,6 +344,55 @@ func (r *authHealthRegistry) State(authID string, model string) (AuthHealthState
 	}
 	state, ok := r.states[authID]
 	return state, ok
+}
+
+func (r *authHealthRegistry) Snapshot(authID string) (AuthHealthState, bool, []authModelHealthState) {
+	if r == nil {
+		return AuthHealthState{}, false, nil
+	}
+	authID = strings.TrimSpace(authID)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state, ok := r.states[authID]
+	models := r.modelExclusions[authID]
+	exclusions := make([]authModelHealthState, 0, len(models))
+	for model, exclusion := range models {
+		exclusions = append(exclusions, authModelHealthState{
+			Model:      model,
+			Reason:     exclusion.Reason,
+			StatusCode: exclusion.StatusCode,
+			ErrorCode:  exclusion.ErrorCode,
+			UpdatedAt:  exclusion.UpdatedAt,
+		})
+	}
+	sort.Slice(exclusions, func(i, j int) bool {
+		return exclusions[i].Model < exclusions[j].Model
+	})
+	return state, ok, exclusions
+}
+
+func (r *authHealthRegistry) ClearCooldown(ctx context.Context, auth *Auth) (bool, error) {
+	if r == nil || r.store == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return false, ErrInvalidInput
+	}
+	r.mu.Lock()
+	state, ok := r.states[auth.ID]
+	if !ok || state.RetryAt.IsZero() ||
+		state.Kind != AuthHealthQuota && state.Kind != AuthHealthTransient {
+		r.mu.Unlock()
+		return false, nil
+	}
+	if persistedAuthHealthKind(state.Kind) {
+		if err := r.store.DeleteAuthHealthState(ctx, auth.ID); err != nil {
+			r.mu.Unlock()
+			return false, err
+		}
+	}
+	delete(r.states, auth.ID)
+	r.healthyEpochs[auth.ID]++
+	r.mu.Unlock()
+	logAuthHealthy(auth, "cooldown_cleared")
+	return true, nil
 }
 
 func (r *authHealthRegistry) MarkHealthy(ctx context.Context, auth *Auth, model string) error {
@@ -713,6 +773,14 @@ func safeLogAccountID(accountID string) string {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return "unknown"
+	}
+	if len(accountID) > maxManagementAccountIDBytes || !utf8.ValidString(accountID) {
+		return "invalid"
+	}
+	for _, char := range accountID {
+		if unicode.IsControl(char) || unicode.IsSpace(char) {
+			return "invalid"
+		}
 	}
 	return accountID
 }

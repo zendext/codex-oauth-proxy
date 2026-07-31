@@ -7,7 +7,8 @@
 - 由内置管理 CLI 使用、仅允许回环地址访问的本地路由。
 - 由 `admin-api-key` 保护的可选远程管理 API。
 
-两个入口调用相同的用户和用量 Handler，并操作同一个 SQLite 数据库。
+两个入口调用相同的用户、用量和 Codex 认证管理 Handler。管理响应使用
+`Cache-Control: no-store`。
 
 ## 本地管理 CLI
 
@@ -169,6 +170,53 @@ curl http://127.0.0.1:8317/v0/management/users \
 ```
 
 请求和响应格式参见 [API 参考](api-reference.md)。
+
+## Codex 认证操作
+
+Codex 认证状态和恢复操作通过管理 API 提供。内置 CLI 不增加单独的认证命令组。
+
+在本地列出安全认证状态：
+
+```bash
+curl http://127.0.0.1:8317/v0/local-admin/auths
+```
+
+通过远程 API 强制刷新：
+
+```bash
+curl -X POST http://127.0.0.1:8317/v0/management/auths/refresh \
+  -H 'Authorization: Bearer admin-change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id":"acct_xxx"}'
+```
+
+把最终路径替换为以下值，可以启用、禁用或清理基于时间的冷却：
+
+```text
+/auths/enable
+/auths/disable
+/auths/cooldown/clear
+```
+
+启用和禁用会更新该账户的每个源文件。启用只执行本地验证，不刷新 Token，也不
+清除健康状态。禁用只影响新选择，不会终止活动 HTTP、SSE 或 WebSocket 流量，
+也不会删除绑定。
+
+清理一个用户的精确会话绑定：
+
+```bash
+curl -X POST http://127.0.0.1:8317/v0/management/session-bindings/clear \
+  -H 'Authorization: Bearer admin-change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"usr_xxx","session_key":"raw-session-key"}'
+```
+
+省略 `session_key` 会清理该用户的全部绑定；只发送 `account_id` 会清理指向
+一个认证的绑定。不提供全局清理，也不提供管理员指定目标的迁移。
+
+未识别认证会继续显示在状态中，但保持只读。管理日志包含操作、安全的账户或
+用户身份、结果和删除数量，不包含 OAuth Token、管理 Key、原始会话 Key、源文件
+路径或原始上游响应 Body。
 
 ## 用户自助服务
 

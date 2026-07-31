@@ -92,6 +92,7 @@ func (r *Refresher) Refresh(ctx context.Context, auth *Auth) error {
 			candidate.ExpiresAt = tokenExpiry(parsed.AccessToken)
 		}
 		candidate.ReparseIdentity()
+		candidate.Metadata["last_refresh"] = now().UTC().Format(time.RFC3339)
 		if err = candidate.Save(); err != nil {
 			return newOAuthRefreshError("persistence failed", 0, "", err)
 		}

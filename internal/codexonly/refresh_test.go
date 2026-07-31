@@ -101,6 +101,9 @@ func TestRefresherUpdatesAuthAndWritesTokenFile(t *testing.T) {
 	if saved["type"] != "codex" {
 		t.Fatalf("saved type = %#v, want codex", saved["type"])
 	}
+	if saved["last_refresh"] != "2026-06-11T12:00:00Z" {
+		t.Fatalf("saved last_refresh = %#v, want fixed refresh time", saved["last_refresh"])
+	}
 }
 
 func TestRefresherRejectsMissingRefreshToken(t *testing.T) {

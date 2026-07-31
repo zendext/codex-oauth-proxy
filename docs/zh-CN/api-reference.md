@@ -148,7 +148,147 @@ Compare-and-swap 故障转移进行重绑定。
 ## 管理 API
 
 只有 `admin-api-key` 非空时才能使用远程管理 API。回环客户端可以使用
-`/v0/local-admin` 下的等价本地路由。
+`/v0/local-admin` 下的等价本地路由。所有管理响应都包含
+`Cache-Control: no-store`。
+
+### `GET /v0/management/auths`
+
+列出所有逻辑 Codex 认证，包括已禁用和未识别的凭据：
+
+```json
+{
+  "auths": [
+    {
+      "account_id": "acct_xxx",
+      "identity_state": "identified",
+      "manageable": true,
+      "email": "a***@example.com",
+      "source_file_count": 2,
+      "enabled": true,
+      "runtime_state": "cooling",
+      "runtime_reason": "quota",
+      "token_expires_at": "2026-08-02T00:00:00Z",
+      "last_refresh_at": "2026-07-31T00:00:00Z",
+      "cooldown_until": "2026-08-01T01:00:00Z",
+      "cooldown_reason": "quota",
+      "model_capability_known": true,
+      "known_supported_models": ["gpt-5.3-codex"],
+      "model_exclusions": [],
+      "session_binding_count": 3,
+      "active_connection_count": 1,
+      "last_error": {
+        "code": "rate_limit_exceeded",
+        "status": 429
+      }
+    }
+  ]
+}
+```
+
+`runtime_state` 为 `active`、`cooling` 或 `unavailable`。模型排除会单独
+报告，因为它们只影响一个模型，而不是整个认证。只有运行时目录已知按认证支持
+集合时，才会填充已知支持模型。
+
+无法恢复账户 ID 的认证返回 `identity_state: "unidentified"`、
+`manageable: false`，并且没有 `account_id`。它仍可用于兼容代理流量，但不能
+接受按账户定位的变更。
+
+响应永远不会包含 OAuth Token、原始认证 JSON、源文件路径、原始会话标识符或
+原始上游错误 Body。
+
+### `POST /v0/management/auths/refresh`
+
+对一个已识别认证强制执行 OAuth 刷新：
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+认证处于禁用状态时也允许此操作，并且始终进入现有按认证 Refresh
+Singleflight。OAuth 操作总 Deadline 为 30 秒。成功会清除凭据相关故障，但
+不会启用认证、清除配额或模型冷却，也不会改变会话绑定。
+
+响应：
+
+```json
+{"auth": { "...": "更新后的安全认证状态" }}
+```
+
+Token 端点或持久化失败只返回脱敏错误，不包含 Token 或上游原始 Body。
+
+### `POST /v0/management/auths/enable`
+
+### `POST /v0/management/auths/disable`
+
+请求：
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+这些操作通过刷新使用的同一同步临时文件和原子重命名路径，更新该账户每个认证
+文件中的 `disabled` 字段。写入前会先解析并验证所有源文件。多文件写入失败时
+会尽可能回滚已经修改的源文件，并且绝不会返回混合状态的成功响应。
+
+启用不会发起 OAuth 请求，也不会清除健康状态、冷却、模型排除、活动请求或会话
+绑定。禁用完成后会把认证排除在新选择之外。现有 HTTP、SSE 和 WebSocket 请求
+继续运行；空闲绑定会一直保留到后续复用、过期、显式清理或认证删除。
+
+### `POST /v0/management/auths/cooldown/clear`
+
+请求：
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+响应：
+
+```json
+{
+  "cleared": true,
+  "auth": { "...": "更新后的安全认证状态" }
+}
+```
+
+只能清理基于时间的配额或 `429`、网络、`408` 和可重试 `5xx` 冷却。此操作
+不会清除禁用状态、`invalid_grant`、缺失或无效的刷新凭据、持续未授权状态或
+模型专用排除；这些情况下 `cleared` 为 `false`。
+
+### `POST /v0/management/session-bindings/clear`
+
+请求必须且只能选择一个范围。
+
+一个用户的一条原始会话 Key：
+
+```json
+{
+  "user_id": "usr_xxx",
+  "session_key": "raw-session-key"
+}
+```
+
+一个用户的全部绑定：
+
+```json
+{"user_id":"usr_xxx"}
+```
+
+指向一个已识别认证的全部绑定：
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+响应：
+
+```json
+{"deleted_count":2}
+```
+
+精确会话清理会在服务端从原始 Key 计算所有受支持的租户范围会话 Digest，并
+删除完整 Alias Group。原始 Key 永远不会返回、记录日志或持久化。不提供无条件
+全局清理，也不提供把会话迁移到管理员指定认证的操作。
 
 ### `POST /v0/management/users`
 

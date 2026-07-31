@@ -55,6 +55,11 @@ remote management API or Grafana:
 admin-api-key: "replace-with-a-long-random-secret"
 ```
 
+Codex auth status and management actions use these existing boundaries. There
+is no separate management feature flag: loopback callers can use
+`/v0/local-admin/*`, and remote callers can use `/v0/management/*` only when
+`admin-api-key` is configured.
+
 ## Container Configuration
 
 The default Compose setup mounts `./auths` at `/root/.codex`:
@@ -107,6 +112,9 @@ therefore one round-robin slot. Logical credentials are sorted by stable
 identity, so file renames and token replacement do not change account ordering.
 Records marked `disabled: true` remain part of reconciliation but are excluded
 from new request selection when no enabled source for that account remains.
+Management enable and disable actions update this field in every source file
+for the account. Auth files remain the only enablement source of truth; SQLite
+does not contain an enablement override.
 
 The directory is rescanned during request-time auth loading. Additions,
 removals, renames, external token updates, and disabled changes are observed
@@ -208,8 +216,16 @@ metadata and a masked value; plaintext is returned only by user creation and key
 reset operations.
 
 Session affinity has no configuration flag. It is enabled by default and stores
-only SHA-256 digests, stable auth IDs, and timestamps. Raw session identifiers
-are not persisted.
+only SHA-256 session and tenant-scope digests, stable auth IDs, and timestamps.
+The tenant-scope digest permits bounded management clearing by user without
+storing a user/session pair or raw session identifier. Existing bindings created
+before this metadata is present acquire it on normal reuse and otherwise expire
+under the one-hour inactivity policy.
+
+Auth status and management operations use SQLite for binding counts, scoped
+deletion, and persisted health changes. A SQLite infrastructure error therefore
+uses the same process-level fail-fast lifecycle as proxy, user, usage, and
+session operations; the API never reports false success.
 
 If `database.path` is relative, it is resolved relative to the server process
 working directory. `~` and `~/...` are expanded.

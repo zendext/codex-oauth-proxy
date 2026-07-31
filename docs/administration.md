@@ -7,8 +7,8 @@ The proxy provides two administration surfaces:
 - A loopback-only local route used by the bundled admin CLI.
 - An optional remote management API protected by `admin-api-key`.
 
-Both surfaces call the same user and usage handlers and operate on the same
-SQLite database.
+Both surfaces call the same user, usage, and Codex auth management handlers.
+Management responses use `Cache-Control: no-store`.
 
 ## Local Admin CLI
 
@@ -173,6 +173,58 @@ curl http://127.0.0.1:8317/v0/management/users \
 ```
 
 See [API Reference](api-reference.md) for request and response shapes.
+
+## Codex Auth Operations
+
+Codex auth status and recovery actions are exposed through the management
+APIs. The bundled CLI does not add a separate auth command group.
+
+List safe auth status locally:
+
+```bash
+curl http://127.0.0.1:8317/v0/local-admin/auths
+```
+
+Force refresh through the remote API:
+
+```bash
+curl -X POST http://127.0.0.1:8317/v0/management/auths/refresh \
+  -H 'Authorization: Bearer admin-change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id":"acct_xxx"}'
+```
+
+Enable, disable, and clear a time-based cooldown by replacing the final path
+with:
+
+```text
+/auths/enable
+/auths/disable
+/auths/cooldown/clear
+```
+
+Enable and disable update every source file for the account. Enable is local
+validation only; it does not refresh tokens or clear health. Disable affects
+new selection but does not terminate active HTTP, SSE, or WebSocket traffic and
+does not delete bindings.
+
+Clear one user's exact session binding:
+
+```bash
+curl -X POST http://127.0.0.1:8317/v0/management/session-bindings/clear \
+  -H 'Authorization: Bearer admin-change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"usr_xxx","session_key":"raw-session-key"}'
+```
+
+Omit `session_key` to clear all bindings for that user, or send only
+`account_id` to clear bindings targeting one auth. No global clear or
+administrator-selected target migration is available.
+
+Unidentified auths remain visible in status but are read-only. Management logs
+include action, safe account/user identity, outcome, and deleted counts. They do
+not include OAuth tokens, admin keys, raw session keys, source paths, or raw
+upstream response bodies.
 
 ## User Self-Service
 

@@ -18,6 +18,7 @@ storage backends.
 | `cmd/server/` | Process entrypoint, server lifecycle, admin CLI, HTTP client, and CLI formatting. |
 | `internal/codexonly/config.go` | YAML loading and path/default resolution. |
 | `internal/codexonly/auth.go` | OAuth file discovery, parsing, filtering, and persistence. |
+| `internal/codexonly/auth_management.go` | Safe auth status, bounded management actions, binding clearing, and active-connection counts. |
 | `internal/codexonly/auth_health.go` | Global credential health, model exclusions, cooldown reconciliation, and authoritative-state persistence. |
 | `internal/codexonly/refresh.go` | OAuth refresh and outbound HTTP transport construction. |
 | `internal/codexonly/failover.go` | Replay eligibility, upstream response classification, retry layers, and deterministic aggregate errors. |
@@ -40,8 +41,9 @@ Startup performs these steps:
 4. Build an upstream client and a timeout-limited OAuth refresh client.
 5. Scan the auth directory to verify it is readable.
 6. Resolve the SQLite path, run idempotent schema migrations, validate the
-   initial persisted user state, remove affinity targets for auth identities
-   that are no longer present, and restore unexpired authoritative auth health.
+   initial persisted user state, ensure tenant-scope digest metadata for
+   affinity management, remove targets for auth identities that are no longer
+   present, and restore unexpired authoritative auth health.
 7. Start one `net/http` server.
 
 The server sets `ReadHeaderTimeout` to 10 seconds. It does not set read or write
@@ -110,6 +112,42 @@ within the refresh deadline. Missing refresh credentials, `invalid_grant`,
 definitive `400`/`401`/`403` responses, malformed responses, and successful
 responses without an access token are terminal. Refresh errors expose only safe
 status and OAuth error-code context, never raw token-endpoint response bodies.
+
+## Auth Management
+
+The remote `/v0/management/*` and loopback `/v0/local-admin/*` route groups use
+one internal auth-management implementation. Every response is marked
+`Cache-Control: no-store`.
+
+Status reconciles the auth directory, health registry, cached per-auth model
+support, session-binding counts, and in-memory active connection counts. It
+returns real account IDs, masked email, source counts, configuration and runtime
+state, token and refresh timestamps, cooldown/error categories, model support
+and exclusions, and logical binding/connection counts. Unidentified path-based
+credentials are listed without exposing the fallback path and remain
+read-only.
+
+Force refresh enters the existing per-auth singleflight with a 30-second
+deadline even when the auth is disabled. Successful refresh clears only
+credential-related failures. Enable and disable validate every source first and
+then reuse `Auth.Save` for synchronized temporary-file writes and atomic rename;
+rollback is attempted for already written sources if a later source fails.
+SQLite never becomes an alternate enablement source.
+
+Cooldown clear removes only time-based quota and transient states. Credential
+failures, disabled state, continued unauthorized state, and model exclusions
+remain intact. Binding clear accepts only exact user/session, user, or account
+scope. Exact clearing derives the tenant-scoped digest server-side, and all
+scopes return a logical `deleted_count`; no global clear or target-auth
+migration exists.
+
+Active HTTP and SSE responses are counted until their upstream body closes.
+Successful WebSocket bridges are counted until the bridge ends. Disabling an
+auth changes later selection but does not cancel these established operations.
+
+Every mutation performs a SQLite readiness check before external changes.
+Subsequent storage errors still pass through the response commit guard, so a
+request cannot return success while the process is entering fail-fast shutdown.
 
 ## Auth Health and Retry
 
@@ -253,12 +291,13 @@ bindings and two users cannot collide. OAuth compatibility requests are scoped
 by the stable identity of the access token that authenticated the request.
 Model name is not part of the affinity key.
 
-The database stores only SHA-256 digests derived from tenant scope, signal
-type, and normalized value. Prompt-cache, conversation, and session aliases
-observed together share one digest-only binding group. The first binding is
-inserted atomically; concurrent first requests follow the database winner.
-Rebinding uses compare-and-swap so concurrent failovers converge without
-overwriting another request's winner.
+The database stores only SHA-256 digests derived from tenant scope, signal type,
+and normalized value, plus a separate SHA-256 tenant-scope digest used for
+user-scoped management deletion. Prompt-cache, conversation, and session
+aliases observed together share one digest-only binding group. The first
+binding is inserted atomically; concurrent first requests follow the database
+winner. Rebinding uses compare-and-swap so concurrent failovers converge
+without overwriting another request's winner.
 
 Bindings expire after one hour of inactivity. Active bindings renew only after
 30 minutes since their previous persistence write, and expired rows are removed
@@ -274,7 +313,7 @@ The HTTP handler checks project-owned routes before the reverse proxy whitelist.
 | --- | --- |
 | `/`, `/healthz` | Service handler |
 | `/v0/local-admin/*` | Loopback administration |
-| `/v0/management/*` | Admin-key management API |
+| `/v0/management/*` | Admin-key user, usage, auth-status, recovery, and binding management API |
 | `/v0/user/*` | Managed user self-service API |
 | `/v1/models` | Runtime per-auth model aggregation with embedded fallback |
 | `/v1/chat/completions` | Local protocol conversion |

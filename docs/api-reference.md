@@ -161,7 +161,157 @@ an upstream Codex request.
 
 Remote management is available only when `admin-api-key` is non-empty.
 Equivalent local routes are available below `/v0/local-admin` to loopback
-clients.
+clients. All management responses include `Cache-Control: no-store`.
+
+### `GET /v0/management/auths`
+
+Lists every logical Codex auth, including disabled and unidentified
+credentials:
+
+```json
+{
+  "auths": [
+    {
+      "account_id": "acct_xxx",
+      "identity_state": "identified",
+      "manageable": true,
+      "email": "a***@example.com",
+      "source_file_count": 2,
+      "enabled": true,
+      "runtime_state": "cooling",
+      "runtime_reason": "quota",
+      "token_expires_at": "2026-08-02T00:00:00Z",
+      "last_refresh_at": "2026-07-31T00:00:00Z",
+      "cooldown_until": "2026-08-01T01:00:00Z",
+      "cooldown_reason": "quota",
+      "model_capability_known": true,
+      "known_supported_models": ["gpt-5.3-codex"],
+      "model_exclusions": [],
+      "session_binding_count": 3,
+      "active_connection_count": 1,
+      "last_error": {
+        "code": "rate_limit_exceeded",
+        "status": 429
+      }
+    }
+  ]
+}
+```
+
+`runtime_state` is `active`, `cooling`, or `unavailable`. Model exclusions are
+reported separately because they apply to one model rather than the complete
+auth. Supported models are included only when the runtime catalog has a known
+per-auth support set.
+
+An auth without a recoverable account ID is returned with
+`identity_state: "unidentified"`, `manageable: false`, and no `account_id`.
+It remains available for compatible proxy traffic but cannot receive
+account-targeted mutations.
+
+The response never includes OAuth tokens, raw auth JSON, source paths, raw
+session identifiers, or raw upstream error bodies.
+
+### `POST /v0/management/auths/refresh`
+
+Forces the OAuth refresh flow for one identified auth:
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+The action is allowed while the auth is disabled and always enters the
+per-auth refresh singleflight. The OAuth operation has a 30-second overall
+deadline. Success clears credential-related failures, but it does not enable
+the auth, clear quota/model cooldowns, or change session bindings.
+
+Response:
+
+```json
+{"auth": { "...": "updated safe auth status" }}
+```
+
+Token endpoint and persistence failures return sanitized errors without token
+or upstream body content.
+
+### `POST /v0/management/auths/enable`
+
+### `POST /v0/management/auths/disable`
+
+Request:
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+These actions update `disabled` in every auth file for the account through the
+same synchronized temporary-file and atomic-rename path used by refresh.
+Every source is parsed and validated before writes begin. A failed multi-file
+write rolls back already changed sources when possible and never returns a
+successful mixed-state response.
+
+Enable performs no OAuth request and does not clear health, cooldown, model
+exclusions, active requests, or session bindings. Disable excludes the auth
+from new selection after the action completes. Existing HTTP, SSE, and
+WebSocket requests continue, and idle bindings remain until later reuse,
+expiry, explicit clearing, or auth removal.
+
+### `POST /v0/management/auths/cooldown/clear`
+
+Request:
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+Response:
+
+```json
+{
+  "cleared": true,
+  "auth": { "...": "updated safe auth status" }
+}
+```
+
+Only time-based quota/`429`, network, `408`, and retryable `5xx` cooldowns can
+be cleared. The action does not clear disabled state, `invalid_grant`, missing
+or invalid refresh credentials, continued unauthorized state, or
+model-specific exclusions. In those cases `cleared` is `false`.
+
+### `POST /v0/management/session-bindings/clear`
+
+The request must select exactly one scope.
+
+One raw session key for one user:
+
+```json
+{
+  "user_id": "usr_xxx",
+  "session_key": "raw-session-key"
+}
+```
+
+All bindings for one user:
+
+```json
+{"user_id":"usr_xxx"}
+```
+
+All bindings targeting one identified auth:
+
+```json
+{"account_id":"acct_xxx"}
+```
+
+Response:
+
+```json
+{"deleted_count":2}
+```
+
+For exact-session clearing, the server computes all supported tenant-scoped
+session digests from the raw key and deletes the complete alias group. The raw
+key is never returned, logged, or persisted. There is no unconditional global
+clear and no action that migrates a session to a selected auth.
 
 ### `POST /v0/management/users`
 

@@ -41,6 +41,13 @@ type Auth struct {
 	renameFile   func(string, string) error
 }
 
+func (a *Auth) LastRefreshAt() time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	return timeField(a.Metadata, "last_refresh", "last_refresh_at", "lastRefreshAt")
+}
+
 func (a *Auth) Expired(now time.Time) bool {
 	if a == nil {
 		return true
@@ -96,6 +103,7 @@ func (a *Auth) Save() error {
 		return fmt.Errorf("auth path is empty")
 	}
 	data := cloneMap(a.Metadata)
+	data["disabled"] = a.Disabled
 	if a.codexCLI || mapField(data, "tokens") != nil {
 		for _, key := range []string{
 			"access_token", "accessToken",
@@ -235,6 +243,8 @@ type FileAuthStore struct {
 	ParseErrorGrace time.Duration
 
 	mu          sync.Mutex
+	mutationMu  sync.Mutex
+	renameFile  func(string, string) error
 	files       map[string]authFileState
 	auths       map[string]*Auth
 	initialized bool
@@ -380,6 +390,76 @@ func (s *FileAuthStore) Reconcile(ctx context.Context) (AuthReconcileResult, err
 		}
 	}
 	return result, nil
+}
+
+func (s *FileAuthStore) SetAccountDisabled(ctx context.Context, accountID string, disabled bool) (*Auth, error) {
+	if s == nil {
+		return nil, fmt.Errorf("auth store is nil")
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, ErrInvalidInput
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	result, err := s.Reconcile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	target := authByManageableAccountID(result.Auths, accountID)
+	if target == nil {
+		for _, auth := range result.Auths {
+			if auth != nil && !auth.Identified() && auth.ID == accountID {
+				return nil, ErrUnidentifiedAuth
+			}
+		}
+		return nil, ErrAuthNotFound
+	}
+	dir, err := ResolveAuthDir(s.Dir)
+	if err != nil {
+		return nil, err
+	}
+	originals := make([]*Auth, 0, len(target.SourcePaths))
+	updates := make([]*Auth, 0, len(target.SourcePaths))
+	for _, path := range target.SourcePaths {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+		}
+		source, errRead := readAuthFile(path, dir)
+		if errRead != nil || source == nil || source.AccountID != accountID {
+			return nil, ErrAuthFilesInvalid
+		}
+		originals = append(originals, cloneAuth(source))
+		update := cloneAuth(source)
+		update.Disabled = disabled
+		update.Metadata["disabled"] = disabled
+		update.renameFile = s.renameFile
+		originals[len(originals)-1].renameFile = s.renameFile
+		updates = append(updates, update)
+	}
+	for index, update := range updates {
+		if err = update.Save(); err != nil {
+			var rollbackErr error
+			for rollbackIndex := index - 1; rollbackIndex >= 0; rollbackIndex-- {
+				rollbackErr = errors.Join(rollbackErr, originals[rollbackIndex].Save())
+			}
+			return nil, errors.Join(fmt.Errorf("save auth disabled state: %w", err), rollbackErr)
+		}
+	}
+	result, err = s.Reconcile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	updated := authByManageableAccountID(result.Auths, accountID)
+	if updated == nil {
+		return nil, ErrAuthNotFound
+	}
+	return updated, nil
 }
 
 func readAuthFile(path string, baseDir string) (*Auth, error) {
@@ -582,6 +662,16 @@ func stableAuthID(accountID string, relativePath string) string {
 		return accountAuthIDPrefix + accountID
 	}
 	return pathAuthIDPrefix + normalizedAuthPath(relativePath)
+}
+
+func authByManageableAccountID(auths []*Auth, accountID string) *Auth {
+	accountID = strings.TrimSpace(accountID)
+	for _, auth := range auths {
+		if auth != nil && auth.Identified() && auth.AccountID == accountID {
+			return auth
+		}
+	}
+	return nil
 }
 
 func normalizedRelativeAuthPath(baseDir string, path string) string {

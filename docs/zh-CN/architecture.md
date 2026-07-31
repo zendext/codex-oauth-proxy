@@ -17,6 +17,7 @@
 | `cmd/server/` | 进程入口、服务器生命周期、管理 CLI、HTTP Client 和 CLI 格式化。 |
 | `internal/codexonly/config.go` | YAML 加载和路径、默认值解析。 |
 | `internal/codexonly/auth.go` | OAuth 文件发现、解析、过滤和持久化。 |
+| `internal/codexonly/auth_management.go` | 安全认证状态、有界管理操作、绑定清理和活动连接计数。 |
 | `internal/codexonly/auth_health.go` | 全局凭据健康、模型排除、冷却协调和权威状态持久化。 |
 | `internal/codexonly/refresh.go` | OAuth 刷新和出站 HTTP Transport 构建。 |
 | `internal/codexonly/failover.go` | 重放资格、上游响应分类、重试层次和确定性聚合错误。 |
@@ -39,7 +40,8 @@
 4. 构建上游 Client 和带超时的 OAuth 刷新 Client。
 5. 扫描认证目录以验证可读性。
 6. 解析 SQLite 路径、执行幂等 Schema Migration、验证初始持久化用户状态，
-   删除指向已不存在认证身份的亲和性目标，并恢复未过期的权威认证健康状态。
+   确保亲和性管理所需的租户范围 Digest 元数据，删除指向已不存在认证身份的
+   目标，并恢复未过期的权威认证健康状态。
 7. 启动一个 `net/http` 服务器。
 
 服务器将 `ReadHeaderTimeout` 设置为 10 秒。它不会设置可能中断已建立 Stream
@@ -94,6 +96,32 @@ HTTP `408`、`429`、`500`、`502`、`503`、`504` 可以重试；有效的
 确定性的 `400`/`401`/`403`、格式错误的响应以及不含 Access Token 的成功响应
 都是终止错误。刷新错误只公开安全的状态码和 OAuth 错误码上下文，不包含 Token
 端点原始响应 Body。
+
+## 认证管理
+
+远程 `/v0/management/*` 和回环 `/v0/local-admin/*` 路由组复用同一个内部
+认证管理实现。每个响应都标记 `Cache-Control: no-store`。
+
+状态会协调认证目录、健康注册表、缓存的按认证模型支持、会话绑定数量和内存中的
+活动连接数量。它返回真实账户 ID、脱敏邮箱、源文件数量、配置与运行时状态、
+Token 和刷新时间、冷却与错误分类、模型支持与排除，以及逻辑绑定和连接数量。
+基于路径的未识别凭据会在不暴露回退路径的情况下列出，并保持只读。
+
+强制刷新即使在认证已禁用时也会进入现有按认证 Singleflight，并使用 30 秒
+Deadline。成功只清除凭据相关故障。启用和禁用会先验证全部源文件，再复用
+`Auth.Save` 执行同步临时文件写入和原子重命名；后续源文件失败时，会回滚已经
+写入的源文件。回滚会尽力完成；SQLite 永远不会成为替代启用状态来源。
+
+冷却清理只删除基于时间的配额和临时状态。凭据故障、禁用状态、持续未授权状态
+和模型排除保持不变。绑定清理只接受精确用户与会话、用户或账户范围。精确清理
+在服务端派生租户范围 Digest；所有范围返回逻辑 `deleted_count`，不提供全局
+清理或目标认证迁移。
+
+活动 HTTP 和 SSE 响应会一直计数到上游 Body 关闭。成功的 WebSocket 桥接会
+计数到桥接结束。禁用认证只改变后续选择，不会取消这些已经建立的操作。
+
+每个变更会在外部修改之前检查 SQLite 就绪状态。后续存储故障仍会经过响应提交
+保护，因此进程进入 Fail-fast 关闭时，请求不能返回成功。
 
 ## 认证健康与重试
 
@@ -211,10 +239,11 @@ Body。如果临时 Replay 存储无法创建或写入，检查会在产生额�
 OAuth 兼容请求按认证该请求的 Access Token 所属稳定身份划分。模型名称不属于
 亲和性 Key。
 
-数据库只存储由租户范围、信号类型和规范化值派生的 SHA-256 Digest。同一请求中
-观察到的 Prompt Cache、Conversation 和 Session 别名共享一个仅含 Digest 的
-绑定组。首次绑定使用原子插入；并发首次请求跟随数据库获胜者。重绑定使用
-Compare-and-swap，使并发故障转移收敛，而不会覆盖其他请求的获胜结果。
+数据库只存储由租户范围、信号类型和规范化值派生的 SHA-256 Digest，以及用于
+按用户管理删除的独立 SHA-256 租户范围 Digest。同一请求中观察到的 Prompt
+Cache、Conversation 和 Session 别名共享一个仅含 Digest 的绑定组。首次绑定
+使用原子插入；并发首次请求跟随数据库获胜者。重绑定使用 Compare-and-swap，
+使并发故障转移收敛，而不会覆盖其他请求的获胜结果。
 
 绑定在一小时无活动后过期。活动绑定仅在距上次持久化写入至少 30 分钟后续期，
 过期行以有界批次清理。绑定在进程重启后保留。禁用认证不会删除空闲绑定；禁用
@@ -228,7 +257,7 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 | --- | --- |
 | `/`、`/healthz` | 服务 Handler |
 | `/v0/local-admin/*` | 回环管理 |
-| `/v0/management/*` | 管理 Key API |
+| `/v0/management/*` | 使用管理 Key 的用户、用量、认证状态、恢复和绑定管理 API |
 | `/v0/user/*` | 托管用户自助 API |
 | `/v1/models` | 按认证运行时模型聚合和嵌入式回退 |
 | `/v1/chat/completions` | 本地协议转换 |

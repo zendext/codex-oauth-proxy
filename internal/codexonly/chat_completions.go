@@ -147,6 +147,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 		})
 		return
 	}
+	endActiveConnection := s.beginAuthConnection(auth.ID)
+	defer endActiveConnection()
 	defer upstreamResp.Body.Close()
 
 	if upstreamResp.StatusCode < 200 || upstreamResp.StatusCode >= 300 {
