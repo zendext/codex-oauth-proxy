@@ -241,10 +241,19 @@ Upgrade 成功后不会重试。不可重放的请求 Body 会保留第一次上
 2. 将消息、Tool、Response Format、Reasoning 和 Service Tier 转换为 Responses
    请求。
 3. 强制上游使用 `stream: true` 和 `store: false`。
-4. 使用与可重放 Responses 请求相同的健康感知提交前重试执行器。
-5. 读取 Responses SSE Event。
-6. 聚合为普通 Chat Completions 响应，或转换为 Chat Completions SSE Chunk。
-7. 应用本地 Stop Sequence 过滤并记录用量。
+4. 在提交下游响应前预检上游 SSE。对于非流式客户端，在重试 Attempt 内校验
+   完整上游 Stream；对于流式客户端，在提交 Header 或 Assistant Role Chunk
+   前校验第一个 Event。
+5. 将提交前终态错误交给与可重放 Responses 请求相同的健康感知执行器。
+6. 读取有界 Responses SSE Event，并要求恰好一个 `response.completed` 或
+   `response.incomplete` 终态。
+7. 按 Index 协调 `response.output_item.done` 快照与终态 Output。非流式 Output
+   以终态快照为准；流式响应只补发缺失的文本或 Tool Argument 后缀，并拒绝
+   冲突。
+8. 聚合为普通 Chat Completions 响应，或转换为 Chat Completions SSE Chunk。
+   提交后故障只发送一个脱敏 SSE Error，绝不重新进入重试。
+9. 应用 Unicode 安全的本地 Stop 过滤；Stop 命中后继续读取终态和用量，并记录
+   成功、上游故障或客户端取消结果。
 
 这是专用兼容层，不是通用的 Schema 保留型转换引擎。
 

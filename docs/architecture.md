@@ -284,12 +284,23 @@ upstream response unchanged.
 2. Convert messages, tools, response format, reasoning, and service tier to a
    Responses request.
 3. Force `stream: true` and `store: false` upstream.
-4. Run the same health-aware pre-commit retry executor used by replayable
-   Responses requests.
-5. Read Responses SSE events.
-6. Aggregate them into a normal Chat Completions response or translate them into
-   Chat Completions SSE chunks.
-7. Apply local stop-sequence filtering and record usage.
+4. Preflight the upstream SSE before downstream commitment. For non-stream
+   clients, validate the complete upstream stream inside the retry attempt; for
+   stream clients, validate the first event before committing headers or the
+   assistant role chunk.
+5. Feed pre-commit terminal errors into the same health-aware executor used by
+   replayable Responses requests.
+6. Read bounded Responses SSE events and require exactly one
+   `response.completed` or `response.incomplete` terminal.
+7. Reconcile indexed `response.output_item.done` snapshots with terminal output.
+   Non-stream output uses the terminal snapshot as authoritative. Streaming
+   emits only missing text or tool-argument suffixes and rejects conflicts.
+8. Aggregate into a normal Chat Completions response or translate into Chat
+   Completions SSE chunks. Post-commit failures emit one sanitized SSE error and
+   never re-enter retry.
+9. Apply Unicode-safe local stop filtering, continue draining terminal state and
+   usage after a stop match, and record success, upstream failure, or client
+   cancellation outcomes.
 
 This is a focused compatibility layer, not a generic schema-preserving
 translation engine.

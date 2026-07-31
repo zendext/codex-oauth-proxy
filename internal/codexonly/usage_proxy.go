@@ -36,6 +36,7 @@ type usageCaptureContext struct {
 	Counters        UsageCounters
 	HasUsage        bool
 	DeltaOnly       bool
+	Outcome         string
 }
 
 type usageCaptureReadCloser struct {
@@ -188,7 +189,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 	diagnostics := s.usageDiagnostics(capture)
 	if s.debugUsageResponseEnabled() {
 		s.debugf(
-			"usage response request_id=%s user_id=%s api_key_id=%s key_hash=%s masked_key=%s auth_id=%s model=%s reasoning_effort=%s service_tier=%s status=%d total_tokens=%d has_usage=%t truncated=%t retry_after=%q",
+			"usage response request_id=%s user_id=%s api_key_id=%s key_hash=%s masked_key=%s auth_id=%s model=%s reasoning_effort=%s service_tier=%s status=%d outcome=%s total_tokens=%d has_usage=%t truncated=%t retry_after=%q",
 			capture.RequestID,
 			credential.User.ID,
 			credential.APIKey.ID,
@@ -199,6 +200,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 			normalizeUsageText(capture.ReasoningEffort, "unknown"),
 			normalizeServiceTier(capture.ServiceTier),
 			capture.StatusCode,
+			normalizeUsageText(capture.Outcome, "unknown"),
 			capture.Counters.TotalTokens,
 			capture.HasUsage,
 			capture.Truncated,
@@ -240,6 +242,7 @@ func (s *Server) usageDiagnostics(capture usageCaptureContext) string {
 		"reasoning_effort": normalizeUsageText(capture.ReasoningEffort, "unknown"),
 		"service_tier":     normalizeServiceTier(capture.ServiceTier),
 		"status":           capture.StatusCode,
+		"outcome":          normalizeUsageText(capture.Outcome, "unknown"),
 		"retry_after":      strings.TrimSpace(capture.RetryAfter),
 		"has_usage":        capture.HasUsage,
 		"truncated":        capture.Truncated,

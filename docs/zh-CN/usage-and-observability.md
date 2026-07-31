@@ -191,8 +191,9 @@ usage:
   debug-openai-response: true
 ```
 
-用量诊断包含安全的请求 ID、模型维度、脱敏 Key 元数据、状态和 Token 摘要，
-不会有意记录响应 Body 和明文 Secret。
+用量诊断包含安全的请求 ID、模型维度、脱敏 Key 元数据、状态、请求结果和
+Token 摘要。Chat Completions 结果会区分 `success`、`upstream_failure` 和
+`client_canceled`。不会有意记录响应 Body 和明文 Secret。
 
 ## Grafana 仪表盘
 

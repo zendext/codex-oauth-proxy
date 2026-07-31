@@ -15,6 +15,14 @@ import (
 
 const defaultChatCompletionInstructions = "You are a helpful assistant."
 
+const (
+	maxChatSSEEventBytes       = 52_428_800
+	statusClientClosedRequest  = 499
+	chatOutcomeSuccess         = "success"
+	chatOutcomeUpstreamFailure = "upstream_failure"
+	chatOutcomeClientCanceled  = "client_canceled"
+)
+
 type chatRequestConversion struct {
 	Responses     map[string]any
 	Metadata      proxyRequestUsageMetadata
@@ -24,38 +32,54 @@ type chatRequestConversion struct {
 }
 
 type chatCompletionState struct {
-	id               string
-	model            string
-	created          int64
-	content          strings.Builder
-	toolCalls        []chatToolCallState
-	toolIndexByItem  map[string]int
-	toolIndexByCall  map[string]int
-	currentToolIndex int
-	usage            UsageCounters
-	hasUsage         bool
-	finishReason     string
+	id                string
+	model             string
+	created           int64
+	content           strings.Builder
+	toolCalls         []chatToolCallState
+	toolIndexByItem   map[string]int
+	toolIndexByCall   map[string]int
+	toolIndexByOutput map[int]int
+	currentToolIndex  int
+	outputItems       map[int]map[string]any
+	nextOutputIndex   int
+	usage             UsageCounters
+	hasUsage          bool
+	finishReason      string
+	terminal          bool
+	stopped           bool
 }
 
 type chatToolCallState struct {
-	ID        string
-	ItemID    string
-	Name      string
-	Arguments strings.Builder
+	ID          string
+	ItemID      string
+	Name        string
+	OutputIndex int
+	Arguments   strings.Builder
 }
 
 type chatStreamUpdate struct {
 	ContentDelta  string
 	ToolDeltas    []map[string]any
-	Completed     bool
+	Terminal      bool
 	FinishReason  string
 	ResponseID    string
 	ResponseModel string
+	UnknownReason string
 }
 
 type sseEvent struct {
 	Event string
 	Data  string
+}
+
+type chatStreamFailure struct {
+	statusCode int
+	body       []byte
+}
+
+func (e *chatStreamFailure) Error() string {
+	return "upstream Responses stream failed"
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, authorization proxyAuthorization, signals []sessionAffinitySignal, replayCandidate bool) {
@@ -70,8 +94,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	replayable := replayCandidate && len(payload) <= maxReplayBodyBytes
+	upstreamCtx, cancelUpstream := context.WithCancel(r.Context())
+	defer cancelUpstream()
 	result, err := s.executeUpstream(
-		r.Context(),
+		upstreamCtx,
 		authorization,
 		signals,
 		conversion.Metadata.Model,
@@ -81,14 +107,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 			if errRequest != nil {
 				return nil, errRequest
 			}
-			return s.httpClient.Transport.RoundTrip(upstreamReq)
+			upstreamResp, errRoundTrip := s.httpClient.Transport.RoundTrip(upstreamReq)
+			if errRoundTrip != nil {
+				return nil, errRoundTrip
+			}
+			return prepareChatCompletionUpstreamResponse(ctx, upstreamResp, conversion.Stream)
 		},
 	)
 	auth := result.Auth
 	upstreamResp := result.Response
 	if err != nil {
 		s.debugf("chat completions upstream request failed method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
-		if r.Context().Err() != nil {
+		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+			s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, statusClientClosedRequest, "", chatOutcomeClientCanceled)
 			return
 		}
 		if errors.Is(err, ErrStorageFailure) {
@@ -97,12 +128,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 		}
 		var finalErr *proxyFinalError
 		if errors.As(err, &finalErr) && finalErr != nil {
-			s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, finalErr.StatusCode, "")
+			s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, finalErr.StatusCode, "", chatOutcomeUpstreamFailure)
 			writeProxyError(w, finalErr)
 			return
 		}
 		statusCode := http.StatusBadGateway
-		s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, statusCode, "")
+		s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, statusCode, "", chatOutcomeUpstreamFailure)
 		writeProxyError(w, &proxyFinalError{
 			StatusCode: statusCode,
 			Code:       proxyErrorCodeUpstream,
@@ -113,14 +144,23 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 	defer upstreamResp.Body.Close()
 
 	if upstreamResp.StatusCode < 200 || upstreamResp.StatusCode >= 300 {
-		s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, upstreamResp.StatusCode, usageRequestID(r, upstreamResp))
-		writeUpstreamChatError(w, upstreamResp)
+		failure, errClassify := classifyUpstreamResponse(upstreamResp, conversion.Metadata.Model, time.Now())
+		if errClassify != nil {
+			failure = upstreamFailure{
+				Kind:       upstreamFailureTransient,
+				StatusCode: http.StatusBadGateway,
+				Reason:     "upstream_error",
+			}
+		}
+		finalErr := chatProxyErrorFromFailure(failure)
+		s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, finalErr.StatusCode, usageRequestID(r, upstreamResp), chatOutcomeUpstreamFailure)
+		writeProxyError(w, finalErr)
 		return
 	}
 
 	state := newChatCompletionState(conversion.Metadata.Model)
 	if conversion.Stream {
-		s.streamChatCompletion(w, r, upstreamResp, authorization, auth, conversion.Metadata, state, conversion.IncludeUsage, conversion.StopSequences)
+		s.streamChatCompletion(w, r, upstreamResp, authorization, auth, conversion.Metadata, state, conversion.IncludeUsage, conversion.StopSequences, cancelUpstream)
 		return
 	}
 	s.aggregateChatCompletion(w, r, upstreamResp, authorization, auth, conversion.Metadata, state, conversion.StopSequences)
@@ -505,10 +545,7 @@ func chatContentEmpty(value any) bool {
 
 func (s *Server) aggregateChatCompletion(w http.ResponseWriter, r *http.Request, upstreamResp *http.Response, authorization proxyAuthorization, auth *Auth, metadata proxyRequestUsageMetadata, state *chatCompletionState, stopSequences []string) {
 	readErr := readResponsesSSE(upstreamResp.Body, func(event sseEvent) error {
-		if strings.TrimSpace(event.Data) == "[DONE]" {
-			return nil
-		}
-		update, err := state.applyResponsesEvent(event)
+		update, err := state.applyResponsesEvent(event, false)
 		if err != nil {
 			return err
 		}
@@ -518,39 +555,57 @@ func (s *Server) aggregateChatCompletion(w http.ResponseWriter, r *http.Request,
 		if update.ResponseModel != "" {
 			state.model = update.ResponseModel
 		}
+		if update.UnknownReason != "" {
+			s.debugf("chat completions unknown incomplete reason=%s", safeChatLogValue(update.UnknownReason))
+		}
 		return nil
 	})
+	if readErr != nil && state.terminal && !isChatStreamFailure(readErr) {
+		readErr = nil
+	}
+	if readErr == nil && !state.terminal {
+		readErr = newChatProtocolFailure("incomplete_stream")
+	}
 	if readErr != nil {
-		s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, http.StatusBadGateway, usageRequestID(r, upstreamResp))
-		writeError(w, http.StatusBadGateway, readErr.Error())
+		finalErr, statusCode := chatProxyErrorFromStreamError(readErr, metadata.Model)
+		s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusCode, usageRequestID(r, upstreamResp), chatOutcomeUpstreamFailure)
+		writeProxyError(w, finalErr)
 		return
 	}
 	if content, stopped := truncateAtStopSequence(state.content.String(), stopSequences); stopped {
 		state.content.Reset()
 		state.content.WriteString(content)
-		state.finishReason = "stop"
+		state.stopped = true
 	}
-	s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, upstreamResp.StatusCode, usageRequestID(r, upstreamResp))
+	s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, upstreamResp.StatusCode, usageRequestID(r, upstreamResp), chatOutcomeSuccess)
 	writeJSON(w, http.StatusOK, state.chatCompletionResponse())
 }
 
-func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, upstreamResp *http.Response, authorization proxyAuthorization, auth *Auth, metadata proxyRequestUsageMetadata, state *chatCompletionState, includeUsage bool, stopSequences []string) {
+func (s *Server) streamChatCompletion(
+	w http.ResponseWriter,
+	r *http.Request,
+	upstreamResp *http.Response,
+	authorization proxyAuthorization,
+	auth *Auth,
+	metadata proxyRequestUsageMetadata,
+	state *chatCompletionState,
+	includeUsage bool,
+	stopSequences []string,
+	cancelUpstream context.CancelFunc,
+) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flushChatCompletion(w)
+	if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(map[string]any{"role": "assistant"}, nil, nil, false)); errWrite != nil {
+		cancelUpstream()
+		s.recordChatCompletionUsage(r, authorization, auth, metadata, UsageCounters{}, false, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+		return
+	}
 
-	_ = writeChatSSE(w, state.chatCompletionChunk(map[string]any{"role": "assistant"}, nil, nil, false))
-	flushChatCompletion(w)
-
-	var streamErr error
+	var writeErr error
 	stopFilter := newChatStopFilter(stopSequences)
 	readErr := readResponsesSSE(upstreamResp.Body, func(event sseEvent) error {
-		if strings.TrimSpace(event.Data) == "[DONE]" {
-			return nil
-		}
-		update, err := state.applyResponsesEvent(event)
+		update, err := state.applyResponsesEvent(event, true)
 		if err != nil {
 			return err
 		}
@@ -563,144 +618,187 @@ func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, up
 		if update.ContentDelta != "" {
 			contentDelta, stopped := stopFilter.push(update.ContentDelta)
 			if stopped {
-				state.finishReason = "stop"
+				state.stopped = true
 			}
 			if contentDelta != "" {
-				if errWrite := writeChatSSE(w, state.chatCompletionChunk(map[string]any{"content": contentDelta}, nil, nil, false)); errWrite != nil {
-					streamErr = errWrite
+				if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(map[string]any{"content": contentDelta}, nil, nil, false)); errWrite != nil {
+					writeErr = errWrite
+					cancelUpstream()
 					return errWrite
 				}
-				flushChatCompletion(w)
 			}
 		}
-		for _, delta := range update.ToolDeltas {
-			if errWrite := writeChatSSE(w, state.chatCompletionChunk(map[string]any{"tool_calls": []any{delta}}, nil, nil, false)); errWrite != nil {
-				streamErr = errWrite
-				return errWrite
+		if !state.stopped {
+			for _, delta := range update.ToolDeltas {
+				if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(map[string]any{"tool_calls": []any{delta}}, nil, nil, false)); errWrite != nil {
+					writeErr = errWrite
+					cancelUpstream()
+					return errWrite
+				}
 			}
-			flushChatCompletion(w)
 		}
-		if update.Completed {
-			if contentDelta := stopFilter.flush(); contentDelta != "" {
-				if errWrite := writeChatSSE(w, state.chatCompletionChunk(map[string]any{"content": contentDelta}, nil, nil, false)); errWrite != nil {
-					streamErr = errWrite
-					return errWrite
-				}
-				flushChatCompletion(w)
-			}
-			finishReason := update.FinishReason
-			if finishReason == "" {
-				finishReason = state.finalFinishReason()
-			}
-			if errWrite := writeChatSSE(w, state.chatCompletionChunk(map[string]any{}, &finishReason, nil, false)); errWrite != nil {
-				streamErr = errWrite
-				return errWrite
-			}
-			flushChatCompletion(w)
-			if includeUsage {
-				usage := state.chatUsage()
-				if errWrite := writeChatSSE(w, state.chatCompletionChunk(nil, nil, &usage, true)); errWrite != nil {
-					streamErr = errWrite
-					return errWrite
-				}
-				flushChatCompletion(w)
-			}
+		if update.UnknownReason != "" {
+			s.debugf("chat completions unknown incomplete reason=%s", safeChatLogValue(update.UnknownReason))
 		}
 		return nil
 	})
-	statusCode := upstreamResp.StatusCode
-	if readErr != nil && streamErr == nil {
-		statusCode = http.StatusBadGateway
+	if readErr != nil && state.terminal && !isChatStreamFailure(readErr) {
+		readErr = nil
 	}
-	s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusCode, usageRequestID(r, upstreamResp))
-	if streamErr == nil {
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
-		flushChatCompletion(w)
+	if writeErr != nil || r.Context().Err() != nil {
+		cancelUpstream()
+		s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+		return
 	}
+	if readErr == nil && !state.terminal {
+		readErr = newChatProtocolFailure("incomplete_stream")
+	}
+	if readErr != nil {
+		finalErr, statusCode := chatProxyErrorFromStreamError(readErr, metadata.Model)
+		s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusCode, usageRequestID(r, upstreamResp), chatOutcomeUpstreamFailure)
+		_ = writeAndFlushChatSSE(w, chatErrorEnvelope(finalErr))
+		cancelUpstream()
+		return
+	}
+	if contentDelta := stopFilter.flush(); contentDelta != "" {
+		if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(map[string]any{"content": contentDelta}, nil, nil, false)); errWrite != nil {
+			cancelUpstream()
+			s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+			return
+		}
+	}
+	finishReason := state.finalFinishReason()
+	if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(map[string]any{}, &finishReason, nil, false)); errWrite != nil {
+		cancelUpstream()
+		s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+		return
+	}
+	if includeUsage {
+		usage := state.chatUsage()
+		if errWrite := writeAndFlushChatSSE(w, state.chatCompletionChunk(nil, nil, &usage, true)); errWrite != nil {
+			cancelUpstream()
+			s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+			return
+		}
+	}
+	if errWrite := writeAndFlushChatDone(w); errWrite != nil {
+		cancelUpstream()
+		s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, statusClientClosedRequest, usageRequestID(r, upstreamResp), chatOutcomeClientCanceled)
+		return
+	}
+	s.recordChatCompletionUsage(r, authorization, auth, metadata, state.usage, state.hasUsage, upstreamResp.StatusCode, usageRequestID(r, upstreamResp), chatOutcomeSuccess)
 }
 
 func newChatCompletionState(model string) *chatCompletionState {
 	created := time.Now().Unix()
 	return &chatCompletionState{
-		id:               fmt.Sprintf("chatcmpl-%d", created),
-		model:            model,
-		created:          created,
-		toolIndexByItem:  map[string]int{},
-		toolIndexByCall:  map[string]int{},
-		currentToolIndex: -1,
+		id:                fmt.Sprintf("chatcmpl-%d", created),
+		model:             model,
+		created:           created,
+		toolIndexByItem:   map[string]int{},
+		toolIndexByCall:   map[string]int{},
+		toolIndexByOutput: map[int]int{},
+		currentToolIndex:  -1,
+		outputItems:       map[int]map[string]any{},
 	}
 }
 
-func (s *chatCompletionState) applyResponsesEvent(event sseEvent) (chatStreamUpdate, error) {
-	var payload map[string]any
-	decoder := json.NewDecoder(strings.NewReader(event.Data))
-	decoder.UseNumber()
-	if err := decoder.Decode(&payload); err != nil {
+func (s *chatCompletionState) applyResponsesEvent(event sseEvent, streaming bool) (chatStreamUpdate, error) {
+	payload, eventType, err := decodeChatResponsesEvent(event)
+	if err != nil {
 		return chatStreamUpdate{}, err
 	}
-	eventType := stringFromMap(payload, "type")
-	if eventType == "" {
-		eventType = event.Event
+	if s.terminal {
+		return chatStreamUpdate{}, newChatProtocolFailure("data_after_terminal")
 	}
 	switch eventType {
 	case "response.created":
-		if response, ok := mapValue(payload["response"]); ok {
-			s.applyResponseMetadata(response)
-			return chatStreamUpdate{ResponseID: s.id, ResponseModel: s.model}, nil
+		response, ok := mapValue(payload["response"])
+		if !ok {
+			return chatStreamUpdate{}, newChatProtocolFailure("malformed_event")
 		}
+		s.applyResponseMetadata(response)
+		return chatStreamUpdate{ResponseID: s.id, ResponseModel: s.model}, nil
 	case "response.output_text.delta":
-		delta := rawStringFromMap(payload, "delta")
+		delta, ok := payload["delta"].(string)
+		if !ok {
+			return chatStreamUpdate{}, newChatProtocolFailure("malformed_event")
+		}
 		s.content.WriteString(delta)
 		return chatStreamUpdate{ContentDelta: delta}, nil
 	case "response.output_text.done":
-		if s.content.Len() == 0 {
-			text := firstNonEmptyString(rawStringFromMap(payload, "text"), rawStringFromMap(payload, "output_text"))
-			s.content.WriteString(text)
-			return chatStreamUpdate{ContentDelta: text}, nil
+		text := firstNonEmptyString(rawStringFromMap(payload, "text"), rawStringFromMap(payload, "output_text"))
+		delta, errReconcile := s.reconcileTextSnapshot(text, streaming)
+		if errReconcile != nil {
+			return chatStreamUpdate{}, errReconcile
 		}
-	case "response.output_item.added", "response.output_item.done":
-		if item, ok := mapValue(payload["item"]); ok && stringFromMap(item, "type") == "function_call" {
-			existingIndex := s.lookupToolCallIndex(item)
-			existingArguments := ""
-			if existingIndex >= 0 {
-				existingArguments = s.toolCalls[existingIndex].Arguments.String()
-			}
-			index, created := s.upsertToolCall(item)
-			if eventType == "response.output_item.added" || created {
-				return chatStreamUpdate{ToolDeltas: []map[string]any{s.initialToolCallDelta(index)}}, nil
-			}
-			if eventType == "response.output_item.done" && existingArguments == "" {
-				if arguments := rawStringFromMap(item, "arguments"); arguments != "" {
-					return chatStreamUpdate{ToolDeltas: []map[string]any{s.argumentsToolCallDelta(index, arguments)}}, nil
-				}
-			}
+		return chatStreamUpdate{ContentDelta: delta}, nil
+	case "response.output_item.added":
+		item, ok := mapValue(payload["item"])
+		if !ok {
+			return chatStreamUpdate{}, newChatProtocolFailure("malformed_event")
+		}
+		if stringFromMap(item, "type") != "function_call" {
+			return chatStreamUpdate{}, nil
+		}
+		outputIndex := s.outputIndexForEvent(payload, item)
+		index, created := s.ensureToolCall(item, outputIndex)
+		if created {
+			return chatStreamUpdate{ToolDeltas: []map[string]any{s.initialToolCallDelta(index)}}, nil
+		}
+	case "response.output_item.done":
+		item, ok := mapValue(payload["item"])
+		if !ok {
+			return chatStreamUpdate{}, newChatProtocolFailure("malformed_event")
+		}
+		outputIndex := s.outputIndexForEvent(payload, item)
+		s.outputItems[outputIndex] = item
+		if streaming {
+			return s.reconcileStreamingOutputItem(item, outputIndex)
 		}
 	case "response.function_call_arguments.delta":
 		index := s.toolIndexForPayload(payload)
-		if index >= 0 {
-			delta := rawStringFromMap(payload, "delta")
-			s.toolCalls[index].Arguments.WriteString(delta)
-			return chatStreamUpdate{ToolDeltas: []map[string]any{s.argumentsToolCallDelta(index, delta)}}, nil
+		delta, ok := payload["delta"].(string)
+		if index < 0 || !ok {
+			return chatStreamUpdate{}, newChatProtocolFailure("malformed_event")
 		}
+		s.toolCalls[index].Arguments.WriteString(delta)
+		return chatStreamUpdate{ToolDeltas: []map[string]any{s.argumentsToolCallDelta(index, delta)}}, nil
 	case "response.function_call_arguments.done":
 		index := s.toolIndexForPayload(payload)
-		if index >= 0 {
-			arguments := rawStringFromMap(payload, "arguments")
-			if arguments != "" {
-				s.toolCalls[index].Arguments.Reset()
-				s.toolCalls[index].Arguments.WriteString(arguments)
-			}
+		arguments, ok := payload["arguments"].(string)
+		if index < 0 || !ok {
+			return chatStreamUpdate{}, newChatProtocolFailure("malformed_event")
 		}
-	case "response.completed":
+		delta, errReconcile := s.reconcileToolArguments(index, arguments, streaming)
+		if errReconcile != nil {
+			return chatStreamUpdate{}, errReconcile
+		}
+		if delta != "" {
+			return chatStreamUpdate{ToolDeltas: []map[string]any{s.argumentsToolCallDelta(index, delta)}}, nil
+		}
+	case "response.completed", "response.incomplete":
+		response, ok := mapValue(payload["response"])
+		if !ok {
+			return chatStreamUpdate{}, newChatProtocolFailure("malformed_event")
+		}
+		update, errTerminal := s.applyTerminalResponse(response, eventType, streaming)
+		if errTerminal != nil {
+			return chatStreamUpdate{}, errTerminal
+		}
+		s.terminal = true
+		update.Terminal = true
+		update.ResponseID = s.id
+		update.ResponseModel = s.model
+		return update, nil
+	case "response.failed":
 		if response, ok := mapValue(payload["response"]); ok {
-			s.applyCompletedResponse(response)
+			s.applyResponseMetadata(response)
+			s.applyResponseUsage(response)
 		}
-		return chatStreamUpdate{
-			Completed:     true,
-			FinishReason:  s.finalFinishReason(),
-			ResponseID:    s.id,
-			ResponseModel: s.model,
-		}, nil
+		return chatStreamUpdate{}, chatFailureFromEvent(payload, eventType)
+	case "error":
+		return chatStreamUpdate{}, chatFailureFromEvent(payload, eventType)
 	}
 	return chatStreamUpdate{}, nil
 }
@@ -714,35 +812,145 @@ func (s *chatCompletionState) applyResponseMetadata(response map[string]any) {
 	}
 }
 
-func (s *chatCompletionState) applyCompletedResponse(response map[string]any) {
-	s.applyResponseMetadata(response)
+func (s *chatCompletionState) applyResponseUsage(response map[string]any) {
 	if counters, ok := usageCountersFromValue(response["usage"]); ok {
 		s.usage = counters
 		s.hasUsage = true
 	}
-	if output, ok := response["output"].([]any); ok {
-		s.applyResponseOutput(output)
-	}
-	if reason := responseFinishReason(response, len(s.toolCalls) > 0); reason != "" {
-		s.finishReason = reason
-	}
 }
 
-func (s *chatCompletionState) applyResponseOutput(output []any) {
-	for _, itemValue := range output {
-		item, ok := itemValue.(map[string]any)
-		if !ok {
-			continue
-		}
-		switch stringFromMap(item, "type") {
-		case "message":
-			if s.content.Len() == 0 {
-				s.content.WriteString(outputTextFromMessage(item))
-			}
-		case "function_call":
-			s.upsertToolCall(item)
+func (s *chatCompletionState) applyTerminalResponse(response map[string]any, eventType string, streaming bool) (chatStreamUpdate, error) {
+	s.applyResponseMetadata(response)
+	s.applyResponseUsage(response)
+	update, err := s.reconcileTerminalOutput(response, streaming)
+	if err != nil {
+		return chatStreamUpdate{}, err
+	}
+	switch eventType {
+	case "response.incomplete":
+		reason, unknown := incompleteFinishReason(response)
+		s.finishReason = reason
+		update.UnknownReason = unknown
+	default:
+		if len(s.toolCalls) > 0 {
+			s.finishReason = "tool_calls"
+		} else {
+			s.finishReason = "stop"
 		}
 	}
+	update.FinishReason = s.finalFinishReason()
+	return update, nil
+}
+
+func (s *chatCompletionState) reconcileTerminalOutput(response map[string]any, streaming bool) (chatStreamUpdate, error) {
+	items, err := s.resolvedResponseOutput(response)
+	if err != nil {
+		return chatStreamUpdate{}, err
+	}
+	var messageText strings.Builder
+	var toolItems []indexedChatOutputItem
+	hasMessage := false
+	for _, indexed := range items {
+		switch stringFromMap(indexed.item, "type") {
+		case "message":
+			hasMessage = true
+			messageText.WriteString(outputTextFromMessage(indexed.item))
+		case "function_call":
+			toolItems = append(toolItems, indexed)
+		}
+	}
+	if !hasMessage && len(toolItems) == 0 {
+		return chatStreamUpdate{}, nil
+	}
+
+	if !streaming {
+		s.content.Reset()
+		s.resetToolCalls()
+		if hasMessage {
+			s.content.WriteString(messageText.String())
+		}
+		for _, indexed := range toolItems {
+			index, _ := s.ensureToolCall(indexed.item, indexed.index)
+			s.toolCalls[index].Arguments.Reset()
+			s.toolCalls[index].Arguments.WriteString(rawStringFromMap(indexed.item, "arguments"))
+		}
+		return chatStreamUpdate{}, nil
+	}
+
+	update := chatStreamUpdate{}
+	if hasMessage {
+		delta, errText := s.reconcileTextSnapshot(messageText.String(), true)
+		if errText != nil {
+			return chatStreamUpdate{}, errText
+		}
+		update.ContentDelta = delta
+	} else if s.content.Len() > 0 {
+		return chatStreamUpdate{}, newChatProtocolFailure("output_conflict")
+	}
+
+	finalTools := make(map[int]struct{}, len(toolItems))
+	for _, indexed := range toolItems {
+		deltas, errTool := s.reconcileToolSnapshot(indexed.item, indexed.index, true)
+		if errTool != nil {
+			return chatStreamUpdate{}, errTool
+		}
+		update.ToolDeltas = append(update.ToolDeltas, deltas...)
+		index := s.lookupToolCallIndex(indexed.item)
+		if index < 0 {
+			index = s.toolIndexByOutput[indexed.index]
+		}
+		if index >= 0 {
+			finalTools[index] = struct{}{}
+		}
+	}
+	if len(finalTools) != len(s.toolCalls) {
+		return chatStreamUpdate{}, newChatProtocolFailure("output_conflict")
+	}
+	return update, nil
+}
+
+type indexedChatOutputItem struct {
+	index int
+	item  map[string]any
+}
+
+func (s *chatCompletionState) resolvedResponseOutput(response map[string]any) ([]indexedChatOutputItem, error) {
+	terminal := map[int]map[string]any{}
+	if rawOutput, exists := response["output"]; exists {
+		output, ok := rawOutput.([]any)
+		if !ok {
+			return nil, newChatProtocolFailure("malformed_event")
+		}
+		for index, itemValue := range output {
+			item, okItem := itemValue.(map[string]any)
+			if !okItem {
+				return nil, newChatProtocolFailure("malformed_event")
+			}
+			terminal[index] = item
+		}
+	}
+	maxIndex := -1
+	for index := range terminal {
+		if index > maxIndex {
+			maxIndex = index
+		}
+	}
+	for index := range s.outputItems {
+		if index > maxIndex {
+			maxIndex = index
+		}
+	}
+	items := make([]indexedChatOutputItem, 0, maxIndex+1)
+	for index := 0; index <= maxIndex; index++ {
+		item := terminal[index]
+		if item == nil {
+			item = s.outputItems[index]
+		}
+		if item != nil {
+			items = append(items, indexedChatOutputItem{index: index, item: item})
+		}
+	}
+	return items, nil
 }
 
 func outputTextFromMessage(message map[string]any) string {
@@ -763,30 +971,39 @@ func outputTextFromMessage(message map[string]any) string {
 	return out.String()
 }
 
-func responseFinishReason(response map[string]any, hasToolCalls bool) string {
-	if hasToolCalls {
-		return "tool_calls"
+func incompleteFinishReason(response map[string]any) (string, string) {
+	reason := ""
+	if details, ok := mapValue(response["incomplete_details"]); ok {
+		reason = stringFromMap(details, "reason")
 	}
-	if status := stringFromMap(response, "status"); status == "incomplete" {
-		if details, ok := mapValue(response["incomplete_details"]); ok && stringFromMap(details, "reason") == "max_output_tokens" {
-			return "length"
-		}
+	switch reason {
+	case "content_filter":
+		return "content_filter", ""
+	case "max_tokens", "max_output_tokens":
+		return "length", ""
+	default:
+		return "length", reason
 	}
-	return "stop"
 }
 
-func (s *chatCompletionState) upsertToolCall(item map[string]any) (int, bool) {
+func (s *chatCompletionState) ensureToolCall(item map[string]any, outputIndex int) (int, bool) {
 	itemID := stringFromMap(item, "id")
 	callID := firstNonEmptyString(stringFromMap(item, "call_id"), itemID)
 	index := s.lookupToolCallIndex(item)
+	if index < 0 && outputIndex >= 0 {
+		if found, ok := s.toolIndexByOutput[outputIndex]; ok {
+			index = found
+		}
+	}
 	created := false
 	if index < 0 {
 		index = len(s.toolCalls)
 		created = true
 		s.toolCalls = append(s.toolCalls, chatToolCallState{
-			ID:     firstNonEmptyString(callID, fmt.Sprintf("call_%d", index)),
-			ItemID: itemID,
-			Name:   stringFromMap(item, "name"),
+			ID:          firstNonEmptyString(callID, fmt.Sprintf("call_%d", index)),
+			ItemID:      itemID,
+			Name:        stringFromMap(item, "name"),
+			OutputIndex: outputIndex,
 		})
 	}
 	if itemID != "" {
@@ -800,8 +1017,9 @@ func (s *chatCompletionState) upsertToolCall(item map[string]any) (int, bool) {
 	if name := stringFromMap(item, "name"); name != "" {
 		s.toolCalls[index].Name = name
 	}
-	if arguments := rawStringFromMap(item, "arguments"); arguments != "" && s.toolCalls[index].Arguments.Len() == 0 {
-		s.toolCalls[index].Arguments.WriteString(arguments)
+	if outputIndex >= 0 {
+		s.toolCalls[index].OutputIndex = outputIndex
+		s.toolIndexByOutput[outputIndex] = index
 	}
 	s.currentToolIndex = index
 	return index, created
@@ -820,7 +1038,31 @@ func (s *chatCompletionState) lookupToolCallIndex(item map[string]any) int {
 			return found
 		}
 	}
+	if outputIndex, ok := int64Value(item["output_index"]); ok {
+		if found, exists := s.toolIndexByOutput[int(outputIndex)]; exists {
+			return found
+		}
+	}
 	return -1
+}
+
+func (s *chatCompletionState) outputIndexForEvent(payload map[string]any, item map[string]any) int {
+	if outputIndex, ok := int64Value(payload["output_index"]); ok && outputIndex >= 0 {
+		index := int(outputIndex)
+		if index >= s.nextOutputIndex {
+			s.nextOutputIndex = index + 1
+		}
+		return index
+	}
+	if toolIndex := s.lookupToolCallIndex(item); toolIndex >= 0 {
+		outputIndex := s.toolCalls[toolIndex].OutputIndex
+		if outputIndex >= 0 {
+			return outputIndex
+		}
+	}
+	index := s.nextOutputIndex
+	s.nextOutputIndex++
+	return index
 }
 
 func (s *chatCompletionState) toolIndexForPayload(payload map[string]any) int {
@@ -837,8 +1079,7 @@ func (s *chatCompletionState) toolIndexForPayload(payload map[string]any) int {
 		}
 	}
 	if outputIndex, ok := int64Value(payload["output_index"]); ok {
-		index := int(outputIndex)
-		if index >= 0 && index < len(s.toolCalls) {
+		if index, exists := s.toolIndexByOutput[int(outputIndex)]; exists {
 			return index
 		}
 	}
@@ -846,6 +1087,71 @@ func (s *chatCompletionState) toolIndexForPayload(payload map[string]any) int {
 		return s.currentToolIndex
 	}
 	return -1
+}
+
+func (s *chatCompletionState) reconcileStreamingOutputItem(item map[string]any, outputIndex int) (chatStreamUpdate, error) {
+	switch stringFromMap(item, "type") {
+	case "message":
+		delta, err := s.reconcileTextSnapshot(outputTextFromMessage(item), true)
+		return chatStreamUpdate{ContentDelta: delta}, err
+	case "function_call":
+		deltas, err := s.reconcileToolSnapshot(item, outputIndex, true)
+		return chatStreamUpdate{ToolDeltas: deltas}, err
+	default:
+		return chatStreamUpdate{}, nil
+	}
+}
+
+func (s *chatCompletionState) reconcileTextSnapshot(snapshot string, streaming bool) (string, error) {
+	current := s.content.String()
+	if !strings.HasPrefix(snapshot, current) {
+		if streaming {
+			return "", newChatProtocolFailure("output_conflict")
+		}
+		s.content.Reset()
+		s.content.WriteString(snapshot)
+		return "", nil
+	}
+	suffix := snapshot[len(current):]
+	s.content.WriteString(suffix)
+	return suffix, nil
+}
+
+func (s *chatCompletionState) reconcileToolSnapshot(item map[string]any, outputIndex int, streaming bool) ([]map[string]any, error) {
+	index, created := s.ensureToolCall(item, outputIndex)
+	fullArguments := rawStringFromMap(item, "arguments")
+	if created {
+		s.toolCalls[index].Arguments.WriteString(fullArguments)
+		return []map[string]any{s.initialToolCallDelta(index)}, nil
+	}
+	delta, err := s.reconcileToolArguments(index, fullArguments, streaming)
+	if err != nil || delta == "" {
+		return nil, err
+	}
+	return []map[string]any{s.argumentsToolCallDelta(index, delta)}, nil
+}
+
+func (s *chatCompletionState) reconcileToolArguments(index int, fullArguments string, streaming bool) (string, error) {
+	current := s.toolCalls[index].Arguments.String()
+	if !strings.HasPrefix(fullArguments, current) {
+		if streaming {
+			return "", newChatProtocolFailure("output_conflict")
+		}
+		s.toolCalls[index].Arguments.Reset()
+		s.toolCalls[index].Arguments.WriteString(fullArguments)
+		return "", nil
+	}
+	suffix := fullArguments[len(current):]
+	s.toolCalls[index].Arguments.WriteString(suffix)
+	return suffix, nil
+}
+
+func (s *chatCompletionState) resetToolCalls() {
+	s.toolCalls = nil
+	s.toolIndexByItem = map[string]int{}
+	s.toolIndexByCall = map[string]int{}
+	s.toolIndexByOutput = map[int]int{}
+	s.currentToolIndex = -1
 }
 
 func (s *chatCompletionState) initialToolCallDelta(index int) map[string]any {
@@ -968,22 +1274,22 @@ func truncateAtStopSequence(content string, stopSequences []string) (string, boo
 type chatStopFilter struct {
 	stopSequences []string
 	buffered      string
-	maxStopLen    int
+	maxStopRunes  int
 	stopped       bool
 }
 
 func newChatStopFilter(stopSequences []string) *chatStopFilter {
 	filter := &chatStopFilter{stopSequences: stopSequences}
 	for _, stop := range stopSequences {
-		if len(stop) > filter.maxStopLen {
-			filter.maxStopLen = len(stop)
+		if count := len([]rune(stop)); count > filter.maxStopRunes {
+			filter.maxStopRunes = count
 		}
 	}
 	return filter
 }
 
 func (f *chatStopFilter) push(delta string) (string, bool) {
-	if f.maxStopLen == 0 {
+	if f.maxStopRunes == 0 {
 		return delta, false
 	}
 	if f.stopped || delta == "" {
@@ -995,21 +1301,22 @@ func (f *chatStopFilter) push(delta string) (string, bool) {
 		f.stopped = true
 		return content, true
 	}
-	keep := f.maxStopLen - 1
+	keep := f.maxStopRunes - 1
 	if keep <= 0 {
 		return combined, false
 	}
-	if len(combined) <= keep {
+	runes := []rune(combined)
+	if len(runes) <= keep {
 		f.buffered = combined
 		return "", false
 	}
-	emitLen := len(combined) - keep
-	f.buffered = combined[emitLen:]
-	return combined[:emitLen], false
+	emitLen := len(runes) - keep
+	f.buffered = string(runes[emitLen:])
+	return string(runes[:emitLen]), false
 }
 
 func (f *chatStopFilter) flush() string {
-	if f.maxStopLen == 0 || f.stopped || f.buffered == "" {
+	if f.maxStopRunes == 0 || f.stopped || f.buffered == "" {
 		return ""
 	}
 	content := f.buffered
@@ -1018,6 +1325,9 @@ func (f *chatStopFilter) flush() string {
 }
 
 func (s *chatCompletionState) finalFinishReason() string {
+	if s.stopped {
+		return "stop"
+	}
 	if s.finishReason != "" {
 		return s.finishReason
 	}
@@ -1028,43 +1338,413 @@ func (s *chatCompletionState) finalFinishReason() string {
 }
 
 func readResponsesSSE(reader io.Reader, handle func(sseEvent) error) error {
-	buffered := bufio.NewReader(reader)
-	var event sseEvent
+	sseReader := newResponsesSSEReader(reader)
 	for {
-		line, err := buffered.ReadString('\n')
-		if len(line) > 0 {
-			line = strings.TrimSuffix(line, "\n")
-			line = strings.TrimSuffix(line, "\r")
-			if line == "" {
-				if strings.TrimSpace(event.Data) != "" {
-					if errHandle := handle(event); errHandle != nil {
-						return errHandle
-					}
+		event, _, err := sseReader.next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if errHandle := handle(event); errHandle != nil {
+			return errHandle
+		}
+	}
+}
+
+type responsesSSEReader struct {
+	buffered *bufio.Reader
+}
+
+func newResponsesSSEReader(reader io.Reader) *responsesSSEReader {
+	return &responsesSSEReader{buffered: bufio.NewReader(reader)}
+}
+
+func (r *responsesSSEReader) next() (sseEvent, []byte, error) {
+	var event sseEvent
+	var raw bytes.Buffer
+	eventBytes := 0
+	for {
+		line, err := readBoundedSSELine(r.buffered, maxChatSSEEventBytes-eventBytes)
+		eventBytes += len(line)
+		if eventBytes > maxChatSSEEventBytes {
+			return sseEvent{}, nil, newChatProtocolFailure("event_too_large")
+		}
+		_, _ = raw.Write(line)
+		trimmed := bytes.TrimSuffix(line, []byte("\n"))
+		trimmed = bytes.TrimSuffix(trimmed, []byte("\r"))
+		if len(trimmed) == 0 {
+			if event.Data != "" {
+				return event, raw.Bytes(), nil
+			}
+			raw.Reset()
+			eventBytes = 0
+			event = sseEvent{}
+		} else if trimmed[0] != ':' {
+			field, value, hasValue := bytes.Cut(trimmed, []byte(":"))
+			if hasValue && len(value) > 0 && value[0] == ' ' {
+				value = value[1:]
+			}
+			switch string(field) {
+			case "event":
+				event.Event = strings.TrimSpace(string(value))
+			case "data":
+				if event.Data != "" {
+					event.Data += "\n"
 				}
-				event = sseEvent{}
-			} else if strings.HasPrefix(line, "event:") {
-				event.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			} else if strings.HasPrefix(line, "data:") {
-				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				if event.Data == "" {
-					event.Data = data
-				} else {
-					event.Data += "\n" + data
-				}
+				event.Data += string(value)
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				if strings.TrimSpace(event.Data) != "" {
-					if errHandle := handle(event); errHandle != nil {
-						return errHandle
-					}
+				if event.Data != "" {
+					return event, raw.Bytes(), nil
 				}
-				return nil
+				return sseEvent{}, nil, io.EOF
 			}
-			return err
+			return sseEvent{}, nil, err
 		}
 	}
+}
+
+func readBoundedSSELine(reader *bufio.Reader, limit int) ([]byte, error) {
+	if limit < 0 {
+		return nil, newChatProtocolFailure("event_too_large")
+	}
+	var line []byte
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(line)+len(fragment) > limit {
+			return nil, newChatProtocolFailure("event_too_large")
+		}
+		line = append(line, fragment...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return line, err
+	}
+}
+
+func prepareChatCompletionUpstreamResponse(ctx context.Context, resp *http.Response, streaming bool) (*http.Response, error) {
+	if resp == nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return resp, nil
+	}
+	if resp.Body == nil {
+		return replaceChatCompletionResponse(resp, newChatProtocolFailure("incomplete_stream")), nil
+	}
+	originalBody := resp.Body
+	reader := newResponsesSSEReader(originalBody)
+	if streaming {
+		event, raw, err := reader.next()
+		if err != nil {
+			if ctx.Err() != nil {
+				_ = originalBody.Close()
+				return nil, ctx.Err()
+			}
+			return replaceChatCompletionResponse(resp, chatStreamFailureFromError(err)), nil
+		}
+		state := newChatCompletionState("")
+		if _, err = state.applyResponsesEvent(event, true); err != nil {
+			return replaceChatCompletionResponse(resp, chatStreamFailureFromError(err)), nil
+		}
+		resp.Body = &replayReadCloser{
+			Reader:  io.MultiReader(bytes.NewReader(raw), reader.buffered),
+			closers: []io.Closer{originalBody},
+		}
+		return resp, nil
+	}
+
+	var replay bytes.Buffer
+	state := newChatCompletionState("")
+	for {
+		event, raw, err := reader.next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if state.terminal && !isChatStreamFailure(err) {
+				break
+			}
+			if ctx.Err() != nil {
+				_ = originalBody.Close()
+				return nil, ctx.Err()
+			}
+			return replaceChatCompletionResponse(resp, chatStreamFailureFromError(err)), nil
+		}
+		_, _ = replay.Write(raw)
+		if _, err = state.applyResponsesEvent(event, false); err != nil {
+			return replaceChatCompletionResponse(resp, chatStreamFailureFromError(err)), nil
+		}
+	}
+	if !state.terminal {
+		return replaceChatCompletionResponse(resp, newChatProtocolFailure("incomplete_stream")), nil
+	}
+	_ = originalBody.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(replay.Bytes()))
+	resp.ContentLength = int64(replay.Len())
+	return resp, nil
+}
+
+func replaceChatCompletionResponse(resp *http.Response, failure *chatStreamFailure) *http.Response {
+	if failure == nil {
+		failure = newChatProtocolFailure("upstream_error")
+	}
+	if resp == nil {
+		resp = &http.Response{Header: make(http.Header)}
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	} else {
+		resp.Header = resp.Header.Clone()
+	}
+	resp.StatusCode = failure.statusCode
+	resp.Status = fmt.Sprintf("%d %s", failure.statusCode, http.StatusText(failure.statusCode))
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Body = io.NopCloser(bytes.NewReader(failure.body))
+	resp.ContentLength = int64(len(failure.body))
+	return resp
+}
+
+func decodeChatResponsesEvent(event sseEvent) (map[string]any, string, error) {
+	decoder := json.NewDecoder(strings.NewReader(event.Data))
+	decoder.UseNumber()
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, "", newChatProtocolFailure("malformed_event")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, "", newChatProtocolFailure("malformed_event")
+	}
+	eventType := stringFromMap(payload, "type")
+	if eventType == "" {
+		eventType = strings.TrimSpace(event.Event)
+	}
+	if eventType == "" {
+		return nil, "", newChatProtocolFailure("malformed_event")
+	}
+	return payload, eventType, nil
+}
+
+func chatFailureFromEvent(payload map[string]any, eventType string) *chatStreamFailure {
+	var source map[string]any
+	switch eventType {
+	case "response.failed":
+		if response, ok := mapValue(payload["response"]); ok {
+			source, _ = mapValue(response["error"])
+		}
+		if source == nil {
+			source, _ = mapValue(payload["error"])
+		}
+	case "error":
+		source, _ = mapValue(payload["error"])
+	}
+
+	selected := map[string]any{}
+	if source != nil {
+		for _, key := range []string{
+			"message",
+			"type",
+			"code",
+			"param",
+			"status",
+			"status_code",
+			"resets_at",
+			"resets_in_seconds",
+		} {
+			if value, ok := source[key]; ok {
+				selected[key] = value
+			}
+		}
+	} else if message, ok := payload["error"].(string); ok && strings.TrimSpace(message) != "" {
+		selected["message"] = message
+	}
+	if eventType == "error" {
+		for _, key := range []string{"message", "code", "param", "status", "status_code", "resets_at", "resets_in_seconds"} {
+			if _, exists := selected[key]; exists {
+				continue
+			}
+			if value, ok := payload[key]; ok {
+				selected[key] = value
+			}
+		}
+		if _, exists := selected["type"]; !exists {
+			if errorType := rawStringFromMap(payload, "error_type"); errorType != "" {
+				selected["type"] = errorType
+			}
+		}
+	}
+	if strings.TrimSpace(rawStringFromMap(selected, "message")) == "" {
+		selected["message"] = "upstream Responses stream failed"
+	}
+	body, err := json.Marshal(map[string]any{"error": selected})
+	if err != nil {
+		return newChatProtocolFailure("upstream_error")
+	}
+	return &chatStreamFailure{
+		statusCode: chatFailureStatus(selected),
+		body:       body,
+	}
+}
+
+func chatFailureStatus(errorPayload map[string]any) int {
+	for _, key := range []string{"status_code", "status"} {
+		if status, ok := int64Value(errorPayload[key]); ok && status >= 400 && status <= 599 {
+			return int(status)
+		}
+	}
+	errorType := strings.ToLower(rawStringFromMap(errorPayload, "type"))
+	errorCode := strings.ToLower(rawStringFromMap(errorPayload, "code"))
+	message := strings.ToLower(rawStringFromMap(errorPayload, "message"))
+	switch {
+	case errorType == "invalid_request_error",
+		errorType == "bad_request_error",
+		errorCode == "context_length_exceeded",
+		errorCode == "context_too_large",
+		strings.Contains(message, "context window"),
+		strings.Contains(message, "context length"):
+		return http.StatusBadRequest
+	case errorType == "authentication_error",
+		errorCode == "invalid_api_key",
+		errorCode == "unauthorized":
+		return http.StatusUnauthorized
+	case errorType == "permission_error",
+		errorCode == "forbidden",
+		errorCode == "permission_denied":
+		return http.StatusForbidden
+	case errorType == "not_found_error",
+		errorCode == "not_found",
+		errorCode == "model_not_found":
+		return http.StatusNotFound
+	case errorType == "rate_limit_error",
+		errorType == "usage_limit_reached",
+		errorCode == "rate_limit_exceeded":
+		return http.StatusTooManyRequests
+	case errorCode == "model_not_supported",
+		errorCode == "unsupported_model",
+		errorCode == "unknown_model",
+		errorCode == "model_unavailable":
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func newChatProtocolFailure(code string) *chatStreamFailure {
+	code = safeChatLogValue(code)
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": "upstream Responses stream failed",
+			"type":    "upstream_error",
+			"code":    code,
+		},
+	})
+	return &chatStreamFailure{
+		statusCode: http.StatusBadGateway,
+		body:       body,
+	}
+}
+
+func chatStreamFailureFromError(err error) *chatStreamFailure {
+	var failure *chatStreamFailure
+	if errors.As(err, &failure) && failure != nil {
+		return failure
+	}
+	return newChatProtocolFailure("upstream_error")
+}
+
+func isChatStreamFailure(err error) bool {
+	var failure *chatStreamFailure
+	return errors.As(err, &failure) && failure != nil
+}
+
+func chatProxyErrorFromStreamError(err error, model string) (*proxyFinalError, int) {
+	streamFailure := chatStreamFailureFromError(err)
+	resp := &http.Response{
+		StatusCode: streamFailure.statusCode,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(streamFailure.body)),
+	}
+	failure, errClassify := classifyUpstreamResponse(resp, model, time.Now())
+	if errClassify != nil {
+		failure = upstreamFailure{
+			Kind:       upstreamFailureTransient,
+			StatusCode: http.StatusBadGateway,
+			Reason:     "upstream_error",
+		}
+	}
+	return chatProxyErrorFromFailure(failure), streamFailure.statusCode
+}
+
+func chatProxyErrorFromFailure(failure upstreamFailure) *proxyFinalError {
+	switch failure.Kind {
+	case upstreamFailureRequestScoped:
+		code := safeHealthCode(failure.ErrorCode)
+		if code == "" {
+			code = "upstream_request_error"
+		}
+		statusCode := failure.StatusCode
+		if statusCode < http.StatusBadRequest || statusCode >= http.StatusInternalServerError {
+			statusCode = http.StatusBadRequest
+		}
+		return &proxyFinalError{
+			StatusCode: statusCode,
+			Code:       code,
+			Message:    "upstream Codex request was rejected",
+		}
+	case upstreamFailureUnauthorized, upstreamFailureCredential:
+		return &proxyFinalError{
+			StatusCode: http.StatusServiceUnavailable,
+			Code:       proxyErrorCodeAuth,
+			Message:    "upstream authentication unavailable",
+		}
+	case upstreamFailureQuota:
+		return &proxyFinalError{
+			StatusCode: http.StatusTooManyRequests,
+			Code:       proxyErrorCodeRateLimited,
+			Message:    "Codex capacity is temporarily rate limited",
+			RetryAt:    failure.RetryAt,
+		}
+	case upstreamFailureModelUnsupported:
+		return &proxyFinalError{
+			StatusCode: http.StatusNotFound,
+			Code:       proxyErrorCodeModelNotFound,
+			Message:    "requested model is unavailable for the selected Codex auth",
+		}
+	default:
+		return &proxyFinalError{
+			StatusCode: http.StatusBadGateway,
+			Code:       proxyErrorCodeUpstream,
+			Message:    "upstream Codex service unavailable",
+		}
+	}
+}
+
+func chatErrorEnvelope(err *proxyFinalError) map[string]any {
+	if err == nil {
+		err = &proxyFinalError{
+			Code:    proxyErrorCodeUpstream,
+			Message: "upstream Codex service unavailable",
+		}
+	}
+	return map[string]any{
+		"error": map[string]any{
+			"message": err.Message,
+			"type":    "proxy_error",
+			"code":    err.Code,
+		},
+	}
+}
+
+func safeChatLogValue(value string) string {
+	if safe := safeHealthCode(value); safe != "" {
+		return safe
+	}
+	return "unknown"
 }
 
 func (s *Server) codexResponsesURL() string {
@@ -1084,22 +1764,29 @@ func writeChatSSE(w io.Writer, payload map[string]any) error {
 	return err
 }
 
-func flushChatCompletion(w http.ResponseWriter) {
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+func writeAndFlushChatSSE(w http.ResponseWriter, payload map[string]any) error {
+	if err := writeChatSSE(w, payload); err != nil {
+		return err
 	}
+	return flushChatCompletion(w)
 }
 
-func writeUpstreamChatError(w http.ResponseWriter, resp *http.Response) {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	message := strings.TrimSpace(string(body))
-	if message == "" {
-		message = http.StatusText(resp.StatusCode)
+func writeAndFlushChatDone(w http.ResponseWriter) error {
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
 	}
-	writeError(w, resp.StatusCode, message)
+	return flushChatCompletion(w)
 }
 
-func (s *Server) recordChatCompletionUsage(r *http.Request, authorization proxyAuthorization, auth *Auth, metadata proxyRequestUsageMetadata, counters UsageCounters, hasUsage bool, statusCode int, requestID string) {
+func flushChatCompletion(w http.ResponseWriter) error {
+	err := http.NewResponseController(w).Flush()
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
+}
+
+func (s *Server) recordChatCompletionUsage(r *http.Request, authorization proxyAuthorization, auth *Auth, metadata proxyRequestUsageMetadata, counters UsageCounters, hasUsage bool, statusCode int, requestID string, outcome string) {
 	if !s.shouldRecordUsage(authorization) {
 		return
 	}
@@ -1117,6 +1804,7 @@ func (s *Server) recordChatCompletionUsage(r *http.Request, authorization proxyA
 		RequestID:       requestID,
 		Counters:        counters,
 		HasUsage:        hasUsage,
+		Outcome:         outcome,
 	})
 }
 

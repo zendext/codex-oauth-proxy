@@ -428,6 +428,30 @@ Reasoning Effort 别名会被规范化：
 Sampling 和其他未知 Chat Completions 字段不会自动转发。需要完整 Responses
 行为的客户端应直接调用 `/v1/responses`。
 
+转换器要求上游恰好出现一个成功终态 Event。`response.completed` 表示完整成功；
+`response.incomplete` 表示部分成功，并使用以下标准 Chat Completions
+`finish_reason`：
+
+| Incomplete Reason | `finish_reason` |
+| --- | --- |
+| `max_tokens`、`max_output_tokens` | `length` |
+| `content_filter` | `content_filter` |
+| 未知值 | `length` |
+
+Incomplete Reason 的优先级高于 `tool_calls`。响应不会包含非标准
+`native_finish_reason` 字段。
+
+对于流式请求，代理会等待第一个有效上游 Event，再提交下游 SSE 响应。提交前的
+故障使用与 HTTP 故障相同的 OAuth 刷新、健康冷却、模型故障转移和请求错误规则
+分类。提交后的故障会发送一个经过脱敏的 OpenAI Error Envelope `data:` Event，
+然后关闭 Stream，且不发送 Finish Chunk 或 `[DONE]`。
+
+成功终态前 EOF、格式错误或超大的 Event、重复终态以及终态后的数据均视为
+故障。单个上游 SSE Event 限制为 50 MB。代理按 Output Index 协调
+`response.output_item.done` 快照与终态 Output；非流式响应以终态 Output 为准，
+流式响应只能补发缺失后缀。本地 Stop 匹配在跨 Event 边界时保持 UTF-8 安全，
+命中后会抑制后续文本和 Tool Delta，同时继续读取终态和用量。
+
 示例：
 
 ```bash
@@ -447,6 +471,9 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 ## Responses 与兼容路由
 
 代理转发以下白名单 Codex 路由，但不定义其完整上游请求 Schema：
+
+这些原生 Responses HTTP 和 WebSocket 路由保持透明；上述 Chat Completions
+终态校验和错误转换不会修改其 Event 或 Frame Payload。
 
 | 常用方法 | 公共路径 |
 | --- | --- |
