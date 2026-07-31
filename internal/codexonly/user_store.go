@@ -179,6 +179,16 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			expires_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS auth_health_states (
+			auth_id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			retry_at TEXT,
+			credential_fingerprint TEXT NOT NULL,
+			status_code INTEGER NOT NULL,
+			error_code TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 	}
 	for _, statement := range tableStatements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -204,6 +214,8 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			ON session_affinity_bindings(binding_digest)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_affinity_expires_at
 			ON session_affinity_bindings(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_auth_health_retry_at
+			ON auth_health_states(retry_at)`,
 	}
 	for _, statement := range indexStatements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {

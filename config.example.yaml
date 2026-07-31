@@ -32,8 +32,14 @@ allow-fast-mode: false
 # Optional outbound proxy. Use "direct" or "none" to bypass proxy settings.
 proxy-url: ""
 
-# Number of upstream retry attempts for future retry-aware calls.
+# Number of additional cooldown retry rounds after the initial credential round.
 request-retry: 3
+
+# Maximum distinct Codex credentials tried in one round. 0 tries all eligible.
+max-retry-credentials: 0
+
+# Maximum seconds to wait for the nearest auth cooldown. 0 disables waiting.
+max-retry-interval: 30
 
 # Codex upstream base URL.
 codex-base-url: "https://chatgpt.com/backend-api/codex"

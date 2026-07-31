@@ -31,7 +31,9 @@ file.
 | `usage.debug-openai-response` | `false` | Adds safe upstream usage metadata to debug logs when `debug` is also enabled. |
 | `allow-fast-mode` | `false` | Allows `service_tier: "fast"` and `"priority"` and exposes Fast metadata in model responses. |
 | `proxy-url` | empty | Explicit outbound proxy URL. Use `direct` or `none` to disable environment proxy discovery. |
-| `request-retry` | `3` | Reserved retry count for retry-aware calls. HTTP proxy requests do not use a general retry loop; OAuth refresh always uses its fixed three-attempt policy. |
+| `request-retry` | `3` | Additional cooldown retry rounds after the initial credential round. `0` disables cooldown rounds. |
+| `max-retry-credentials` | `0` | Maximum distinct eligible Codex credentials attempted in one round. `0` means all eligible credentials. |
+| `max-retry-interval` | `30` | Maximum seconds to wait for the nearest credential cooldown before another round. `0` disables cooldown waiting. |
 | `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Upstream base for Codex Responses-compatible routes. |
 | `chatgpt-base-url` | `https://chatgpt.com/backend-api` | Upstream base for file, account, and hosted MCP compatibility routes. |
 | `codex-user-agent` | empty | Upstream User-Agent override. Empty forwards the client value or uses a Codex CLI fallback. |
@@ -126,9 +128,50 @@ Updated tokens are written through a same-directory `0600` temporary file,
 synced, and atomically renamed over the selected source file. Account and email
 claims are reparsed before persistence. An HTTP upstream `401` can trigger one
 same-credential refresh and one retry before the client response is committed
-when the original request is already replayable. Non-replayable request bodies
-are forwarded once without disk buffering. Reactive refresh does not trigger
-cross-credential failover.
+when the original request is replayable. Continued unauthorized responses,
+`invalid_grant`, and explicit quota recovery deadlines make that logical
+credential unavailable until its state is cleared or expires.
+
+## Health-Aware Failover
+
+Health state applies globally to one stable Codex credential across all users
+and sessions. Selection skips disabled credentials, active cooldowns,
+credential failures, and model-specific capability exclusions. A session-bound
+request uses the existing compare-and-swap affinity rebind when its credential
+is no longer eligible.
+
+Failures are handled in three independent layers:
+
+1. A replayable request that receives `401` refreshes and retries the same
+   credential once. This does not consume the credential-switch limit.
+2. One round tries distinct currently eligible credentials, bounded by
+   `max-retry-credentials`.
+3. After a round exhausts eligible credentials, the proxy waits for the nearest
+   cooldown only when it is within `max-retry-interval`, then starts up to
+   `request-retry` additional rounds.
+
+Request-scoped `4xx` responses stop immediately without penalizing a
+credential. `429` honors `Retry-After` or an explicit Codex quota reset time.
+Network failures, `408`, and retryable `5xx` responses use a short in-memory
+cooldown. Model-not-supported responses exclude only that credential/model
+pair.
+
+SQLite persists only explicit quota recovery deadlines, `invalid_grant`, and
+continued unauthorized state after refresh. Short transport cooldowns and
+model exclusions are process-local. Credential-related persisted state clears
+when credential material changes or a later refresh/request proves it healthy;
+an unexpired explicit quota deadline survives same-account token updates and
+process restarts.
+
+Cross-credential retry is limited to read-only `GET`/`HEAD`, JSON
+`/v1/chat/completions`, Responses, Responses compact, alpha search, JSON image
+generation, trace summarization, and the Responses WebSocket handshake before
+upgrade. Replayable bodies are buffered in memory only, up to and including
+32 MiB. Unknown-length, larger, multipart, file, realtime, side-effecting wham,
+hosted MCP, and unknown write requests are forwarded once without being
+rejected merely because replay is unavailable. Eligible buffered requests may
+be repeated after an ambiguous network failure, which accepts a rare duplicate
+generation or billing risk in favor of availability.
 
 ## Managed Users and Database
 
@@ -137,6 +180,7 @@ The SQLite database stores:
 - Users.
 - Generated and rotated user API keys.
 - Tenant-scoped session affinity digests and stable OAuth auth targets.
+- Authoritative Codex credential health states.
 - Ten-minute usage buckets.
 
 Generated API keys are stored as SHA-256 hashes. API responses expose key

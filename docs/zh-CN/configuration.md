@@ -29,7 +29,9 @@ codex-oauth-proxy serve --config /etc/codex-oauth-proxy/config.yaml
 | `usage.debug-openai-response` | `false` | 当 `debug` 也启用时，在调试日志中添加安全的上游用量元数据。 |
 | `allow-fast-mode` | `false` | 允许 `service_tier: "fast"` 和 `"priority"`，并在模型响应中公开 Fast 元数据。 |
 | `proxy-url` | 空 | 显式出站代理 URL。使用 `direct` 或 `none` 禁用环境代理发现。 |
-| `request-retry` | `3` | 为支持重试的调用保留的重试次数。HTTP 代理请求不使用通用重试循环；OAuth 刷新始终使用固定的三次尝试策略。 |
+| `request-retry` | `3` | 初始凭据轮次之后允许的额外冷却重试轮数。`0` 禁用冷却轮次。 |
+| `max-retry-credentials` | `0` | 每轮最多尝试的不同且当前可用的 Codex 凭据数。`0` 表示尝试全部可用凭据。 |
+| `max-retry-interval` | `30` | 为开始下一轮而等待最近凭据冷却的最长秒数。`0` 禁用冷却等待。 |
 | `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Codex Responses 兼容路由的上游 Base URL。 |
 | `chatgpt-base-url` | `https://chatgpt.com/backend-api` | 文件、账户和 Hosted MCP 兼容路由的上游 Base URL。 |
 | `codex-user-agent` | 空 | 上游 User-Agent 覆盖值。空值会转发客户端值或使用 Codex CLI 回退值。 |
@@ -115,8 +117,38 @@ Token 的较新 Token。源路径被另一账户替换时，旧请求不会附�
 更新后的 Token 会先写入同目录 `0600` 临时文件，完成 Sync 后原子重命名覆盖
 选中的源文件。持久化前会从刷新后的 Token 重新解析账户和邮箱声明。HTTP 上游
 返回 `401`，且原始请求已经可重放时，可以在客户端响应提交前触发一次同凭据
-刷新和一次重试。不可重放的请求 Body 不会写入磁盘缓冲，而是仅转发一次。响应式
-刷新不会触发跨凭据 Failover。
+刷新和一次重试。刷新后继续返回未授权、`invalid_grant` 或显式配额恢复 Deadline
+时，该逻辑凭据会在状态清除或过期前不可用。
+
+## 健康感知故障转移
+
+健康状态以稳定 Codex 凭据为全局范围，跨所有用户和会话生效。选择会跳过禁用
+凭据、活动冷却、凭据故障和模型专用能力排除。会话绑定请求的凭据不再可用时，
+会使用现有 Compare-and-swap 亲和性重绑定。
+
+故障处理包含三个相互独立的层次：
+
+1. 可重放请求收到 `401` 时，刷新并重试同一凭据一次；这不会消耗凭据切换上限。
+2. 一个轮次尝试不同且当前可用的凭据，并受 `max-retry-credentials` 限制。
+3. 一个轮次耗尽可用凭据后，仅当最近冷却不超过 `max-retry-interval` 时等待，
+   随后最多启动 `request-retry` 个额外轮次。
+
+请求范围的 `4xx` 响应会立即停止，且不会惩罚凭据。`429` 遵循
+`Retry-After` 或显式 Codex 配额重置时间。网络故障、`408` 和可重试 `5xx`
+使用短期内存冷却。模型不支持响应只排除对应凭据和模型组合。
+
+SQLite 只持久化显式配额恢复 Deadline、`invalid_grant` 和刷新后继续未授权的
+状态。短期传输冷却和模型排除只存在于当前进程。凭据材料变化或后续刷新、请求
+证明凭据健康时，会清除凭据相关的持久化状态；未过期的显式配额 Deadline 在
+同账户 Token 更新和进程重启后仍然保留。
+
+跨凭据重试只适用于只读 `GET`/`HEAD`、JSON `/v1/chat/completions`、
+Responses、Responses Compact、Alpha Search、JSON Image Generation、
+Trace Summarization，以及 Upgrade 成功前的 Responses WebSocket Handshake。
+可重放 Body 只在内存中缓冲，最大包含 32 MiB。未知长度、更大、Multipart、
+文件、Realtime、具有副作用的 Wham、Hosted MCP 和未知写请求只转发一次，不会
+仅因无法重放而被拒绝。符合条件的缓冲请求在模糊网络故障后可能重复执行；这是
+为了可用性而接受的极少量重复生成或重复计费风险。
 
 ## 托管用户与数据库
 
@@ -125,6 +157,7 @@ SQLite 数据库存储：
 - 用户。
 - 生成和轮换的用户 API Key。
 - 租户范围的会话亲和性 Digest 和稳定 OAuth 认证目标。
+- 权威 Codex 凭据健康状态。
 - 10 分钟用量桶。
 
 生成的 API Key 以 SHA-256 Hash 存储。API 响应只公开 Key 元数据和脱敏值；

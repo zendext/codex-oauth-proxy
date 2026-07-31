@@ -17,7 +17,9 @@
 | `cmd/server/` | 进程入口、服务器生命周期、管理 CLI、HTTP Client 和 CLI 格式化。 |
 | `internal/codexonly/config.go` | YAML 加载和路径、默认值解析。 |
 | `internal/codexonly/auth.go` | OAuth 文件发现、解析、过滤和持久化。 |
+| `internal/codexonly/auth_health.go` | 全局凭据健康、模型排除、冷却协调和权威状态持久化。 |
 | `internal/codexonly/refresh.go` | OAuth 刷新和出站 HTTP Transport 构建。 |
+| `internal/codexonly/failover.go` | 重放资格、上游响应分类、重试层次和确定性聚合错误。 |
 | `internal/codexonly/server.go` | 路由、认证、模型目录、Header、HTTP Reverse Proxy 以及管理和用户 Handler。 |
 | `internal/codexonly/chat_completions.go` | Chat Completions 到 Responses 的转换和响应翻译。 |
 | `internal/codexonly/user_store.go` | SQLite Schema、用户、API Key 和认证。 |
@@ -35,8 +37,8 @@
 3. 解析 `auth-dir` 并验证两个上游 Base URL。
 4. 构建上游 Client 和带超时的 OAuth 刷新 Client。
 5. 扫描认证目录以验证可读性。
-6. 解析 SQLite 路径、执行幂等 Schema Migration、验证初始持久化用户状态，并
-   删除指向已不存在认证身份的亲和性目标。
+6. 解析 SQLite 路径、执行幂等 Schema Migration、验证初始持久化用户状态，
+   删除指向已不存在认证身份的亲和性目标，并恢复未过期的权威认证健康状态。
 7. 启动一个 `net/http` 服务器。
 
 服务器将 `ReadHeaderTimeout` 设置为 10 秒。它不会设置可能中断已建立 Stream
@@ -91,6 +93,40 @@ HTTP `408`、`429`、`500`、`502`、`503`、`504` 可以重试；有效的
 确定性的 `400`/`401`/`403`、格式错误的响应以及不含 Access Token 的成功响应
 都是终止错误。刷新错误只公开安全的状态码和 OAuth 错误码上下文，不包含 Token
 端点原始响应 Body。
+
+## 认证健康与重试
+
+在该单进程实现中，认证健康以稳定逻辑凭据为全局范围。所有会话都会跳过已禁用、
+正在冷却、凭据无效、刷新后继续未授权或不支持请求模型的凭据。健康时会话亲和性
+保持不变；需要故障转移时，使用现有 SQLite Compare-and-swap 重绑定。每个请求
+会快照其开始时已知的认证 ID，因此新加入的替代身份不能接管正在执行的请求。
+
+代理会在提交下游响应前分类上游结果：
+
+- 请求范围的 `4xx` 会停止请求，但不改变认证健康。
+- 可重放时，`401` 会执行一次协调的同认证刷新和重试；再次返回 `401` 会阻止
+  该凭据。
+- `429` 使用 `Retry-After` 或显式 Codex 配额重置 Deadline。
+- 网络故障、`408` 和可重试 `5xx` 会创建短期内存冷却。
+- 模型不支持响应只创建认证和模型组合的排除，不会形成全局冷却。可缓存模型 ID
+  使用安全的 128 字节标识符格式；每个认证最多保留 64 个排除，并以确定性的
+  最旧条目淘汰策略限制容量。
+
+重试使用三个独立预算。同认证 `401` 修复不计入凭据预算。一个执行轮次最多尝试
+`max-retry-credentials` 个不同且可用的认证，零表示全部。轮次结束后，仅当最近
+冷却不超过 `max-retry-interval` 时等待，随后最多启动 `request-retry` 个额外
+轮次。Context 取消会立即中断选择、刷新和冷却等待。
+
+跨认证重试要求路由显式可重放。符合条件的 JSON 请求只在内存中缓冲，最大包含
+32 MiB，不会为重试写入磁盘。未知长度、超大、Multipart、文件、Realtime、
+具有副作用的 Wham、Hosted MCP 和未知写请求保持单次执行。Responses WebSocket
+Handshake 可以在 Upgrade 成功前故障转移。HTTP Stream 和 WebSocket 在下游提交
+后都不会重新进入重试。
+
+只有显式配额 Deadline、`invalid_grant` 和刷新后继续未授权的状态会存储在
+`auth_health_states`。临时冷却和模型排除只保存在内存中。凭据状态 Fingerprint
+会在实际 Token 材料变化后使持久化凭据故障失效，而同账户 Token 更新会保留
+未过期的配额 Deadline。
 
 ## 认证边界
 
@@ -179,22 +215,23 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 
 1. 认证传入的托管 Key 或允许的 OAuth 兼容 Token。
 2. Fast 模式禁用时拒绝 Fast Service Tier。
-3. 解析会话亲和性；没有有效信号时使用轮询选择，然后刷新选中的上游 OAuth
-   凭据。
+3. 协调认证文件和全局健康，然后解析健康的会话亲和性，或选择下一个可用凭据。
 4. 将目标 URL 重写到配置的 Codex 或 ChatGPT Base。
 5. 使用选中的 OAuth Access Token 替换 `Authorization`。
 6. 可用时添加 ChatGPT Account ID 和兼容 Header。
-7. HTTP 上游在客户端响应提交前返回 `401`，且原始请求 Body 已经可重放时，
-   刷新同一凭据并重试一次。
-8. 不为重试缓冲不可重放的请求，而是仅转发一次。
-9. 转发 HTTP Stream 响应或桥接 WebSocket Frame。
-10. 为托管用户请求采集用量元数据。
+7. 仅当请求可重放且尚未提交客户端响应时，应用同认证修复、不同凭据故障转移
+   和有界冷却轮次。
+8. 更新认证健康；选择切换到其他凭据时使用亲和性 CAS。
+9. 单次转发不可重放请求，转发 HTTP Stream，或在 Handshake 成功后桥接
+   WebSocket Frame。
+10. 所有候选耗尽时返回确定且安全的聚合错误。
+11. 为托管用户请求采集用量元数据。
 
 正常运行期间，代理会保持已建立的 HTTP Stream。WebSocket 转发使用 Gorilla
 WebSocket，并在上游 Upgrade 路径强制使用 HTTP/1.1 ALPN。服务器关闭或发生
-致命存储故障时，会取消已建立的 Stream 并关闭 WebSocket 两端。OAuth 响应式
-恢复不会切换到其他凭据，也不会在响应提交后重试。不可重放的请求 Body 会保留
-第一次上游响应，不进行修改。
+致命存储故障时，会取消已建立的 Stream 并关闭 WebSocket 两端。响应提交或
+Upgrade 成功后不会重试。不可重放的请求 Body 会保留第一次上游响应，不进行
+修改。
 
 ## Chat Completions 转换
 
@@ -204,7 +241,7 @@ WebSocket，并在上游 Upgrade 路径强制使用 HTTP/1.1 ALPN。服务器关
 2. 将消息、Tool、Response Format、Reasoning 和 Service Tier 转换为 Responses
    请求。
 3. 强制上游使用 `stream: true` 和 `store: false`。
-4. 上游返回 `401` 时，在提交客户端响应前刷新同一凭据并重试一次。
+4. 使用与可重放 Responses 请求相同的健康感知提交前重试执行器。
 5. 读取 Responses SSE Event。
 6. 聚合为普通 Chat Completions 响应，或转换为 Chat Completions SSE Chunk。
 7. 应用本地 Stop Sequence 过滤并记录用量。
@@ -251,6 +288,19 @@ Partial Unique Index 保证每个用户只能有一个启用的 Key。重置 Key
 绑定表不会存储原始 Session ID、Prompt Cache Key、Conversation ID、托管 API
 Key 或模型名称。
 
+### 认证健康状态
+
+一个权威持久化认证健康行包含：
+
+- 稳定 OAuth 凭据 ID。
+- 状态类型和安全原因。
+- 可选恢复 Deadline。
+- 凭据相关状态使用的 Credential Fingerprint。
+- 安全的上游状态码和错误码。
+- 更新时间。
+
+该表不会存储 Access Token、Refresh Token、原始上游 Body 或短期传输冷却。
+
 ## 用量数据模型
 
 `usage_buckets` 将托管用户用量聚合到 UTC 10 分钟桶。逻辑桶 Key 包含：
@@ -281,5 +331,7 @@ OAuth 文件会被原地读取和刷新。托管明文 Key 只在创建或重置
 原始会话亲和性信号不会写入 SQLite、由管理 API 返回或写入调试日志。大型 JSON
 请求 Body 可以在该请求生命周期内暂存到进程拥有、权限为 `0600` 的临时 Replay
 文件中；Replay 关闭时会删除该文件，包括后续请求处理步骤替换 Replay Body 时。
+该临时存储仅用于亲和性信号提取。跨认证重试 Body 只存在于内存中，并限制为
+32 MiB。
 
 服务器自身提供 HTTP。监听地址选择和传输终止属于部署环境职责。

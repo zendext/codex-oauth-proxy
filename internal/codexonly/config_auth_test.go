@@ -41,6 +41,12 @@ func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 	if cfg.RequestRetry != 3 {
 		t.Fatalf("RequestRetry = %d, want 3", cfg.RequestRetry)
 	}
+	if cfg.MaxRetryCredentials != 0 {
+		t.Fatalf("MaxRetryCredentials = %d, want 0", cfg.MaxRetryCredentials)
+	}
+	if cfg.MaxRetryInterval != 30 {
+		t.Fatalf("MaxRetryInterval = %d, want 30", cfg.MaxRetryInterval)
+	}
 	if cfg.CodexUserAgent != "" {
 		t.Fatalf("CodexUserAgent = %q, want empty default", cfg.CodexUserAgent)
 	}
@@ -52,6 +58,31 @@ func TestLoadConfigAppliesCodexOnlyDefaults(t *testing.T) {
 	}
 	if cfg.ChatGPTBaseURL != DefaultChatGPTBaseURL {
 		t.Fatalf("ChatGPTBaseURL = %q, want %q", cfg.ChatGPTBaseURL, DefaultChatGPTBaseURL)
+	}
+}
+
+func TestLoadConfigParsesRetrySettingsAndPreservesExplicitZero(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(
+		"request-retry: 0\nmax-retry-credentials: 2\nmax-retry-interval: 0\n",
+	), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+
+	if cfg.RequestRetry != 0 {
+		t.Fatalf("RequestRetry = %d, want explicit 0", cfg.RequestRetry)
+	}
+	if cfg.MaxRetryCredentials != 2 {
+		t.Fatalf("MaxRetryCredentials = %d, want 2", cfg.MaxRetryCredentials)
+	}
+	if cfg.MaxRetryInterval != 0 {
+		t.Fatalf("MaxRetryInterval = %d, want explicit 0", cfg.MaxRetryInterval)
 	}
 }
 

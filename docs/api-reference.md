@@ -68,6 +68,33 @@ signals are ignored, and the stored prefix plus untouched request stream are
 forwarded unchanged. Ignored or missing signals do not fail the request;
 selection falls back to normal round-robin behavior.
 
+## Health-Aware Failover
+
+Auth health is global across sessions. A healthy affinity binding stays on its
+current Codex credential; a binding whose credential is disabled, cooling,
+credential-invalid, continued-unauthorized, or unable to serve the requested
+model is rebound with compare-and-swap failover.
+
+Cross-credential retry is available only for:
+
+- Read-only `GET` and `HEAD` requests on whitelisted routes.
+- JSON `/v1/chat/completions`.
+- Responses, Responses compact, alpha search, JSON image generation, and trace
+  summarization.
+- A Responses WebSocket handshake before successful upgrade.
+
+Replayable request bodies are buffered in memory up to and including 32 MiB.
+Unknown-length or larger bodies and multipart, file, realtime, side-effecting
+wham, hosted MCP, and unknown write requests are sent once. They are not
+rejected merely because automatic replay is unavailable.
+
+Within one replayable execution, `401` first refreshes and retries the same
+credential once. A credential round then tries distinct eligible credentials.
+After a round, the proxy may wait for the nearest cooldown and start another
+round according to `request-retry`, `max-retry-credentials`, and
+`max-retry-interval`. Cancellation stops waiting immediately. No retry occurs
+after downstream response bytes or a successful WebSocket upgrade.
+
 ## Error Format
 
 Project-owned handlers return:
@@ -82,7 +109,32 @@ Project-owned handlers return:
 ```
 
 Proxied upstream routes may preserve upstream status codes, headers, and response
-bodies instead.
+bodies instead. Request-scoped upstream `4xx` errors stop immediately and do
+not penalize a credential.
+
+When replayable candidates are exhausted, the proxy returns a safe aggregate
+error:
+
+```json
+{
+  "error": {
+    "message": "upstream Codex service unavailable",
+    "type": "proxy_error",
+    "code": "upstream_unavailable"
+  }
+}
+```
+
+Deterministic aggregate outcomes are:
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `404` | `model_not_found` | Every known candidate is excluded for the requested model. |
+| `429` | `rate_limited` | All serviceable candidates are quota-limited, or mixed failures have a clear near-term quota recovery. The response includes the earliest known `Retry-After`. |
+| `503` | `auth_unavailable` | All candidates are disabled, credential-invalid, or continued-unauthorized. |
+| `502` | `upstream_unavailable` | Network/retryable upstream failures were exhausted, including mixed failures without a near-term recovery deadline. |
+
+Client cancellation does not synthesize a new proxy error.
 
 ## Service Endpoints
 

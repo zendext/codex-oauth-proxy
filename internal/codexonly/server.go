@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -203,6 +204,7 @@ func matchingAuth(auths []*Auth, target *Auth) *Auth {
 type Server struct {
 	cfg                        *Config
 	auths                      *AuthManager
+	health                     *authHealthRegistry
 	users                      *UserStore
 	httpClient                 *http.Client
 	baseURL                    *url.URL
@@ -210,6 +212,7 @@ type Server struct {
 	ctx                        context.Context
 	cancel                     context.CancelFunc
 	sessionAffinityReplayStore func() *sessionAffinityReplayStore
+	waitRetry                  func(context.Context, time.Duration) error
 	closeOnce                  sync.Once
 	closeErr                   error
 }
@@ -229,24 +232,6 @@ type proxyAuthorization struct {
 type AuthSelection struct {
 	Auth    *Auth
 	Binding SessionAffinityBinding
-}
-
-type upstreamAuthRefreshError struct {
-	err error
-}
-
-func (e *upstreamAuthRefreshError) Error() string {
-	if e == nil || e.err == nil {
-		return "upstream authentication unavailable"
-	}
-	return "upstream authentication unavailable: " + e.err.Error()
-}
-
-func (e *upstreamAuthRefreshError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.err
 }
 
 func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
@@ -313,15 +298,23 @@ func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
 		_ = userStore.Close()
 		return nil, err
 	}
+	health := newAuthHealthRegistry(userStore)
+	if err = health.Restore(ctx, initialAuths.Auths); err != nil {
+		cancel()
+		_ = userStore.Close()
+		return nil, err
+	}
 	server := &Server{
 		cfg:            cfg,
 		auths:          manager,
+		health:         health,
 		users:          userStore,
 		httpClient:     client,
 		baseURL:        upstream,
 		chatGPTBaseURL: chatGPTUpstream,
 		ctx:            serverCtx,
 		cancel:         cancel,
+		waitRetry:      waitForProxyRetry,
 	}
 	server.debugf(
 		"debug enabled listen=%s auth_dir=%s database_path=%s codex_base_url=%s chatgpt_base_url=%s",
@@ -480,24 +473,26 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			writeAuthError(w, err)
 			return
 		}
+		replayCandidate := requestReplayCandidate(r)
 		signals := s.extractSessionAffinitySignals(r)
 		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
 			writeError(w, http.StatusBadRequest, "fast mode is disabled")
 			return
 		}
-		s.handleChatCompletions(w, r, authorization, signals)
+		s.handleChatCompletions(w, r, authorization, signals, replayCandidate)
 	case routeOK:
 		authorization, err := s.authorizeProxy(r, route.allowUpstreamAuth)
 		if err != nil {
 			writeAuthError(w, err)
 			return
 		}
+		replayCandidate := requestReplayCandidate(r)
 		signals := s.extractSessionAffinitySignals(r)
 		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
 			writeError(w, http.StatusBadRequest, "fast mode is disabled")
 			return
 		}
-		s.proxyCodex(w, r, route, authorization, signals)
+		s.proxyCodex(w, r, route, authorization, signals, replayCandidate)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
@@ -671,66 +666,123 @@ func (s *Server) reconcileAuths(ctx context.Context) (AuthReconcileResult, error
 			return AuthReconcileResult{}, err
 		}
 	}
+	if s.health != nil {
+		if err = s.health.Reconcile(ctx, result); err != nil {
+			return AuthReconcileResult{}, err
+		}
+	}
 	return result, nil
 }
 
 func (s *Server) selectProxyAuth(ctx context.Context, authorization proxyAuthorization, signals []sessionAffinitySignal) (AuthSelection, error) {
+	selection, err := s.selectProxyAuthCandidate(ctx, authorization, signals, "", nil, nil, AuthSelection{})
+	if err != nil {
+		return AuthSelection{}, err
+	}
+	auth, err := s.auths.prepareAuth(ctx, selection.Auth)
+	selection.Auth = auth
+	return selection, err
+}
+
+var errNoEligibleAuth = errors.New("no eligible codex auth")
+
+func (s *Server) selectProxyAuthCandidate(
+	ctx context.Context,
+	authorization proxyAuthorization,
+	signals []sessionAffinitySignal,
+	model string,
+	tried map[string]struct{},
+	allowed map[string]struct{},
+	selection AuthSelection,
+) (AuthSelection, error) {
 	result, err := s.reconcileAuths(ctx)
 	if err != nil {
 		return AuthSelection{}, err
 	}
-	if len(result.Active) == 0 {
-		return AuthSelection{}, fmt.Errorf("no active codex auth files found")
+	if s.health != nil {
+		if err = s.health.PruneExpired(ctx); err != nil {
+			return AuthSelection{}, err
+		}
 	}
 	if err = s.users.maybeCleanupExpiredSessionAffinity(ctx); err != nil {
 		return AuthSelection{}, err
 	}
+	eligible := make([]*Auth, 0, len(result.Active))
+	for _, auth := range result.Active {
+		if auth == nil {
+			continue
+		}
+		if allowed != nil {
+			if _, ok := allowed[auth.ID]; !ok {
+				continue
+			}
+		}
+		if _, alreadyTried := tried[auth.ID]; alreadyTried {
+			continue
+		}
+		if s.health != nil {
+			if _, blocked := s.health.Blocked(auth, model); blocked {
+				continue
+			}
+		}
+		eligible = append(eligible, auth)
+	}
+	if len(eligible) == 0 {
+		return AuthSelection{}, errNoEligibleAuth
+	}
+
 	digests := sessionAffinityDigestsForRequest(authorization, signals)
 	if len(digests) == 0 {
-		auth, errNext := s.auths.nextAuth(result.Active)
-		if errNext != nil {
-			return AuthSelection{}, errNext
-		}
-		auth, errNext = s.auths.prepareAuth(ctx, auth)
+		auth, errNext := s.auths.nextAuth(eligible)
 		return AuthSelection{Auth: auth}, errNext
 	}
 
 	activeByID := authsByStableID(result.Active)
-	binding, found, err := s.users.LookupSessionAffinity(ctx, digests)
+	eligibleByID := authsByStableID(eligible)
+	binding := selection.Binding
+	found := binding.valid()
+	if !found {
+		binding, found, err = s.users.LookupSessionAffinity(ctx, digests)
+		if err != nil {
+			return AuthSelection{}, err
+		}
+	}
+	if found {
+		if auth := eligibleByID[binding.AuthID]; auth != nil {
+			return AuthSelection{Auth: auth, Binding: binding}, nil
+		}
+	}
+
+	candidate, err := s.auths.nextAuth(eligible)
 	if err != nil {
 		return AuthSelection{}, err
 	}
 	if found {
-		if auth := activeByID[binding.AuthID]; auth != nil {
-			auth, err = s.auths.prepareAuth(ctx, auth)
-			return AuthSelection{Auth: auth, Binding: binding}, err
-		}
-		candidate, errNext := s.auths.nextAuth(result.Active)
-		if errNext != nil {
-			return AuthSelection{}, errNext
-		}
 		binding, err = s.users.RebindSessionAffinity(ctx, binding, candidate.ID)
+	} else {
+		binding, err = s.users.BindSessionAffinity(ctx, digests, candidate.ID)
+	}
+	if err != nil {
+		return AuthSelection{}, err
+	}
+
+	auth := activeByID[binding.AuthID]
+	if auth == nil || eligibleByID[binding.AuthID] == nil {
+		selection = AuthSelection{Binding: binding}
+		delete(eligibleByID, binding.AuthID)
+		filtered := make([]*Auth, 0, len(eligible))
+		for _, item := range eligible {
+			if eligibleByID[item.ID] != nil {
+				filtered = append(filtered, item)
+			}
+		}
+		if len(filtered) == 0 {
+			return AuthSelection{}, errNoEligibleAuth
+		}
+		candidate, err = s.auths.nextAuth(filtered)
 		if err != nil {
 			return AuthSelection{}, err
 		}
-		auth := activeByID[binding.AuthID]
-		if auth == nil {
-			return AuthSelection{}, fmt.Errorf("session-bound codex auth %s is unavailable", binding.AuthID)
-		}
-		auth, err = s.auths.prepareAuth(ctx, auth)
-		return AuthSelection{Auth: auth, Binding: binding}, err
-	}
-
-	candidate, err := s.auths.nextAuth(result.Active)
-	if err != nil {
-		return AuthSelection{}, err
-	}
-	binding, err = s.users.BindSessionAffinity(ctx, digests, candidate.ID)
-	if err != nil {
-		return AuthSelection{}, err
-	}
-	auth := activeByID[binding.AuthID]
-	if auth == nil {
 		binding, err = s.users.RebindSessionAffinity(ctx, binding, candidate.ID)
 		if err != nil {
 			return AuthSelection{}, err
@@ -740,8 +792,7 @@ func (s *Server) selectProxyAuth(ctx context.Context, authorization proxyAuthori
 	if auth == nil {
 		return AuthSelection{}, fmt.Errorf("session-bound codex auth %s is unavailable", binding.AuthID)
 	}
-	auth, err = s.auths.prepareAuth(ctx, auth)
-	return AuthSelection{Auth: auth, Binding: binding}, err
+	return AuthSelection{Auth: auth, Binding: binding}, nil
 }
 
 func (s *Server) RebindAuthSelection(ctx context.Context, selection AuthSelection, candidateAuthID string) (AuthSelection, error) {
@@ -1116,25 +1167,15 @@ func resetRequestBody(r *http.Request, body []byte) {
 	}
 }
 
-func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization, signals []sessionAffinitySignal) {
-	selection, err := s.selectProxyAuth(r.Context(), authorization, signals)
-	if err != nil {
-		s.debugf("proxy upstream auth unavailable method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
-		if errors.Is(err, ErrStorageFailure) {
-			writeStoreError(w, err)
-			return
-		}
-		writeError(w, http.StatusServiceUnavailable, "upstream authentication unavailable")
-		return
-	}
-	auth := selection.Auth
+func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization, signals []sessionAffinitySignal, replayCandidate bool) {
+	replayable := prepareReplayBody(r, replayCandidate)
 	if route.responsesWebsocket && websocketRequested(r) {
-		s.proxyCodexWebSocket(w, r, route, authorization, auth)
+		s.proxyCodexWebSocket(w, r, route, authorization, signals, replayable)
 		return
 	}
 	metadata := captureProxyRequestUsageMetadata(r)
 	s.debugf(
-		"proxy upstream request method=%s path=%s target_scheme=%s target_host=%s target_path=%s websocket=%t allow_upstream_auth=%t auth_id=%s account_id_present=%t",
+		"proxy upstream request method=%s path=%s target_scheme=%s target_host=%s target_path=%s websocket=%t allow_upstream_auth=%t replayable=%t",
 		r.Method,
 		r.URL.Path,
 		route.baseURL.Scheme,
@@ -1142,9 +1183,18 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 		route.targetPath,
 		route.responsesWebsocket && websocketRequested(r),
 		route.allowUpstreamAuth,
-		auth.ID,
-		strings.TrimSpace(auth.AccountID) != "",
+		replayable,
 	)
+	execution := &proxyAttemptTransport{
+		server:        s,
+		incoming:      r,
+		route:         route,
+		authorization: authorization,
+		signals:       signals,
+		model:         metadata.Model,
+		replayable:    replayable,
+		transport:     s.httpClient.Transport,
+	}
 	proxy := &httputil.ReverseProxy{
 		Director: func(out *http.Request) {
 			out.URL.Scheme = route.baseURL.Scheme
@@ -1152,26 +1202,29 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 			out.URL.Path = route.targetPath
 			out.URL.RawQuery = r.URL.RawQuery
 			out.Host = route.baseURL.Host
-			applyCodexProxyHeaders(out, r, auth, s.cfg, route.responsesWebsocket)
 		},
-		Transport: s.httpClient.Transport,
+		Transport: execution,
 		ModifyResponse: func(resp *http.Response) error {
-			if errRetry := s.retryUnauthorizedProxyResponse(resp, r, route, auth); errRetry != nil {
-				return errRetry
+			result := execution.Result()
+			auth := result.Auth
+			authID := ""
+			if auth != nil {
+				authID = auth.ID
 			}
 			s.debugf(
-				"proxy upstream response method=%s path=%s status=%d target_host=%s target_path=%s",
+				"proxy upstream response method=%s path=%s status=%d target_host=%s target_path=%s auth_id=%s",
 				r.Method,
 				r.URL.Path,
 				resp.StatusCode,
 				route.baseURL.Host,
 				route.targetPath,
+				authID,
 			)
 			if s.shouldRecordUsage(authorization) {
 				capture := newUsageCaptureReadCloser(resp.Body, maxUsageCaptureBytes, func(payload []byte, truncated bool, counters UsageCounters, hasUsage bool) {
 					s.recordProxyUsageFromPayload(r.Context(), usageCaptureContext{
 						Authorization:   authorization,
-						AuthID:          auth.ID,
+						AuthID:          authID,
 						Model:           metadata.Model,
 						ReasoningEffort: metadata.ReasoningEffort,
 						ServiceTier:     metadata.ServiceTier,
@@ -1189,12 +1242,13 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
-			statusCode := http.StatusBadGateway
-			message := proxyErr.Error()
-			var authErr *upstreamAuthRefreshError
-			if errors.As(proxyErr, &authErr) {
-				statusCode = http.StatusServiceUnavailable
-				message = "upstream authentication unavailable"
+			if req.Context().Err() != nil {
+				return
+			}
+			result := execution.Result()
+			authID := ""
+			if result.Auth != nil {
+				authID = result.Auth.ID
 			}
 			s.debugf(
 				"proxy upstream error method=%s path=%s target_host=%s target_path=%s error=%q",
@@ -1205,9 +1259,14 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 				proxyErr.Error(),
 			)
 			if s.shouldRecordUsage(authorization) {
+				statusCode := http.StatusBadGateway
+				var finalErr *proxyFinalError
+				if errors.As(proxyErr, &finalErr) && finalErr != nil {
+					statusCode = finalErr.StatusCode
+				}
 				s.recordProxyUsageFromPayload(req.Context(), usageCaptureContext{
 					Authorization:   authorization,
-					AuthID:          auth.ID,
+					AuthID:          authID,
 					Model:           metadata.Model,
 					ReasoningEffort: metadata.ReasoningEffort,
 					ServiceTier:     metadata.ServiceTier,
@@ -1215,72 +1274,23 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 					RequestID:       requestIDFromRequest(req),
 				})
 			}
-			writeError(rw, statusCode, message)
+			if errors.Is(proxyErr, ErrStorageFailure) {
+				writeStoreError(rw, proxyErr)
+				return
+			}
+			var finalErr *proxyFinalError
+			if errors.As(proxyErr, &finalErr) && finalErr != nil {
+				writeProxyError(rw, finalErr)
+				return
+			}
+			writeProxyError(rw, &proxyFinalError{
+				StatusCode: http.StatusBadGateway,
+				Code:       proxyErrorCodeUpstream,
+				Message:    "upstream Codex service unavailable",
+			})
 		},
 	}
 	proxy.ServeHTTP(w, r)
-}
-
-func (s *Server) retryUnauthorizedProxyResponse(resp *http.Response, incoming *http.Request, route upstreamRoute, auth *Auth) error {
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		return nil
-	}
-	retryReq, err := cloneRequestForRetry(resp.Request)
-	if err != nil {
-		s.debugf(
-			"proxy upstream unauthorized method=%s path=%s auth_id=%s action=skip_retry reason=request_not_replayable",
-			incoming.Method,
-			incoming.URL.Path,
-			auth.ID,
-		)
-		return nil
-	}
-	failedAccessToken := auth.AccessToken
-	refreshCtx := incoming.Context()
-	if resp.Request != nil {
-		refreshCtx = resp.Request.Context()
-	}
-	discardAndCloseResponse(resp)
-	s.debugf(
-		"proxy upstream unauthorized method=%s path=%s auth_id=%s action=refresh",
-		incoming.Method,
-		incoming.URL.Path,
-		auth.ID,
-	)
-	refreshed := cloneAuth(auth)
-	if err := s.auths.RefreshAfterUnauthorized(refreshCtx, refreshed, failedAccessToken); err != nil {
-		if retryReq.Body != nil {
-			_ = retryReq.Body.Close()
-		}
-		return &upstreamAuthRefreshError{err: err}
-	}
-	applyCodexProxyHeaders(retryReq, incoming, refreshed, s.cfg, route.responsesWebsocket)
-	retryResp, err := s.httpClient.Transport.RoundTrip(retryReq)
-	if err != nil {
-		return err
-	}
-	*resp = *retryResp
-	copyAuth(auth, refreshed)
-	return nil
-}
-
-func cloneRequestForRetry(req *http.Request) (*http.Request, error) {
-	if req == nil {
-		return nil, fmt.Errorf("upstream request is nil")
-	}
-	retryReq := req.Clone(req.Context())
-	if req.Body == nil || req.Body == http.NoBody {
-		return retryReq, nil
-	}
-	if req.GetBody == nil {
-		return nil, fmt.Errorf("upstream request body is not replayable")
-	}
-	body, err := req.GetBody()
-	if err != nil {
-		return nil, err
-	}
-	retryReq.Body = body
-	return retryReq, nil
 }
 
 func discardAndCloseResponse(resp *http.Response) {
@@ -1653,6 +1663,33 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		"error": map[string]any{
 			"message": message,
 			"type":    http.StatusText(status),
+		},
+	})
+}
+
+func writeProxyError(w http.ResponseWriter, err *proxyFinalError) {
+	if err == nil {
+		err = &proxyFinalError{
+			StatusCode: http.StatusBadGateway,
+			Code:       proxyErrorCodeUpstream,
+			Message:    "upstream Codex service unavailable",
+		}
+	}
+	if err.StatusCode == 0 {
+		err.StatusCode = http.StatusBadGateway
+	}
+	if !err.RetryAt.IsZero() {
+		seconds := int64(math.Ceil(time.Until(err.RetryAt).Seconds()))
+		if seconds < 0 {
+			seconds = 0
+		}
+		w.Header().Set(proxyRetryAfterHeader, strconv.FormatInt(seconds, 10))
+	}
+	writeJSON(w, err.StatusCode, map[string]any{
+		"error": map[string]any{
+			"message": err.Message,
+			"type":    "proxy_error",
+			"code":    err.Code,
 		},
 	})
 }

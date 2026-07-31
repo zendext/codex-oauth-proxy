@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -194,7 +195,7 @@ func (s *Server) recordProxyUsage(capture usageCaptureContext) {
 			credential.APIKey.KeyHash,
 			credential.APIKey.MaskedKey,
 			capture.AuthID,
-			normalizeUsageText(capture.Model, "unknown"),
+			safeLogModel(capture.Model),
 			normalizeUsageText(capture.ReasoningEffort, "unknown"),
 			normalizeServiceTier(capture.ServiceTier),
 			capture.StatusCode,
@@ -454,7 +455,14 @@ func newUsageRequestID() string {
 	return id
 }
 
-func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization, auth *Auth) {
+func (s *Server) proxyCodexWebSocket(
+	w http.ResponseWriter,
+	r *http.Request,
+	route upstreamRoute,
+	authorization proxyAuthorization,
+	signals []sessionAffinitySignal,
+	replayable bool,
+) {
 	if !s.fastModeAllowed() && queryHasFastServiceTier(r.URL.Query()) {
 		writeError(w, http.StatusBadRequest, "fast mode is disabled")
 		return
@@ -476,29 +484,67 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 		metadataMu.Unlock()
 	}
 	upstreamURL := websocketURL(route.baseURL, route.targetPath, r.URL.RawQuery)
-	header := outboundWebSocketHeader(r, auth, s.cfg, route.responsesWebsocket)
 	dialer := websocketDialer(s.httpClient)
 	dialer.Subprotocols = websocket.Subprotocols(r)
-
-	s.debugf(
-		"proxy upstream websocket dial method=%s path=%s target=%s auth_id=%s",
-		r.Method,
-		r.URL.Path,
-		upstreamURL,
-		auth.ID,
+	var upstreamConn *websocket.Conn
+	result, err := s.executeUpstream(
+		r.Context(),
+		authorization,
+		signals,
+		metadata.Model,
+		replayable,
+		func(ctx context.Context, auth *Auth) (*http.Response, error) {
+			header := outboundWebSocketHeader(r, auth, s.cfg, route.responsesWebsocket)
+			s.debugf(
+				"proxy upstream websocket dial method=%s path=%s target=%s auth_id=%s",
+				r.Method,
+				r.URL.Path,
+				upstreamURL,
+				auth.ID,
+			)
+			conn, resp, errDial := dialer.DialContext(ctx, upstreamURL, header)
+			if errDial != nil {
+				statusCode := http.StatusBadGateway
+				if resp != nil {
+					statusCode = resp.StatusCode
+				}
+				s.debugf(
+					"proxy upstream websocket dial failed method=%s path=%s status=%d auth_id=%s error=%q",
+					r.Method,
+					r.URL.Path,
+					statusCode,
+					auth.ID,
+					errDial.Error(),
+				)
+				if errors.Is(errDial, websocket.ErrBadHandshake) && resp != nil {
+					return resp, nil
+				}
+				return nil, errDial
+			}
+			upstreamConn = conn
+			return resp, nil
+		},
 	)
-	upstreamConn, upstreamResp, err := dialer.DialContext(r.Context(), upstreamURL, header)
 	if err != nil {
-		statusCode := http.StatusBadGateway
-		if upstreamResp != nil {
-			statusCode = upstreamResp.StatusCode
-			_ = upstreamResp.Body.Close()
+		if upstreamConn != nil {
+			_ = upstreamConn.Close()
 		}
-		s.debugf("proxy upstream websocket dial failed method=%s path=%s status=%d error=%q", r.Method, r.URL.Path, statusCode, err.Error())
+		if r.Context().Err() != nil {
+			return
+		}
+		statusCode := http.StatusBadGateway
+		var finalErr *proxyFinalError
+		if errors.As(err, &finalErr) && finalErr != nil {
+			statusCode = finalErr.StatusCode
+		}
+		authID := ""
+		if result.Auth != nil {
+			authID = result.Auth.ID
+		}
 		if s.shouldRecordUsage(authorization) {
 			s.recordProxyUsage(usageCaptureContext{
 				Authorization:   authorization,
-				AuthID:          auth.ID,
+				AuthID:          authID,
 				Model:           metadata.Model,
 				ReasoningEffort: metadata.ReasoningEffort,
 				ServiceTier:     metadata.ServiceTier,
@@ -506,8 +552,50 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 				RequestID:       requestIDFromRequest(r),
 			})
 		}
-		writeError(w, http.StatusBadGateway, err.Error())
+		if errors.Is(err, ErrStorageFailure) {
+			writeStoreError(w, err)
+			return
+		}
+		if finalErr != nil {
+			writeProxyError(w, finalErr)
+			return
+		}
+		writeProxyError(w, &proxyFinalError{
+			StatusCode: http.StatusBadGateway,
+			Code:       proxyErrorCodeUpstream,
+			Message:    "upstream Codex service unavailable",
+		})
 		return
+	}
+	auth := result.Auth
+	upstreamResp := result.Response
+	if upstreamConn == nil {
+		if upstreamResp == nil {
+			writeProxyError(w, &proxyFinalError{
+				StatusCode: http.StatusBadGateway,
+				Code:       proxyErrorCodeUpstream,
+				Message:    "upstream Codex service unavailable",
+			})
+			return
+		}
+		defer upstreamResp.Body.Close()
+		if s.shouldRecordUsage(authorization) {
+			s.recordProxyUsage(usageCaptureContext{
+				Authorization:   authorization,
+				AuthID:          auth.ID,
+				Model:           metadata.Model,
+				ReasoningEffort: metadata.ReasoningEffort,
+				ServiceTier:     metadata.ServiceTier,
+				StatusCode:      upstreamResp.StatusCode,
+				RequestID:       usageRequestID(r, upstreamResp),
+				RetryAfter:      upstreamResp.Header.Get("Retry-After"),
+			})
+		}
+		writeWebSocketHandshakeResponse(w, upstreamResp)
+		return
+	}
+	if upstreamResp != nil && upstreamResp.Body != nil {
+		_ = upstreamResp.Body.Close()
 	}
 	defer upstreamConn.Close()
 
@@ -646,6 +734,43 @@ func (s *Server) proxyCodexWebSocket(w http.ResponseWriter, r *http.Request, rou
 			StatusCode:      http.StatusSwitchingProtocols,
 			RequestID:       requestIDFromRequest(r),
 		})
+	}
+}
+
+func writeWebSocketHandshakeResponse(w http.ResponseWriter, resp *http.Response) {
+	if resp == nil {
+		writeProxyError(w, nil)
+		return
+	}
+	excluded := map[string]struct{}{
+		"Connection":          {},
+		"Content-Length":      {},
+		"Keep-Alive":          {},
+		"Proxy-Authenticate":  {},
+		"Proxy-Authorization": {},
+		"Te":                  {},
+		"Trailer":             {},
+		"Transfer-Encoding":   {},
+		"Upgrade":             {},
+	}
+	for _, value := range resp.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if token = http.CanonicalHeaderKey(strings.TrimSpace(token)); token != "" {
+				excluded[token] = struct{}{}
+			}
+		}
+	}
+	for key, values := range resp.Header {
+		if _, skip := excluded[http.CanonicalHeaderKey(key)]; skip {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if resp.Body != nil {
+		_, _ = io.Copy(w, resp.Body)
 	}
 }
 
