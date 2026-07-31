@@ -448,6 +448,34 @@ Sampling and other unknown Chat Completions fields are not automatically
 forwarded. Clients that require full Responses behavior should call
 `/v1/responses` directly.
 
+The converter requires exactly one successful upstream terminal event.
+`response.completed` is a complete success. `response.incomplete` is a partial
+success with these standard Chat Completions finish reasons:
+
+| Incomplete reason | `finish_reason` |
+| --- | --- |
+| `max_tokens`, `max_output_tokens` | `length` |
+| `content_filter` | `content_filter` |
+| unknown | `length` |
+
+An incomplete reason takes precedence over `tool_calls`. The response does not
+include a non-standard `native_finish_reason` field.
+
+For streaming requests, the proxy waits for the first valid upstream event
+before committing the downstream SSE response. A failure before commitment is
+classified by the same OAuth refresh, health cooldown, model failover, and
+request-error rules as an HTTP failure. A failure after commitment emits one
+sanitized OpenAI error envelope as a `data:` event, closes the stream, and does
+not emit a finish chunk or `[DONE]`.
+
+EOF before a successful terminal, malformed or oversized events, duplicate
+terminals, and data after a terminal are failures. One upstream SSE event is
+limited to 50 MB. `response.output_item.done` snapshots are reconciled by output
+index with terminal output; non-stream terminal output is authoritative, while
+streaming can emit only a missing suffix. Local stop matching is UTF-8 safe
+across event boundaries and suppresses later text and tool deltas while the
+proxy continues draining terminal state and usage.
+
 Example:
 
 ```bash
@@ -468,6 +496,10 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 
 The proxy forwards these whitelisted Codex routes without defining their full
 upstream request schema:
+
+These native Responses HTTP and WebSocket routes remain transparent; the Chat
+Completions terminal validation and error conversion described above do not
+modify their event or frame payloads.
 
 | Common method | Public path |
 | --- | --- |
