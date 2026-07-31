@@ -185,32 +185,38 @@ func (m *AuthManager) refreshCurrentAuth(
 	reuseChangedToken bool,
 	force bool,
 ) (*Auth, error) {
-	result, err := m.Store.Reconcile(ctx)
-	if err != nil {
-		return nil, newOAuthRefreshError("auth reload failed", 0, "", err)
-	}
-	auths := result.Active
-	if force {
-		auths = result.Auths
-	}
-	current := matchingAuth(auths, auth)
-	if current == nil {
-		return nil, newOAuthRefreshError("auth is no longer available", 0, "", nil)
-	}
-	if !force && current.AccessToken != "" && current.AccessToken != failedAccessToken {
-		now := time.Now
-		if m.Now != nil {
-			now = m.Now
+	var refreshed *Auth
+	err := m.Store.withConsistentFiles(func() error {
+		result, errReconcile := m.Store.reconcile(ctx)
+		if errReconcile != nil {
+			return newOAuthRefreshError("auth reload failed", 0, "", errReconcile)
 		}
-		if reuseChangedToken || !current.Expired(now()) {
-			return current, nil
+		auths := result.Active
+		if force {
+			auths = result.Auths
 		}
-	}
-	candidate := cloneAuth(current)
-	if err = m.Refresher.Refresh(ctx, candidate); err != nil {
-		return nil, err
-	}
-	return candidate, nil
+		current := matchingAuth(auths, auth)
+		if current == nil {
+			return newOAuthRefreshError("auth is no longer available", 0, "", nil)
+		}
+		if !force && current.AccessToken != "" && current.AccessToken != failedAccessToken {
+			now := time.Now
+			if m.Now != nil {
+				now = m.Now
+			}
+			if reuseChangedToken || !current.Expired(now()) {
+				refreshed = current
+				return nil
+			}
+		}
+		candidate := cloneAuth(current)
+		if errRefresh := m.Refresher.Refresh(ctx, candidate); errRefresh != nil {
+			return errRefresh
+		}
+		refreshed = candidate
+		return nil
+	})
+	return refreshed, err
 }
 
 func matchingAuth(auths []*Auth, target *Auth) *Auth {

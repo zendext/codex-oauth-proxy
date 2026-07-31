@@ -271,6 +271,12 @@ func (s *FileAuthStore) Reconcile(ctx context.Context) (AuthReconcileResult, err
 	if s == nil {
 		return AuthReconcileResult{}, fmt.Errorf("auth store is nil")
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	return s.reconcile(ctx)
+}
+
+func (s *FileAuthStore) reconcile(ctx context.Context) (AuthReconcileResult, error) {
 	dir, err := ResolveAuthDir(s.Dir)
 	if err != nil {
 		return AuthReconcileResult{}, err
@@ -403,7 +409,7 @@ func (s *FileAuthStore) SetAccountDisabled(ctx context.Context, accountID string
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 
-	result, err := s.Reconcile(ctx)
+	result, err := s.reconcile(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +457,7 @@ func (s *FileAuthStore) SetAccountDisabled(ctx context.Context, accountID string
 			return nil, errors.Join(fmt.Errorf("save auth disabled state: %w", err), rollbackErr)
 		}
 	}
-	result, err = s.Reconcile(ctx)
+	result, err = s.reconcile(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -460,6 +466,15 @@ func (s *FileAuthStore) SetAccountDisabled(ctx context.Context, accountID string
 		return nil, ErrAuthNotFound
 	}
 	return updated, nil
+}
+
+func (s *FileAuthStore) withConsistentFiles(operation func() error) error {
+	if s == nil || operation == nil {
+		return ErrInvalidInput
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	return operation()
 }
 
 func readAuthFile(path string, baseDir string) (*Auth, error) {

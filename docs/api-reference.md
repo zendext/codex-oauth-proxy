@@ -296,6 +296,9 @@ All bindings for one user:
 {"user_id":"usr_xxx"}
 ```
 
+User scope requires `session_key` to be omitted. A present empty, whitespace,
+or otherwise invalid `session_key` returns `400` and does not clear bindings.
+
 All bindings targeting one identified auth:
 
 ```json

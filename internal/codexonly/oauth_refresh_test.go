@@ -20,6 +20,7 @@ import (
 
 func TestAuthManagerCoordinatesConcurrentProactiveRefresh(t *testing.T) {
 	authDir := t.TempDir()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	writeAuthFile(t, authDir, "auth.json", `{
 		"type": "codex",
 		"account_id": "acct_1",
@@ -38,14 +39,14 @@ func TestAuthManagerCoordinatesConcurrentProactiveRefresh(t *testing.T) {
 		<-releaseRefresh
 		auth.AccessToken = "new-access"
 		auth.RefreshToken = "new-refresh"
-		auth.ExpiresAt = time.Now().Add(time.Hour)
+		auth.ExpiresAt = now.Add(time.Hour)
 		return auth.Save()
 	})
 	manager := &AuthManager{
 		Store:     NewFileAuthStore(authDir),
 		Refresher: refresher,
 		Now: func() time.Time {
-			return time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+			return now
 		},
 	}
 

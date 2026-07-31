@@ -332,7 +332,9 @@ func TestAuthManagementForceRefreshFailureIsSanitizedAndUnidentifiedIsReadOnly(t
 		"refresh_token": "secret-unidentified-refresh"
 	}`)
 	server := newAuthManagementTestServer(t, authDir, nil)
+	var refreshCalls atomic.Int32
 	server.auths.Refresher = RefresherFunc(func(context.Context, *Auth) error {
+		refreshCalls.Add(1)
 		return newOAuthRefreshError("secret upstream body", http.StatusBadRequest, "invalid_grant", errors.New("secret cause"))
 	})
 	var logs bytes.Buffer
@@ -355,6 +357,13 @@ func TestAuthManagementForceRefreshFailureIsSanitizedAndUnidentifiedIsReadOnly(t
 	pathTarget := doJSONRequest(t, server, http.MethodPost, "/v0/management/auths/disable", `{"account_id":"path:unidentified.json"}`, "admin-secret-value")
 	if pathTarget.Code != http.StatusConflict {
 		t.Fatalf("path-identified mutation status = %d, want 409, body: %s", pathTarget.Code, pathTarget.Body.String())
+	}
+	pathRefresh := doJSONRequest(t, server, http.MethodPost, "/v0/management/auths/refresh", `{"account_id":"path:unidentified.json"}`, "admin-secret-value")
+	if pathRefresh.Code != http.StatusConflict {
+		t.Fatalf("path-identified refresh status = %d, want 409, body: %s", pathRefresh.Code, pathRefresh.Body.String())
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want only the identified auth refresh", got)
 	}
 	for _, output := range []string{resp.Body.String(), logs.String()} {
 		for _, secret := range []string{
@@ -725,6 +734,158 @@ func TestAuthManagementDuplicateFileSaveFailureRollsBack(t *testing.T) {
 	}
 }
 
+func TestAuthManagementSerializesRefreshAndDisablePersistence(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "a.json", flatAuthJSON("acct_serial", "access-a", false))
+	writeAuthFile(t, authDir, "b.json", flatAuthJSON("acct_serial", "access-b", false))
+	server := newAuthManagementTestServer(t, authDir, nil)
+	auth := requireAuthByAccountID(t, server, "acct_serial")
+
+	refreshStarted := make(chan struct{})
+	allowRefresh := make(chan struct{})
+	var allowRefreshOnce sync.Once
+	releaseRefresh := func() {
+		allowRefreshOnce.Do(func() {
+			close(allowRefresh)
+		})
+	}
+	t.Cleanup(releaseRefresh)
+	server.auths.Refresher = RefresherFunc(func(_ context.Context, candidate *Auth) error {
+		close(refreshStarted)
+		<-allowRefresh
+		candidate.AccessToken = "rotated-access"
+		candidate.RefreshToken = "rotated-refresh"
+		candidate.ExpiresAt = time.Now().Add(time.Hour)
+		return candidate.Save()
+	})
+
+	disableSaveStarted := make(chan struct{})
+	var disableSaveOnce sync.Once
+	server.auths.Store.renameFile = func(oldPath string, newPath string) error {
+		disableSaveOnce.Do(func() {
+			close(disableSaveStarted)
+		})
+		return os.Rename(oldPath, newPath)
+	}
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- server.auths.ForceRefresh(context.Background(), auth)
+	}()
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for refresh")
+	}
+
+	disableDone := make(chan error, 1)
+	go func() {
+		_, err := server.auths.Store.SetAccountDisabled(context.Background(), "acct_serial", true)
+		disableDone <- err
+	}()
+	select {
+	case <-disableSaveStarted:
+		t.Fatal("disable persistence started while refresh still owned the auth-file boundary")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseRefresh()
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("ForceRefresh returned error: %v", err)
+	}
+	if err := <-disableDone; err != nil {
+		t.Fatalf("SetAccountDisabled returned error: %v", err)
+	}
+
+	first := readAuthJSON(t, filepath.Join(authDir, "a.json"))
+	if first["access_token"] != "rotated-access" || first["refresh_token"] != "rotated-refresh" {
+		t.Fatalf("refreshed tokens were overwritten: access=%#v refresh=%#v", first["access_token"], first["refresh_token"])
+	}
+	for _, name := range []string{"a.json", "b.json"} {
+		meta := readAuthJSON(t, filepath.Join(authDir, name))
+		if meta["disabled"] != true {
+			t.Fatalf("%s disabled = %#v, want true", name, meta["disabled"])
+		}
+	}
+}
+
+func TestFileAuthStoreFailedMultiFileEnableHidesIntermediateState(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "a.json", flatAuthJSON("acct_visibility", "access-a", true))
+	writeAuthFile(t, authDir, "b.json", flatAuthJSON("acct_visibility", "access-b", true))
+	store := NewFileAuthStore(authDir)
+	if _, err := store.Reconcile(context.Background()); err != nil {
+		t.Fatalf("initial Reconcile returned error: %v", err)
+	}
+
+	secondSaveStarted := make(chan struct{})
+	releaseSecondSave := make(chan struct{})
+	var releaseSecondOnce sync.Once
+	releaseSecond := func() {
+		releaseSecondOnce.Do(func() {
+			close(releaseSecondSave)
+		})
+	}
+	t.Cleanup(releaseSecond)
+	var renameCalls atomic.Int32
+	store.renameFile = func(oldPath string, newPath string) error {
+		switch renameCalls.Add(1) {
+		case 1:
+			return os.Rename(oldPath, newPath)
+		case 2:
+			close(secondSaveStarted)
+			<-releaseSecondSave
+			return errors.New("injected second source failure")
+		default:
+			return os.Rename(oldPath, newPath)
+		}
+	}
+
+	enableDone := make(chan error, 1)
+	go func() {
+		_, err := store.SetAccountDisabled(context.Background(), "acct_visibility", false)
+		enableDone <- err
+	}()
+	select {
+	case <-secondSaveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for partial enable state")
+	}
+
+	type loadResult struct {
+		auths []*Auth
+		err   error
+	}
+	loadDone := make(chan loadResult, 1)
+	go func() {
+		auths, err := store.Load(context.Background())
+		loadDone <- loadResult{auths: auths, err: err}
+	}()
+	select {
+	case result := <-loadDone:
+		t.Fatalf("Load observed intermediate state before rollback: auths=%#v error=%v", result.auths, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseSecond()
+	if err := <-enableDone; err == nil {
+		t.Fatal("SetAccountDisabled returned nil error, want injected save failure")
+	}
+	result := <-loadDone
+	if result.err != nil {
+		t.Fatalf("Load after rollback returned error: %v", result.err)
+	}
+	if len(result.auths) != 0 {
+		t.Fatalf("active auths after failed enable = %#v, want none", result.auths)
+	}
+	for _, name := range []string{"a.json", "b.json"} {
+		meta := readAuthJSON(t, filepath.Join(authDir, name))
+		if meta["disabled"] != true {
+			t.Fatalf("%s disabled = %#v, want rollback to true", name, meta["disabled"])
+		}
+	}
+}
+
 func TestAuthManagementClearCooldownSafety(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -983,6 +1144,56 @@ func TestAuthManagementClearBindingsScopesAndRedaction(t *testing.T) {
 	}
 }
 
+func TestAuthManagementRejectsPresentEmptySessionKeyWithoutDeletingBindings(t *testing.T) {
+	tests := []struct {
+		name       string
+		sessionKey string
+	}{
+		{name: "empty", sessionKey: ""},
+		{name: "whitespace", sessionKey: " \t "},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			writeAuthFile(t, authDir, "auth.json", flatAuthJSON("acct_empty_session", "access-empty-session", false))
+			server := newAuthManagementTestServer(t, authDir, nil)
+			user, err := server.users.CreateUser(context.Background(), CreateUserParams{Name: "Alice"})
+			if err != nil {
+				t.Fatalf("create user: %v", err)
+			}
+			authorization := proxyAuthorization{Credential: &AuthenticatedAPIKey{User: user.User, APIKey: user.APIKey}}
+			if _, err = server.selectProxyAuth(context.Background(), authorization, []sessionAffinitySignal{
+				{Kind: sessionAffinitySignalSessionID, Value: "binding-that-must-remain"},
+			}); err != nil {
+				t.Fatalf("create binding: %v", err)
+			}
+			before := countLogicalSessionBindings(t, server.users)
+
+			body, err := json.Marshal(map[string]string{
+				"user_id":     user.User.ID,
+				"session_key": test.sessionKey,
+			})
+			if err != nil {
+				t.Fatalf("encode request: %v", err)
+			}
+			resp := doJSONRequest(
+				t,
+				server,
+				http.MethodPost,
+				"/v0/management/session-bindings/clear",
+				string(body),
+				"admin-secret-value",
+			)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("clear status = %d, want 400, body: %s", resp.Code, resp.Body.String())
+			}
+			if after := countLogicalSessionBindings(t, server.users); after != before {
+				t.Fatalf("binding count after rejected clear = %d, want unchanged %d", after, before)
+			}
+		})
+	}
+}
+
 func TestAuthManagementFatalStorageErrorsCannotReturnSuccess(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1145,4 +1356,13 @@ func deletedCount(resp *httptest.ResponseRecorder) int64 {
 	}
 	_ = json.Unmarshal(resp.Body.Bytes(), &payload)
 	return payload.DeletedCount
+}
+
+func countLogicalSessionBindings(t *testing.T, store *UserStore) int64 {
+	t.Helper()
+	var count int64
+	if err := store.db.QueryRow(`SELECT COUNT(DISTINCT binding_digest) FROM session_affinity_bindings`).Scan(&count); err != nil {
+		t.Fatalf("count logical session bindings: %v", err)
+	}
+	return count
 }

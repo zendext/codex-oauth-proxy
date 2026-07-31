@@ -2,6 +2,7 @@ package codexonly
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -27,9 +28,19 @@ type authManagementRequest struct {
 }
 
 type clearSessionBindingsRequest struct {
-	UserID     string `json:"user_id"`
-	SessionKey string `json:"session_key"`
-	AccountID  string `json:"account_id"`
+	UserID     string         `json:"user_id"`
+	SessionKey optionalString `json:"session_key"`
+	AccountID  string         `json:"account_id"`
+}
+
+type optionalString struct {
+	Value   string
+	Present bool
+}
+
+func (s *optionalString) UnmarshalJSON(data []byte) error {
+	s.Present = true
+	return json.Unmarshal(data, &s.Value)
 }
 
 type authManagementLastError struct {
@@ -168,6 +179,10 @@ func (s *Server) handleManagementAuthAction(w http.ResponseWriter, r *http.Reque
 		writeStoreError(w, err)
 		return
 	}
+	if action == "refresh" {
+		s.handleManagementAuthRefresh(w, r, accountID)
+		return
+	}
 	target, err := s.managementAuthByAccountID(r.Context(), accountID)
 	if err != nil {
 		writeAuthManagementError(w, err)
@@ -175,28 +190,6 @@ func (s *Server) handleManagementAuthAction(w http.ResponseWriter, r *http.Reque
 	}
 
 	switch action {
-	case "refresh":
-		refreshed := cloneAuth(target)
-		err = s.auths.ForceRefresh(r.Context(), refreshed)
-		if err != nil {
-			failure := preparationFailure(err, s.health.currentTime())
-			if errMark := s.markAuthFailure(r.Context(), target, "", failure); errMark != nil {
-				writeStoreError(w, errMark)
-				return
-			}
-			logAuthManagementOutcome("force_refresh", accountID, "failed", failure.StatusCode, failure.ErrorCode)
-			writeError(w, http.StatusBadGateway, "Codex OAuth refresh failed")
-			return
-		}
-		if err = s.health.MarkCredentialHealthy(r.Context(), refreshed); err != nil {
-			writeStoreError(w, err)
-			return
-		}
-		if _, err = s.reconcileAuths(r.Context()); err != nil {
-			writeAuthManagementError(w, err)
-			return
-		}
-		logAuthManagementOutcome("force_refresh", accountID, "succeeded", 0, "")
 	case "enable", "disable":
 		disabled := action == "disable"
 		if _, err = s.auths.Store.SetAccountDisabled(r.Context(), accountID, disabled); err != nil {
@@ -234,6 +227,43 @@ func (s *Server) handleManagementAuthAction(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{"auth": status})
 }
 
+func (s *Server) handleManagementAuthRefresh(w http.ResponseWriter, r *http.Request, accountID string) {
+	refreshed := &Auth{
+		ID:        stableAuthID(accountID, ""),
+		AccountID: accountID,
+	}
+	if err := s.auths.ForceRefresh(r.Context(), refreshed); err != nil {
+		target, errTarget := s.managementAuthByAccountID(r.Context(), accountID)
+		if errTarget != nil {
+			writeAuthManagementError(w, errTarget)
+			return
+		}
+		failure := preparationFailure(err, s.health.currentTime())
+		if errMark := s.markAuthFailure(r.Context(), target, "", failure); errMark != nil {
+			writeStoreError(w, errMark)
+			return
+		}
+		logAuthManagementOutcome("force_refresh", accountID, "failed", failure.StatusCode, failure.ErrorCode)
+		writeError(w, http.StatusBadGateway, "Codex OAuth refresh failed")
+		return
+	}
+	if err := s.health.MarkCredentialHealthy(r.Context(), refreshed); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if _, err := s.reconcileAuths(r.Context()); err != nil {
+		writeAuthManagementError(w, err)
+		return
+	}
+	logAuthManagementOutcome("force_refresh", accountID, "succeeded", 0, "")
+	status, err := s.managementAuthStatusByAccountID(r.Context(), accountID)
+	if err != nil {
+		writeAuthManagementError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"auth": status})
+}
+
 func (s *Server) handleManagementSessionBindingClear(w http.ResponseWriter, r *http.Request) {
 	var req clearSessionBindingsRequest
 	if !decodeJSONRequest(w, r, &req) {
@@ -241,10 +271,13 @@ func (s *Server) handleManagementSessionBindingClear(w http.ResponseWriter, r *h
 	}
 	req.UserID = strings.TrimSpace(req.UserID)
 	req.AccountID = strings.TrimSpace(req.AccountID)
-	hasSession := strings.TrimSpace(req.SessionKey) != ""
-	exactScope := req.UserID != "" && hasSession && req.AccountID == ""
-	userScope := req.UserID != "" && !hasSession && req.AccountID == ""
-	accountScope := req.UserID == "" && !hasSession && req.AccountID != ""
+	if req.SessionKey.Present && strings.TrimSpace(req.SessionKey.Value) == "" {
+		writeError(w, http.StatusBadRequest, "invalid session_key")
+		return
+	}
+	exactScope := req.UserID != "" && req.SessionKey.Present && req.AccountID == ""
+	userScope := req.UserID != "" && !req.SessionKey.Present && req.AccountID == ""
+	accountScope := req.UserID == "" && !req.SessionKey.Present && req.AccountID != ""
 	if !exactScope && !userScope && !accountScope {
 		writeError(w, http.StatusBadRequest, "exactly one binding clear scope is required")
 		return
@@ -267,7 +300,7 @@ func (s *Server) handleManagementSessionBindingClear(w http.ResponseWriter, r *h
 		deleted, err = s.users.DeleteSessionAffinityByTenantSession(
 			r.Context(),
 			"user:"+req.UserID,
-			req.SessionKey,
+			req.SessionKey.Value,
 		)
 		if err == nil {
 			logSessionBindingClear("exact_session", req.UserID, "", deleted)
