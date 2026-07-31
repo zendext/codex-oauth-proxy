@@ -28,11 +28,15 @@ type Config struct {
 	AllowFastMode        bool           `yaml:"allow-fast-mode"`
 	ProxyURL             string         `yaml:"proxy-url"`
 	RequestRetry         int            `yaml:"request-retry"`
+	MaxRetryCredentials  int            `yaml:"max-retry-credentials"`
+	MaxRetryInterval     int            `yaml:"max-retry-interval"`
 	CodexBaseURL         string         `yaml:"codex-base-url"`
 	ChatGPTBaseURL       string         `yaml:"chatgpt-base-url"`
 	CodexUserAgent       string         `yaml:"codex-user-agent"`
 	CodexBetaFeatures    string         `yaml:"codex-beta-features"`
 	CodexRefreshTokenURL string         `yaml:"codex-refresh-token-url"`
+	requestRetrySet      bool
+	maxRetryIntervalSet  bool
 }
 
 type DatabaseConfig struct {
@@ -42,6 +46,27 @@ type DatabaseConfig struct {
 type UsageConfig struct {
 	Enabled             *bool `yaml:"enabled"`
 	DebugOpenAIResponse bool  `yaml:"debug-openai-response"`
+}
+
+func (cfg *Config) UnmarshalYAML(value *yaml.Node) error {
+	type plainConfig Config
+	var decoded plainConfig
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*cfg = Config(decoded)
+	if value.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(value.Content); index += 2 {
+		switch value.Content[index].Value {
+		case "request-retry":
+			cfg.requestRetrySet = true
+		case "max-retry-interval":
+			cfg.maxRetryIntervalSet = true
+		}
+	}
+	return nil
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -78,8 +103,20 @@ func ApplyDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.ChatGPTBaseURL) == "" {
 		cfg.ChatGPTBaseURL = DefaultChatGPTBaseURL
 	}
-	if cfg.RequestRetry <= 0 {
+	if !cfg.requestRetrySet && cfg.RequestRetry == 0 {
 		cfg.RequestRetry = 3
+	}
+	if cfg.RequestRetry < 0 {
+		cfg.RequestRetry = 0
+	}
+	if cfg.MaxRetryCredentials < 0 {
+		cfg.MaxRetryCredentials = 0
+	}
+	if !cfg.maxRetryIntervalSet && cfg.MaxRetryInterval == 0 {
+		cfg.MaxRetryInterval = 30
+	}
+	if cfg.MaxRetryInterval < 0 {
+		cfg.MaxRetryInterval = 0
 	}
 }
 

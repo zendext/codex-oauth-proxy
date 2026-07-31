@@ -269,6 +269,41 @@ func TestRuntimeSessionAffinitySQLiteFailuresSignalFatal(t *testing.T) {
 	})
 }
 
+func TestRuntimeAuthHealthSQLiteFailuresSignalFatal(t *testing.T) {
+	t.Run("read", func(t *testing.T) {
+		server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
+		if err := server.users.db.Close(); err != nil {
+			t.Fatalf("close SQLite database: %v", err)
+		}
+		if _, err := server.users.LoadAuthHealthStates(context.Background()); !errors.Is(err, ErrStorageFailure) {
+			t.Fatalf("LoadAuthHealthStates error = %v, want ErrStorageFailure", err)
+		}
+		assertFatalStorageError(t, server.FatalErrors())
+	})
+
+	t.Run("write", func(t *testing.T) {
+		server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
+		auths, err := server.auths.Store.Load(context.Background())
+		if err != nil {
+			t.Fatalf("load auths: %v", err)
+		}
+		if err = server.users.db.Close(); err != nil {
+			t.Fatalf("close SQLite database: %v", err)
+		}
+		err = server.health.MarkUnavailable(context.Background(), auths[0], AuthHealthState{
+			Kind:          AuthHealthQuota,
+			Reason:        "quota",
+			RetryAt:       time.Now().Add(time.Minute),
+			Authoritative: true,
+			StatusCode:    http.StatusTooManyRequests,
+		})
+		if !errors.Is(err, ErrStorageFailure) {
+			t.Fatalf("MarkUnavailable error = %v, want ErrStorageFailure", err)
+		}
+		assertFatalStorageError(t, server.FatalErrors())
+	})
+}
+
 func TestExpectedStoreErrorsDoNotSignalFatal(t *testing.T) {
 	server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
 	store := server.users

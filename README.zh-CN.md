@@ -13,7 +13,7 @@ Codex 请求。
 
 - 代理 Codex CLI 和受支持的 OpenAI 兼容请求。
 - 为代理用户管理 `cop_...` API Key。
-- 轮换多个 Codex OAuth 凭据并刷新过期 Token。
+- 使用健康感知的 Codex OAuth 故障转移、冷却和协调 Token 刷新。
 - 持久化租户范围的会话亲和性，不存储原始会话标识符。
 - 记录按用户划分的 Token 用量，并提供可选 Grafana 仪表盘。
 

@@ -18,7 +18,9 @@ storage backends.
 | `cmd/server/` | Process entrypoint, server lifecycle, admin CLI, HTTP client, and CLI formatting. |
 | `internal/codexonly/config.go` | YAML loading and path/default resolution. |
 | `internal/codexonly/auth.go` | OAuth file discovery, parsing, filtering, and persistence. |
+| `internal/codexonly/auth_health.go` | Global credential health, model exclusions, cooldown reconciliation, and authoritative-state persistence. |
 | `internal/codexonly/refresh.go` | OAuth refresh and outbound HTTP transport construction. |
+| `internal/codexonly/failover.go` | Replay eligibility, upstream response classification, retry layers, and deterministic aggregate errors. |
 | `internal/codexonly/server.go` | Routing, authentication, model catalog, headers, HTTP reverse proxy, and management/user handlers. |
 | `internal/codexonly/chat_completions.go` | Chat Completions to Responses conversion and response translation. |
 | `internal/codexonly/user_store.go` | SQLite schema, users, API keys, and authentication. |
@@ -37,8 +39,8 @@ Startup performs these steps:
 4. Build an upstream client and a timeout-limited OAuth refresh client.
 5. Scan the auth directory to verify it is readable.
 6. Resolve the SQLite path, run idempotent schema migrations, validate the
-   initial persisted user state, and remove affinity targets for auth identities
-   that are no longer present.
+   initial persisted user state, remove affinity targets for auth identities
+   that are no longer present, and restore unexpired authoritative auth health.
 7. Start one `net/http` server.
 
 The server sets `ReadHeaderTimeout` to 10 seconds. It does not set read or write
@@ -107,6 +109,47 @@ within the refresh deadline. Missing refresh credentials, `invalid_grant`,
 definitive `400`/`401`/`403` responses, malformed responses, and successful
 responses without an access token are terminal. Refresh errors expose only safe
 status and OAuth error-code context, never raw token-endpoint response bodies.
+
+## Auth Health and Retry
+
+Auth health is global to one stable logical credential in this single process.
+All sessions skip credentials that are disabled, cooling down,
+credential-invalid, continued-unauthorized, or excluded for the requested
+model. Session affinity remains sticky while healthy and uses its existing
+SQLite compare-and-swap rebind when failover is required. One request snapshots
+the auth IDs known at its start, so a newly added replacement identity cannot
+take over that in-flight execution.
+
+The proxy classifies upstream outcomes before committing a downstream response:
+
+- Request-scoped `4xx` responses stop without changing auth health.
+- `401` performs one coordinated same-auth refresh and retry when replay is
+  available; another `401` blocks that credential.
+- `429` uses `Retry-After` or an explicit Codex quota reset deadline.
+- Network failures, `408`, and retryable `5xx` responses create a short
+  in-memory cooldown.
+- Model-not-supported responses create a credential/model exclusion rather than
+  an auth-global cooldown.
+
+Retry uses three independent budgets. Same-auth `401` repair is outside the
+credential budget. One execution round tries distinct eligible auths up to
+`max-retry-credentials`, where zero means all. After a round, the proxy waits
+for the nearest cooldown only when it is within `max-retry-interval`, then
+starts up to `request-retry` additional rounds. Context cancellation interrupts
+selection, refresh, and cooldown waiting immediately.
+
+Cross-auth retry requires an explicit replayable route. Eligible JSON requests
+are buffered in memory up to and including 32 MiB; nothing is spooled to disk
+for retry. Unknown-length, oversized, multipart, file, realtime,
+side-effecting wham, hosted MCP, and unknown write requests remain one-shot.
+Responses WebSocket handshakes can fail over before a successful upgrade.
+HTTP streams and WebSockets never re-enter retry after downstream commitment.
+
+Only explicit quota deadlines, `invalid_grant`, and continued unauthorized
+state are stored in `auth_health_states`. Transient cooldowns and model
+exclusions remain in memory. Credential-state fingerprints invalidate persisted
+credential failures after real token material changes, while same-account token
+updates preserve unexpired quota deadlines.
 
 ## Authentication Boundaries
 
@@ -208,24 +251,28 @@ For a whitelisted proxy request:
 
 1. Authenticate the incoming managed key or permitted OAuth compatibility token.
 2. Reject Fast service tiers when Fast mode is disabled.
-3. Resolve session affinity, or use round-robin selection when no valid signal
-   is present, then refresh the selected upstream OAuth credential.
+3. Reconcile auth files and global health, then resolve healthy session affinity
+   or choose the next eligible credential.
 4. Rewrite the target URL to the configured Codex or ChatGPT base.
 5. Replace `Authorization` with the selected OAuth access token.
 6. Add the ChatGPT account ID and compatibility headers when available.
-7. If an HTTP upstream returns `401` before the client response is committed
-   and the original request body is already replayable, refresh the same
-   credential and retry it once.
-8. Forward non-replayable requests once without buffering them for retry.
-9. Forward HTTP streaming responses or bridge WebSocket frames.
-10. Capture usage metadata for managed user requests.
+7. Apply same-auth repair, distinct-credential failover, and bounded cooldown
+   rounds only while the request is replayable and no client response is
+   committed.
+8. Update auth health and use affinity CAS when selection moves to another
+   credential.
+9. Forward one-shot requests once, forward HTTP streaming responses, or bridge
+   WebSocket frames after a successful handshake.
+10. Return deterministic safe aggregate errors when all candidates are
+    exhausted.
+11. Capture usage metadata for managed user requests.
 
 The proxy preserves established HTTP streams during normal operation. WebSocket
 forwarding uses Gorilla WebSocket and forces HTTP/1.1 ALPN for the upstream
 upgrade path. Server shutdown or a fatal storage failure cancels established
-streams and closes both WebSocket peers. Reactive OAuth recovery does not switch
-to another credential and does not retry after response commitment.
-Non-replayable request bodies keep the first upstream response unchanged.
+streams and closes both WebSocket peers. No retry occurs after response
+commitment or successful upgrade. Non-replayable request bodies keep the first
+upstream response unchanged.
 
 ## Chat Completions Conversion
 
@@ -235,8 +282,8 @@ Non-replayable request bodies keep the first upstream response unchanged.
 2. Convert messages, tools, response format, reasoning, and service tier to a
    Responses request.
 3. Force `stream: true` and `store: false` upstream.
-4. If the upstream returns `401`, refresh the same credential and retry once
-   before committing the client response.
+4. Run the same health-aware pre-commit retry executor used by replayable
+   Responses requests.
 5. Read Responses SSE events.
 6. Aggregate them into a normal Chat Completions response or translate them into
    Chat Completions SSE chunks.
@@ -285,6 +332,20 @@ A binding has:
 No raw session ID, prompt-cache key, conversation ID, managed API key, or model
 name is stored in the binding table.
 
+### Auth Health States
+
+An authoritative persisted auth health row has:
+
+- Stable OAuth credential ID.
+- State kind and safe reason.
+- Optional recovery deadline.
+- Credential fingerprint for credential-related states.
+- Safe upstream status and error code.
+- Update timestamp.
+
+The table never stores access tokens, refresh tokens, raw upstream bodies, or
+short transport cooldowns.
+
 ## Usage Data Model
 
 `usage_buckets` aggregates managed-user usage into 10-minute UTC buckets. The
@@ -318,7 +379,9 @@ Raw session affinity signals are not written to SQLite, returned by management
 APIs, or written to debug logs. A large JSON request body may be staged in a
 process-owned `0600` temporary replay file for the lifetime of that request; the
 file is removed when replay closes, including when another request-processing
-step replaces the replay body.
+step replaces the replay body. That temporary storage exists only for affinity
+signal extraction. Cross-auth retry bodies are memory-only and capped at
+32 MiB.
 
 The server itself provides HTTP. Listen address selection and transport
 termination belong to the deployment environment.

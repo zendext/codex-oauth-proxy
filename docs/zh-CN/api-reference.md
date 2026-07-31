@@ -63,6 +63,29 @@ X-API-Key: <token>
 前缀与未读取的请求流。被忽略或缺失的信号不会导致请求失败；选择会回退到正常
 轮询行为。
 
+## 健康感知故障转移
+
+认证健康跨会话全局生效。健康的亲和性绑定会继续使用当前 Codex 凭据；绑定凭据
+被禁用、正在冷却、凭据无效、刷新后继续未授权或无法服务请求模型时，会通过
+Compare-and-swap 故障转移进行重绑定。
+
+跨凭据重试只适用于：
+
+- 白名单路由上的只读 `GET` 和 `HEAD` 请求。
+- JSON `/v1/chat/completions`。
+- Responses、Responses Compact、Alpha Search、JSON Image Generation 和
+  Trace Summarization。
+- Upgrade 成功前的 Responses WebSocket Handshake。
+
+可重放请求 Body 只在内存中缓冲，最大包含 32 MiB。未知长度或更大的 Body，
+以及 Multipart、文件、Realtime、具有副作用的 Wham、Hosted MCP 和未知写请求
+只发送一次，不会仅因无法自动重放而被拒绝。
+
+在一次可重放执行中，`401` 首先刷新并重试同一凭据一次。随后一个凭据轮次尝试
+不同且可用的凭据。轮次结束后，代理可以根据 `request-retry`、
+`max-retry-credentials` 和 `max-retry-interval` 等待最近冷却并启动下一轮。
+取消会立即停止等待。下游响应字节提交或 WebSocket Upgrade 成功后不会重试。
+
 ## 错误格式
 
 项目自有 Handler 返回：
@@ -76,7 +99,31 @@ X-API-Key: <token>
 }
 ```
 
-代理的上游路由可能会保留上游状态码、Header 和响应 Body。
+代理的上游路由可能会保留上游状态码、Header 和响应 Body。请求范围的上游
+`4xx` 会立即停止，且不会惩罚凭据。
+
+可重放候选耗尽后，代理返回安全的聚合错误：
+
+```json
+{
+  "error": {
+    "message": "upstream Codex service unavailable",
+    "type": "proxy_error",
+    "code": "upstream_unavailable"
+  }
+}
+```
+
+确定性聚合结果如下：
+
+| 状态 | Code | 含义 |
+| --- | --- | --- |
+| `404` | `model_not_found` | 所有已知候选都因请求模型而被排除。 |
+| `429` | `rate_limited` | 所有可服务候选都受配额限制，或混合故障存在明确的近期配额恢复时间。响应包含已知最早的 `Retry-After`。 |
+| `503` | `auth_unavailable` | 所有候选都已禁用、凭据无效或刷新后继续未授权。 |
+| `502` | `upstream_unavailable` | 网络或可重试上游故障已经耗尽，包括没有近期恢复 Deadline 的混合故障。 |
+
+客户端取消不会生成新的代理错误。
 
 ## 服务端点
 
