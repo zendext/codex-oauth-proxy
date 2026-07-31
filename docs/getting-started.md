@@ -96,6 +96,18 @@ Expected response:
 {"status":"ok"}
 ```
 
+## Process Supervision
+
+SQLite is required for startup and continued operation. The process exits with
+an error when the database cannot be opened, migrated, initially read, or
+accessed by a runtime read or write.
+
+Production deployments must run the proxy under systemd, Docker, Kubernetes, or
+another external supervisor with an appropriate restart policy. Correct the
+database path, permissions, corruption, disk, or filesystem problem before
+expecting a restarted process to remain healthy. The proxy does not reconnect
+to SQLite or continue in a degraded in-memory mode.
+
 ## Create a Managed User
 
 Keep the server running and use another terminal:

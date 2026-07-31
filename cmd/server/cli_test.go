@@ -4,11 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/zendext/codex-oauth-proxy/internal/codexonly"
 )
 
 func TestParseCLILegacyServeFlags(t *testing.T) {
@@ -254,4 +262,98 @@ func TestRunHelpPrintsUsage(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
+}
+
+func TestWaitForServerReturnsFatalStorageError(t *testing.T) {
+	fatalErr := errors.New("injected SQLite failure")
+	fatalErrors := make(chan error, 1)
+	fatalErrors <- fmt.Errorf("%w: %w", codexonly.ErrStorageFailure, fatalErr)
+	lifecycle := &testServerLifecycle{fatalErrors: fatalErrors}
+
+	err := waitForServer(
+		&commandRuntime{ctx: context.Background(), stdout: io.Discard},
+		&http.Server{},
+		lifecycle,
+		make(chan error),
+		make(chan os.Signal),
+		time.Second,
+	)
+	if !errors.Is(err, fatalErr) {
+		t.Fatalf("waitForServer error = %v, want injected fatal error", err)
+	}
+	if got := lifecycle.shutdowns.Load(); got != 1 {
+		t.Fatalf("shutdown calls = %d, want 1", got)
+	}
+}
+
+func TestShutdownHTTPServerIsBounded(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	})}
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.Serve(listener)
+	}()
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		resp, errGet := http.Get("http://" + listener.Addr().String())
+		if errGet == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for request handler")
+	}
+
+	lifecycle := &testServerLifecycle{fatalErrors: make(chan error)}
+	start := time.Now()
+	err = shutdownHTTPServer(server, lifecycle, 20*time.Millisecond)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdownHTTPServer error = %v, want context deadline exceeded", err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("shutdownHTTPServer took %s, want less than 1s", elapsed)
+	}
+	if got := lifecycle.shutdowns.Load(); got != 1 {
+		t.Fatalf("shutdown calls = %d, want 1", got)
+	}
+
+	close(release)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for client request")
+	}
+	select {
+	case errServe := <-serveErr:
+		if !errors.Is(errServe, http.ErrServerClosed) {
+			t.Fatalf("Serve error = %v, want http.ErrServerClosed", errServe)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for HTTP server")
+	}
+}
+
+type testServerLifecycle struct {
+	fatalErrors <-chan error
+	shutdowns   atomic.Int32
+}
+
+func (l *testServerLifecycle) FatalErrors() <-chan error {
+	return l.fatalErrors
+}
+
+func (l *testServerLifecycle) Shutdown() {
+	l.shutdowns.Add(1)
 }

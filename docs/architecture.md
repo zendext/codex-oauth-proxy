@@ -35,12 +35,34 @@ Startup performs these steps:
 3. Resolve `auth-dir` and validate the two upstream base URLs.
 4. Build an upstream client and a timeout-limited OAuth refresh client.
 5. Scan the auth directory to verify it is readable.
-6. Resolve the SQLite path and run idempotent schema migrations.
+6. Resolve the SQLite path, run idempotent schema migrations, and validate the
+   initial persisted user state.
 7. Start one `net/http` server.
 
 The server sets `ReadHeaderTimeout` to 10 seconds. It does not set read or write
 timeouts that would terminate established streaming or WebSocket traffic.
-Graceful shutdown has a 10-second timeout.
+Graceful shutdown has a 10-second timeout and force-closes remaining HTTP
+connections when that deadline expires.
+
+## Storage Failure Lifecycle
+
+SQLite is a process-level hard dependency. A database path, open, migration, or
+initial state-load failure prevents startup.
+
+At runtime, the first unexpected SQLite read or write failure becomes the
+process-level fatal error. It cancels active proxy request contexts, closes both
+sides of established WebSocket bridges, starts bounded HTTP shutdown, and
+causes the server process to exit with an error. Concurrent later failures reuse
+the first fatal error and do not start additional shutdowns.
+
+Expected application errors do not trigger this lifecycle. These include
+invalid input, missing records, disabled or invalid credentials, handled
+constraint conflicts, and canceled request contexts.
+
+The process does not provide degraded, in-memory-only, or automatic database
+recovery. Production deployments must use systemd, Docker, Kubernetes, or
+another external supervisor to restart the process after the underlying SQLite
+problem has been corrected.
 
 ## OAuth Credential Flow
 
@@ -135,8 +157,10 @@ For a whitelisted proxy request:
 7. Forward HTTP streaming responses or bridge WebSocket frames.
 8. Capture usage metadata for managed user requests.
 
-The proxy preserves established HTTP streams. WebSocket forwarding uses Gorilla
-WebSocket and forces HTTP/1.1 ALPN for the upstream upgrade path.
+The proxy preserves established HTTP streams during normal operation. WebSocket
+forwarding uses Gorilla WebSocket and forces HTTP/1.1 ALPN for the upstream
+upgrade path. Server shutdown or a fatal storage failure cancels established
+streams and closes both WebSocket peers.
 
 ## Chat Completions Conversion
 

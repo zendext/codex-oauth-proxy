@@ -28,8 +28,9 @@ var (
 )
 
 type UserStore struct {
-	db  *sql.DB
-	now func() time.Time
+	db       *sql.DB
+	now      func() time.Time
+	failures *storageFailureState
 }
 
 type CreateUserParams struct {
@@ -79,6 +80,10 @@ type AuthenticatedAPIKey struct {
 }
 
 func OpenUserStore(ctx context.Context, path string) (*UserStore, error) {
+	return openUserStore(ctx, path, nil)
+}
+
+func openUserStore(ctx context.Context, path string, onFailure func()) (*UserStore, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, fmt.Errorf("open user store: %w", ErrInvalidInput)
@@ -92,7 +97,8 @@ func OpenUserStore(ctx context.Context, path string) (*UserStore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	store := &UserStore{
-		db: db,
+		db:       db,
+		failures: newStorageFailureState(onFailure),
 		now: func() time.Time {
 			return time.Now().UTC()
 		},
@@ -100,6 +106,10 @@ func OpenUserStore(ctx context.Context, path string) (*UserStore, error) {
 	if err = store.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if _, err = store.ListUsers(ctx, nil); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("load initial user state: %w", err)
 	}
 	return store, nil
 }
@@ -367,6 +377,9 @@ func tableColumnExists(ctx context.Context, db *sql.DB, table string, column str
 }
 
 func (s *UserStore) CreateUser(ctx context.Context, params CreateUserParams) (CreatedUserAPIKey, error) {
+	if err := s.checkReady(); err != nil {
+		return CreatedUserAPIKey{}, err
+	}
 	name, err := normalizeUserName(params.Name)
 	if err != nil {
 		return CreatedUserAPIKey{}, err
@@ -406,7 +419,7 @@ func (s *UserStore) CreateUser(ctx context.Context, params CreateUserParams) (Cr
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return CreatedUserAPIKey{}, fmt.Errorf("begin create user: %w", err)
+		return CreatedUserAPIKey{}, s.databaseError("begin create user", err)
 	}
 	defer rollbackUnlessCommitted(tx)
 
@@ -415,22 +428,25 @@ func (s *UserStore) CreateUser(ctx context.Context, params CreateUserParams) (Cr
 		user.ID, user.Name, boolInt(user.Enabled), formatDBTime(user.CreatedAt), formatDBTime(user.UpdatedAt),
 	)
 	if err != nil {
-		return CreatedUserAPIKey{}, mapSQLiteError(err)
+		return CreatedUserAPIKey{}, s.databaseError("insert user", mapSQLiteError(err))
 	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO api_keys (id, user_id, key_hash, key_prefix, masked_key, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		key.ID, key.UserID, key.KeyHash, key.KeyPrefix, key.MaskedKey, boolInt(key.Enabled), formatDBTime(key.CreatedAt),
 	)
 	if err != nil {
-		return CreatedUserAPIKey{}, mapSQLiteError(err)
+		return CreatedUserAPIKey{}, s.databaseError("insert user API key", mapSQLiteError(err))
 	}
 	if err = tx.Commit(); err != nil {
-		return CreatedUserAPIKey{}, fmt.Errorf("commit create user: %w", err)
+		return CreatedUserAPIKey{}, s.databaseError("commit create user", err)
 	}
 	return CreatedUserAPIKey{User: user, APIKey: key, PlaintextAPIKey: plainKey}, nil
 }
 
 func (s *UserStore) ListUsers(ctx context.Context, enabled *bool) ([]UserWithAPIKey, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
 	query := userWithKeySelect() + ` ORDER BY u.name COLLATE NOCASE ASC`
 	args := []any{}
 	if enabled != nil {
@@ -439,7 +455,7 @@ func (s *UserStore) ListUsers(ctx context.Context, enabled *bool) ([]UserWithAPI
 	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list users: %w", err)
+		return nil, s.databaseError("list users", err)
 	}
 	defer rows.Close()
 
@@ -447,26 +463,35 @@ func (s *UserStore) ListUsers(ctx context.Context, enabled *bool) ([]UserWithAPI
 	for rows.Next() {
 		user, errScan := scanUserWithAPIKey(rows)
 		if errScan != nil {
-			return nil, errScan
+			return nil, s.databaseError("scan user", errScan)
 		}
 		users = append(users, user)
 	}
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("list users rows: %w", err)
+		return nil, s.databaseError("list users rows", err)
+	}
+	if err = rows.Close(); err != nil {
+		return nil, s.databaseError("close user rows", err)
 	}
 	return users, nil
 }
 
 func (s *UserStore) GetUser(ctx context.Context, id string) (UserWithAPIKey, error) {
+	if err := s.checkReady(); err != nil {
+		return UserWithAPIKey{}, err
+	}
 	row := s.db.QueryRowContext(ctx, userWithKeySelect()+` WHERE u.id = ?`, strings.TrimSpace(id))
 	user, err := scanUserWithAPIKey(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserWithAPIKey{}, ErrUserNotFound
 	}
-	return user, err
+	return user, s.databaseError("get user", err)
 }
 
 func (s *UserStore) UpdateUser(ctx context.Context, id string, params UpdateUserParams) (UserWithAPIKey, error) {
+	if err := s.checkReady(); err != nil {
+		return UserWithAPIKey{}, err
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return UserWithAPIKey{}, ErrUserNotFound
@@ -491,12 +516,15 @@ func (s *UserStore) UpdateUser(ctx context.Context, id string, params UpdateUser
 		name, boolInt(enabled), formatDBTime(s.now().UTC()), id,
 	)
 	if err != nil {
-		return UserWithAPIKey{}, mapSQLiteError(err)
+		return UserWithAPIKey{}, s.databaseError("update user", mapSQLiteError(err))
 	}
 	return s.GetUser(ctx, id)
 }
 
 func (s *UserStore) ResetUserAPIKey(ctx context.Context, userID string) (CreatedUserAPIKey, error) {
+	if err := s.checkReady(); err != nil {
+		return CreatedUserAPIKey{}, err
+	}
 	user, err := s.GetUser(ctx, userID)
 	if err != nil {
 		return CreatedUserAPIKey{}, err
@@ -522,28 +550,31 @@ func (s *UserStore) ResetUserAPIKey(ctx context.Context, userID string) (Created
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return CreatedUserAPIKey{}, fmt.Errorf("begin reset api key: %w", err)
+		return CreatedUserAPIKey{}, s.databaseError("begin reset API key", err)
 	}
 	defer rollbackUnlessCommitted(tx)
 
 	_, err = tx.ExecContext(ctx, `UPDATE api_keys SET enabled = 0 WHERE user_id = ? AND enabled = 1`, user.User.ID)
 	if err != nil {
-		return CreatedUserAPIKey{}, fmt.Errorf("disable previous api keys: %w", err)
+		return CreatedUserAPIKey{}, s.databaseError("disable previous API keys", err)
 	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO api_keys (id, user_id, key_hash, key_prefix, masked_key, enabled, created_at, rotated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		key.ID, key.UserID, key.KeyHash, key.KeyPrefix, key.MaskedKey, boolInt(key.Enabled), formatDBTime(key.CreatedAt), formatDBTime(*key.RotatedAt),
 	)
 	if err != nil {
-		return CreatedUserAPIKey{}, mapSQLiteError(err)
+		return CreatedUserAPIKey{}, s.databaseError("insert replacement API key", mapSQLiteError(err))
 	}
 	if err = tx.Commit(); err != nil {
-		return CreatedUserAPIKey{}, fmt.Errorf("commit reset api key: %w", err)
+		return CreatedUserAPIKey{}, s.databaseError("commit reset API key", err)
 	}
 	return CreatedUserAPIKey{User: user.User, APIKey: key, PlaintextAPIKey: plainKey}, nil
 }
 
 func (s *UserStore) AuthenticateAPIKey(ctx context.Context, key string) (AuthenticatedAPIKey, error) {
+	if err := s.checkReady(); err != nil {
+		return AuthenticatedAPIKey{}, err
+	}
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return AuthenticatedAPIKey{}, ErrInvalidAPIKey
@@ -562,7 +593,7 @@ func (s *UserStore) AuthenticateAPIKey(ctx context.Context, key string) (Authent
 		return AuthenticatedAPIKey{}, ErrInvalidAPIKey
 	}
 	if err != nil {
-		return AuthenticatedAPIKey{}, err
+		return AuthenticatedAPIKey{}, s.databaseError("authenticate API key", err)
 	}
 	if !apiKey.Enabled {
 		return AuthenticatedAPIKey{}, ErrInvalidAPIKey
@@ -573,7 +604,7 @@ func (s *UserStore) AuthenticateAPIKey(ctx context.Context, key string) (Authent
 	now := s.now().UTC()
 	_, err = s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE id = ?`, formatDBTime(now), apiKey.ID)
 	if err != nil {
-		return AuthenticatedAPIKey{}, fmt.Errorf("update api key last used: %w", err)
+		return AuthenticatedAPIKey{}, s.databaseError("update API key last used", err)
 	}
 	apiKey.LastUsedAt = &now
 	return AuthenticatedAPIKey{User: user, APIKey: apiKey}, nil

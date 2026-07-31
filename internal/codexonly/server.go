@@ -86,6 +86,10 @@ type Server struct {
 	httpClient     *http.Client
 	baseURL        *url.URL
 	chatGPTBaseURL *url.URL
+	ctx            context.Context
+	cancel         context.CancelFunc
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 type upstreamRoute struct {
@@ -99,7 +103,10 @@ type proxyAuthorization struct {
 	Credential *AuthenticatedAPIKey
 }
 
-func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
+func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -148,8 +155,10 @@ func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
 		return nil, err
 	}
 	cfg.Database.Path = databasePath
-	userStore, err := OpenUserStore(ctx, cfg.Database.Path)
+	serverCtx, cancel := context.WithCancel(ctx)
+	userStore, err := openUserStore(ctx, cfg.Database.Path, cancel)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	server := &Server{
@@ -159,6 +168,8 @@ func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
 		httpClient:     client,
 		baseURL:        upstream,
 		chatGPTBaseURL: chatGPTUpstream,
+		ctx:            serverCtx,
+		cancel:         cancel,
 	}
 	server.debugf(
 		"debug enabled listen=%s auth_dir=%s database_path=%s codex_base_url=%s chatgpt_base_url=%s",
@@ -171,10 +182,56 @@ func NewHandler(ctx context.Context, cfg *Config) (http.Handler, error) {
 	return server, nil
 }
 
+func (s *Server) FatalErrors() <-chan error {
+	if s == nil || s.users == nil || s.users.failures == nil {
+		return nil
+	}
+	return s.users.failures.channel()
+}
+
+func (s *Server) Shutdown() {
+	if s != nil && s.cancel != nil {
+		s.cancel()
+	}
+}
+
+func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.Shutdown()
+		if s.users != nil {
+			s.closeErr = s.users.Close()
+		}
+	})
+	return s.closeErr
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestCtx, cancel := context.WithCancel(r.Context())
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+	r = r.WithContext(requestCtx)
+	var recorder *debugResponseWriter
 	if s.debugEnabled() {
+		recorder = &debugResponseWriter{ResponseWriter: w}
+		w = recorder
+	}
+	w = newStorageResponseWriter(w, s.users.failures)
+	if s.ctx.Err() != nil {
+		if fatalErr := s.users.failures.current(); fatalErr != nil {
+			writeStoreError(w, fatalErr)
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
+	if recorder != nil {
 		start := time.Now()
-		recorder := &debugResponseWriter{ResponseWriter: w}
 		route, routeOK := s.proxyRoute(r.URL.Path)
 		s.debugf(
 			"request received method=%s path=%s route=%s remote=%s user_agent=%q token_sources=%s",
@@ -194,7 +251,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				time.Since(start).Milliseconds(),
 			)
 		}()
-		s.serveHTTP(recorder, r, route, routeOK)
+		s.serveHTTP(w, r, route, routeOK)
 		return
 	}
 	route, routeOK := s.proxyRoute(r.URL.Path)
@@ -329,6 +386,9 @@ func (s *Server) authenticateUserAPIKeyFromTokens(ctx context.Context, tokens []
 	if s == nil || s.users == nil {
 		return AuthenticatedAPIKey{}, ErrInvalidAPIKey
 	}
+	if err := s.users.checkReady(); err != nil {
+		return AuthenticatedAPIKey{}, err
+	}
 	var disabledErr error
 	for _, token := range tokens {
 		credential, err := s.users.AuthenticateAPIKey(ctx, token)
@@ -337,6 +397,10 @@ func (s *Server) authenticateUserAPIKeyFromTokens(ctx context.Context, tokens []
 		}
 		if errors.Is(err, ErrDisabledCredential) {
 			disabledErr = err
+			continue
+		}
+		if !errors.Is(err, ErrInvalidAPIKey) {
+			return AuthenticatedAPIKey{}, err
 		}
 	}
 	if disabledErr != nil {
@@ -347,7 +411,8 @@ func (s *Server) authenticateUserAPIKeyFromTokens(ctx context.Context, tokens []
 
 func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) (proxyAuthorization, error) {
 	tokens := candidateProxyTokens(r)
-	if credential, err := s.authenticateUserAPIKeyFromTokens(r.Context(), tokens); err == nil {
+	credential, err := s.authenticateUserAPIKeyFromTokens(r.Context(), tokens)
+	if err == nil {
 		s.debugf(
 			"proxy auth ok method=%s path=%s auth=user_api_key user_id=%s api_key_id=%s token_sources=%s",
 			r.Method,
@@ -357,9 +422,19 @@ func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) (proxyA
 			tokenSourceSummary(r),
 		)
 		return proxyAuthorization{Credential: &credential}, nil
-	} else if errors.Is(err, ErrDisabledCredential) {
+	}
+	if errors.Is(err, ErrDisabledCredential) {
 		s.debugf(
 			"proxy auth failed method=%s path=%s reason=disabled_credential token_sources=%s",
+			r.Method,
+			r.URL.Path,
+			tokenSourceSummary(r),
+		)
+		return proxyAuthorization{}, err
+	}
+	if !errors.Is(err, ErrInvalidAPIKey) {
+		s.debugf(
+			"proxy auth failed method=%s path=%s reason=storage_failure token_sources=%s",
 			r.Method,
 			r.URL.Path,
 			tokenSourceSummary(r),
@@ -600,6 +675,10 @@ func decodeJSONRequest(w http.ResponseWriter, r *http.Request, target any) bool 
 }
 
 func writeAuthError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrStorageFailure) {
+		writeStoreError(w, err)
+		return
+	}
 	if errors.Is(err, ErrDisabledCredential) {
 		writeError(w, http.StatusForbidden, "disabled credential")
 		return
@@ -608,6 +687,9 @@ func writeAuthError(w http.ResponseWriter, err error) {
 }
 
 func authFailureReason(err error) string {
+	if errors.Is(err, ErrStorageFailure) {
+		return "storage_failure"
+	}
 	if errors.Is(err, ErrDisabledCredential) {
 		return "disabled_credential"
 	}
@@ -886,6 +968,10 @@ func safeURLString(raw *url.URL) string {
 type debugResponseWriter struct {
 	http.ResponseWriter
 	status int
+}
+
+func (w *debugResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *debugResponseWriter) WriteHeader(status int) {
