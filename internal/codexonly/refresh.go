@@ -216,7 +216,7 @@ func refreshCodexTokenAttempt(ctx context.Context, client *http.Client, tokenURL
 		return oauthRefreshResponse{}, -1, newOAuthRefreshError("response missing access token", resp.StatusCode, "", nil)
 	}
 	const maxExpiresIn = int64((1<<63 - 1) / int64(time.Second))
-	if parsed.ExpiresIn > maxExpiresIn {
+	if parsed.ExpiresIn < 0 || parsed.ExpiresIn > maxExpiresIn {
 		return oauthRefreshResponse{}, -1, newOAuthRefreshError("invalid token expiry", resp.StatusCode, "", nil)
 	}
 	return parsed, -1, nil

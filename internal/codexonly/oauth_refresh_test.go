@@ -256,6 +256,57 @@ func TestRefresherDoesNotRetryTerminalResponses(t *testing.T) {
 	}
 }
 
+func TestRefresherRejectsNegativeExpiryWithoutChangingAuth(t *testing.T) {
+	auth := newRefreshTestAuth(t)
+	before := cloneAuth(auth)
+	beforeFile, err := os.ReadFile(auth.Path)
+	if err != nil {
+		t.Fatalf("read auth before refresh: %v", err)
+	}
+
+	var attempts atomic.Int32
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		_, _ = io.WriteString(w, `{
+			"access_token":"secret-new-access",
+			"refresh_token":"secret-new-refresh",
+			"expires_in":-1
+		}`)
+	}))
+	defer tokenServer.Close()
+
+	err = (&Refresher{Client: tokenServer.Client(), TokenURL: tokenServer.URL}).Refresh(context.Background(), auth)
+	if err == nil {
+		t.Fatal("Refresh returned nil error")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1", got)
+	}
+	if !strings.Contains(err.Error(), "invalid token expiry") {
+		t.Fatalf("Refresh error = %v, want invalid token expiry", err)
+	}
+	for _, secret := range []string{"secret-new-access", "secret-new-refresh"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("Refresh error exposed %q: %v", secret, err)
+		}
+	}
+	if auth.AccessToken != before.AccessToken ||
+		auth.RefreshToken != before.RefreshToken ||
+		auth.IDToken != before.IDToken ||
+		auth.AccountID != before.AccountID ||
+		auth.Email != before.Email ||
+		!auth.ExpiresAt.Equal(before.ExpiresAt) {
+		t.Fatalf("auth changed after rejected expiry: before=%#v after=%#v", before, auth)
+	}
+	afterFile, err := os.ReadFile(auth.Path)
+	if err != nil {
+		t.Fatalf("read auth after refresh: %v", err)
+	}
+	if !bytes.Equal(afterFile, beforeFile) {
+		t.Fatalf("auth file changed after rejected expiry:\nbefore: %s\nafter: %s", beforeFile, afterFile)
+	}
+}
+
 func TestRefresherAppliesOverallDeadlineAndCancellation(t *testing.T) {
 	t.Run("default deadline", func(t *testing.T) {
 		client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
