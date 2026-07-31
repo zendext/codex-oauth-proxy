@@ -29,7 +29,7 @@ codex-oauth-proxy serve --config /etc/codex-oauth-proxy/config.yaml
 | `usage.debug-openai-response` | `false` | 当 `debug` 也启用时，在调试日志中添加安全的上游用量元数据。 |
 | `allow-fast-mode` | `false` | 允许 `service_tier: "fast"` 和 `"priority"`，并在模型响应中公开 Fast 元数据。 |
 | `proxy-url` | 空 | 显式出站代理 URL。使用 `direct` 或 `none` 禁用环境代理发现。 |
-| `request-retry` | `3` | 为支持重试的调用保留的重试次数。当前代理路径没有应用通用请求重试循环。 |
+| `request-retry` | `3` | 为支持重试的调用保留的重试次数。HTTP 代理请求不使用通用重试循环；OAuth 刷新始终使用固定的三次尝试策略。 |
 | `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Codex Responses 兼容路由的上游 Base URL。 |
 | `chatgpt-base-url` | `https://chatgpt.com/backend-api` | 文件、账户和 Hosted MCP 兼容路由的上游 Base URL。 |
 | `codex-user-agent` | 空 | 上游 User-Agent 覆盖值。空值会转发客户端值或使用 Codex CLI 回退值。 |
@@ -105,8 +105,16 @@ database:
 加载器会保留最近一次成功解析的表示五秒。超过宽限期后仍然格式错误的文件会
 由协调结果报告并排除。
 
-凭据在五分钟内过期时会先刷新再使用。更新后的 Token 会写回选中的源文件，并
-从刷新后的 Token 中重新解析账户和邮箱声明。
+凭据在五分钟内过期时会先刷新再使用。刷新会按稳定凭据身份在进程内协调，因此
+并发调用方会复用一次已完成刷新，或复用已经替换其旧 Token 的较新 Token。每次
+刷新共用一个 30 秒 Deadline，最多尝试三次；仅临时网络故障和 HTTP `408`、
+`429`、`500`、`502`、`503`、`504` 可以重试。有效的 `Retry-After` 受该
+Deadline 限制。
+
+更新后的 Token 会先写入同目录 `0600` 临时文件，完成 Sync 后原子重命名覆盖
+选中的源文件。持久化前会从刷新后的 Token 重新解析账户和邮箱声明。HTTP 上游
+返回 `401` 时，可以在客户端响应提交前触发一次同凭据刷新和一次重试；不会触发
+跨凭据 Failover。
 
 ## 托管用户与数据库
 

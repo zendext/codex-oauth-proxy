@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,7 +66,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 	auth, err := s.auths.Select(r.Context())
 	if err != nil {
 		s.debugf("chat completions upstream auth unavailable method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(w, http.StatusServiceUnavailable, "upstream authentication unavailable")
 		return
 	}
 	payload, err := json.Marshal(conversion.Responses)
@@ -73,18 +74,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 		writeError(w, http.StatusBadRequest, "invalid chat completion request")
 		return
 	}
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.codexResponsesURL(), bytes.NewReader(payload))
+	upstreamResp, auth, err := s.doChatCompletionUpstream(r, payload, auth)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	upstreamReq.Header.Set("Accept", "text/event-stream")
-	applyCodexProxyHeaders(upstreamReq, r, auth, s.cfg, false)
-
-	upstreamResp, err := s.httpClient.Do(upstreamReq)
-	if err != nil {
-		s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, http.StatusBadGateway, "")
-		writeError(w, http.StatusBadGateway, err.Error())
+		statusCode := http.StatusBadGateway
+		message := err.Error()
+		var authErr *upstreamAuthRefreshError
+		if errors.As(err, &authErr) {
+			statusCode = http.StatusServiceUnavailable
+			message = "upstream authentication unavailable"
+		}
+		s.debugf("chat completions upstream request failed method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
+		s.recordChatCompletionUsage(r, authorization, auth, conversion.Metadata, UsageCounters{}, false, statusCode, "")
+		writeError(w, statusCode, message)
 		return
 	}
 	defer upstreamResp.Body.Close()
@@ -101,6 +102,52 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	s.aggregateChatCompletion(w, r, upstreamResp, authorization, auth, conversion.Metadata, state, conversion.StopSequences)
+}
+
+func (s *Server) doChatCompletionUpstream(incoming *http.Request, payload []byte, auth *Auth) (*http.Response, *Auth, error) {
+	upstreamReq, err := s.newChatCompletionUpstreamRequest(incoming, payload, auth)
+	if err != nil {
+		return nil, auth, err
+	}
+	upstreamResp, err := s.httpClient.Do(upstreamReq)
+	if err != nil {
+		return nil, auth, err
+	}
+	if upstreamResp.StatusCode != http.StatusUnauthorized {
+		return upstreamResp, auth, nil
+	}
+
+	failedAccessToken := auth.AccessToken
+	discardAndCloseResponse(upstreamResp)
+	s.debugf(
+		"chat completions upstream unauthorized method=%s path=%s auth_id=%s action=refresh",
+		incoming.Method,
+		incoming.URL.Path,
+		auth.ID,
+	)
+	refreshed := cloneAuth(auth)
+	if err = s.auths.RefreshAfterUnauthorized(incoming.Context(), refreshed, failedAccessToken); err != nil {
+		return nil, auth, &upstreamAuthRefreshError{err: err}
+	}
+	upstreamReq, err = s.newChatCompletionUpstreamRequest(incoming, payload, refreshed)
+	if err != nil {
+		return nil, auth, err
+	}
+	upstreamResp, err = s.httpClient.Do(upstreamReq)
+	if err != nil {
+		return nil, refreshed, err
+	}
+	return upstreamResp, refreshed, nil
+}
+
+func (s *Server) newChatCompletionUpstreamRequest(incoming *http.Request, payload []byte, auth *Auth) (*http.Request, error) {
+	upstreamReq, err := http.NewRequestWithContext(incoming.Context(), http.MethodPost, s.codexResponsesURL(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	upstreamReq.Header.Set("Accept", "text/event-stream")
+	applyCodexProxyHeaders(upstreamReq, incoming, auth, s.cfg, false)
+	return upstreamReq, nil
 }
 
 func decodeChatCompletionRequest(r *http.Request) (chatRequestConversion, error) {

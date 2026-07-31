@@ -31,7 +31,7 @@ file.
 | `usage.debug-openai-response` | `false` | Adds safe upstream usage metadata to debug logs when `debug` is also enabled. |
 | `allow-fast-mode` | `false` | Allows `service_tier: "fast"` and `"priority"` and exposes Fast metadata in model responses. |
 | `proxy-url` | empty | Explicit outbound proxy URL. Use `direct` or `none` to disable environment proxy discovery. |
-| `request-retry` | `3` | Reserved retry count for retry-aware calls. The current proxy path does not apply a general request retry loop. |
+| `request-retry` | `3` | Reserved retry count for retry-aware calls. HTTP proxy requests do not use a general retry loop; OAuth refresh always uses its fixed three-attempt policy. |
 | `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Upstream base for Codex Responses-compatible routes. |
 | `chatgpt-base-url` | `https://chatgpt.com/backend-api` | Upstream base for file, account, and hosted MCP compatibility routes. |
 | `codex-user-agent` | empty | Upstream User-Agent override. Empty forwards the client value or uses a Codex CLI fallback. |
@@ -113,9 +113,19 @@ its last successfully parsed representation is retained for five seconds. A
 file that remains malformed after that grace period is reported by
 reconciliation and excluded.
 
-A credential expiring within five minutes is refreshed before use. Updated
-tokens are written back to the selected source file, and account and email
-claims are reparsed from refreshed tokens.
+A credential expiring within five minutes is refreshed before use. Refreshes
+are coordinated in process by stable credential identity, so concurrent callers
+reuse one completed refresh or a newer token that already replaced their old
+token. Each refresh has a 30-second overall deadline and up to three attempts,
+with retries limited to transient network failures and HTTP `408`, `429`,
+`500`, `502`, `503`, and `504`. Valid `Retry-After` values are bounded by that
+deadline.
+
+Updated tokens are written through a same-directory `0600` temporary file,
+synced, and atomically renamed over the selected source file. Account and email
+claims are reparsed before persistence. An HTTP upstream `401` can trigger one
+same-credential refresh and one retry before the client response is committed;
+it does not trigger cross-credential failover.
 
 ## Managed Users and Database
 

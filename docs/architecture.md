@@ -78,9 +78,14 @@ For every upstream request:
 4. Sort selectable logical credentials by stable identity.
 5. Select the next logical credential in round-robin order.
 6. Treat credentials expiring within five minutes as expired.
-7. Refresh an expired credential and reparse account and email claims.
-8. Write refreshed values back to the selected source file.
-9. Forward the request with the selected access token and account ID.
+7. Coordinate refresh in process by stable credential ID so one effective
+   refresh serves concurrent callers for that credential.
+8. Reuse a newer access token when another caller already replaced the token
+   that expired or received `401`.
+9. Refresh an expired credential and reparse account and email claims.
+10. Atomically replace the selected source file after syncing a same-directory
+    `0600` temporary file.
+11. Forward the request with the selected access token and account ID.
 
 Reconciliation reports additions, removals, credential changes, metadata
 changes, eligibility changes, and source-file changes without including token
@@ -90,6 +95,14 @@ removal and a new-identity addition. Disabled logical credentials remain known
 but are excluded from new selection. A five-second parse-error grace retains the
 last good representation during partial editor writes; persistently malformed
 files are then excluded.
+
+Each effective token refresh has one 30-second deadline and at most three total
+attempts. Retries are limited to transient network failures and HTTP `408`,
+`429`, `500`, `502`, `503`, and `504`; a valid `Retry-After` is honored only
+within the refresh deadline. Missing refresh credentials, `invalid_grant`,
+definitive `400`/`401`/`403` responses, malformed responses, and successful
+responses without an access token are terminal. Refresh errors expose only safe
+status and OAuth error-code context, never raw token-endpoint response bodies.
 
 ## Authentication Boundaries
 
@@ -154,13 +167,17 @@ For a whitelisted proxy request:
 4. Rewrite the target URL to the configured Codex or ChatGPT base.
 5. Replace `Authorization` with the selected OAuth access token.
 6. Add the ChatGPT account ID and compatibility headers when available.
-7. Forward HTTP streaming responses or bridge WebSocket frames.
-8. Capture usage metadata for managed user requests.
+7. Make HTTP request bodies replayable before forwarding.
+8. If an HTTP upstream returns `401` before the client response is committed,
+   refresh the same credential and retry it once.
+9. Forward HTTP streaming responses or bridge WebSocket frames.
+10. Capture usage metadata for managed user requests.
 
 The proxy preserves established HTTP streams during normal operation. WebSocket
 forwarding uses Gorilla WebSocket and forces HTTP/1.1 ALPN for the upstream
 upgrade path. Server shutdown or a fatal storage failure cancels established
-streams and closes both WebSocket peers.
+streams and closes both WebSocket peers. Reactive OAuth recovery does not switch
+to another credential and does not retry after response commitment.
 
 ## Chat Completions Conversion
 
@@ -170,10 +187,12 @@ streams and closes both WebSocket peers.
 2. Convert messages, tools, response format, reasoning, and service tier to a
    Responses request.
 3. Force `stream: true` and `store: false` upstream.
-4. Read Responses SSE events.
-5. Aggregate them into a normal Chat Completions response or translate them into
+4. If the upstream returns `401`, refresh the same credential and retry once
+   before committing the client response.
+5. Read Responses SSE events.
+6. Aggregate them into a normal Chat Completions response or translate them into
    Chat Completions SSE chunks.
-6. Apply local stop-sequence filtering and record usage.
+7. Apply local stop-sequence filtering and record usage.
 
 This is a focused compatibility layer, not a generic schema-preserving
 translation engine.
