@@ -60,9 +60,10 @@ restarts. Managed bindings are isolated by user. Compatibility-token bindings
 are isolated by the matched stable OAuth identity.
 
 Values over 512 bytes, empty values, invalid UTF-8, and values containing
-control characters are ignored for affinity. JSON inspection is limited to
-64 KiB. Ignored or missing signals do not fail the request; selection falls back
-to normal round-robin behavior.
+control characters are ignored for affinity. JSON bodies are inspected as a
+token stream without an affinity-specific body-size cutoff, and the exact body
+is restored before forwarding. Ignored or missing signals do not fail the
+request; selection falls back to normal round-robin behavior.
 
 ## Error Format
 
@@ -295,20 +296,6 @@ Response:
 ```
 
 Invalid window, step, grouping, fill, or filter combinations return `400`.
-
-### `DELETE /v0/management/session-affinity`
-
-Deletes all persisted session affinity bindings without returning digests or
-raw session identifiers.
-
-Response:
-
-```json
-{"cleared":12}
-```
-
-The loopback-only equivalent is
-`DELETE /v0/local-admin/session-affinity`.
 
 ## User API
 

@@ -9,20 +9,22 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
 )
 
 const (
-	maxSessionAffinitySignalBytes   = 512
-	maxSessionAffinityBodyBytes     = 64 << 10
-	sessionAffinityExpiry           = time.Hour
-	sessionAffinityRenewalThreshold = 30 * time.Minute
-	sessionAffinityCleanupInterval  = 5 * time.Minute
-	sessionAffinityCleanupBatchSize = 100
+	maxSessionAffinitySignalBytes    = 512
+	sessionAffinityReplayMemoryBytes = 64 << 10
+	sessionAffinityExpiry            = time.Hour
+	sessionAffinityRenewalThreshold  = 30 * time.Minute
+	sessionAffinityCleanupInterval   = 5 * time.Minute
+	sessionAffinityCleanupBatchSize  = 100
 )
 
 const (
@@ -55,11 +57,31 @@ type sessionAffinityRow struct {
 
 type replayReadCloser struct {
 	io.Reader
-	closer io.Closer
+	closers []io.Closer
+	once    sync.Once
 }
 
 type replayErrorReader struct {
 	err error
+}
+
+type sessionAffinitySignalAccumulator struct {
+	candidates map[string]string
+	conflicts  map[string]bool
+}
+
+type sessionAffinityReplayStore struct {
+	memory        bytes.Buffer
+	file          *os.File
+	path          string
+	spillDisabled bool
+}
+
+type sessionAffinitySourceReader struct {
+	reader      io.Reader
+	err         error
+	bytesRead   int64
+	errorOffset int64
 }
 
 func (r *replayErrorReader) Read([]byte) (int, error) {
@@ -72,59 +94,63 @@ func (r *replayErrorReader) Read([]byte) (int, error) {
 }
 
 func (r *replayReadCloser) Close() error {
-	if r == nil || r.closer == nil {
-		return nil
-	}
-	return r.closer.Close()
-}
-
-func extractSessionAffinitySignals(r *http.Request) []sessionAffinitySignal {
 	if r == nil {
 		return nil
 	}
-	candidates := make(map[string]string)
-	conflicts := make(map[string]bool)
-	add := func(kind string, raw string) {
-		value, ok := normalizeSessionAffinitySignal(raw)
-		if !ok || conflicts[kind] {
-			return
-		}
-		if current, exists := candidates[kind]; exists && current != value {
-			delete(candidates, kind)
-			conflicts[kind] = true
-			return
-		}
-		candidates[kind] = value
-	}
-
-	for _, name := range []string{"Session-Id", "Session_id"} {
-		values := r.Header.Values(name)
-		if len(values) > 4 {
-			values = values[:4]
-		}
-		for _, value := range values {
-			add(sessionAffinitySignalSessionID, value)
-		}
-	}
-
-	if requestMayContainSessionAffinityJSON(r) {
-		body := readBoundedSessionAffinityBody(r)
-		if len(body) > 0 {
-			var payload map[string]any
-			decoder := json.NewDecoder(bytes.NewReader(body))
-			decoder.UseNumber()
-			if err := decoder.Decode(&payload); err == nil {
-				addStringSessionAffinitySignal(payload, "session_id", sessionAffinitySignalSessionID, add)
-				addStringSessionAffinitySignal(payload, "sessionId", sessionAffinitySignalSessionID, add)
-				addStringSessionAffinitySignal(payload, "prompt_cache_key", sessionAffinitySignalPromptCacheKey, add)
-				addStringSessionAffinitySignal(payload, "conversation_id", sessionAffinitySignalConversationID, add)
-				if conversation, ok := payload["conversation"].(map[string]any); ok {
-					addStringSessionAffinitySignal(conversation, "id", sessionAffinitySignalConversationID, add)
-				}
+	var closeErr error
+	r.once.Do(func() {
+		for _, closer := range r.closers {
+			if closer == nil {
+				continue
+			}
+			if err := closer.Close(); err != nil && closeErr == nil {
+				closeErr = err
 			}
 		}
-	}
+	})
+	return closeErr
+}
 
+func newSessionAffinitySignalAccumulator() *sessionAffinitySignalAccumulator {
+	return &sessionAffinitySignalAccumulator{
+		candidates: make(map[string]string),
+		conflicts:  make(map[string]bool),
+	}
+}
+
+func (a *sessionAffinitySignalAccumulator) add(kind string, raw string) {
+	if a == nil {
+		return
+	}
+	value, ok := normalizeSessionAffinitySignal(raw)
+	if !ok || a.conflicts[kind] {
+		return
+	}
+	if current, exists := a.candidates[kind]; exists && current != value {
+		delete(a.candidates, kind)
+		a.conflicts[kind] = true
+		return
+	}
+	a.candidates[kind] = value
+}
+
+func (a *sessionAffinitySignalAccumulator) merge(other *sessionAffinitySignalAccumulator) {
+	if a == nil || other == nil {
+		return
+	}
+	for kind := range other.conflicts {
+		delete(a.candidates, kind)
+		a.conflicts[kind] = true
+	}
+	for kind, value := range other.candidates {
+		a.add(kind, value)
+	}
+}
+
+func (a *sessionAffinitySignalAccumulator) signals() []sessionAffinitySignal {
+	if a == nil {
+		return nil
+	}
 	kinds := []string{
 		sessionAffinitySignalSessionID,
 		sessionAffinitySignalPromptCacheKey,
@@ -132,11 +158,35 @@ func extractSessionAffinitySignals(r *http.Request) []sessionAffinitySignal {
 	}
 	signals := make([]sessionAffinitySignal, 0, len(kinds))
 	for _, kind := range kinds {
-		if value := candidates[kind]; value != "" && !conflicts[kind] {
+		if value := a.candidates[kind]; value != "" && !a.conflicts[kind] {
 			signals = append(signals, sessionAffinitySignal{Kind: kind, Value: value})
 		}
 	}
 	return signals
+}
+
+func extractSessionAffinitySignals(r *http.Request) []sessionAffinitySignal {
+	if r == nil {
+		return nil
+	}
+	signals := newSessionAffinitySignalAccumulator()
+	for _, name := range []string{"Session-Id", "Session_id"} {
+		values := r.Header.Values(name)
+		if len(values) > 4 {
+			values = values[:4]
+		}
+		for _, value := range values {
+			signals.add(sessionAffinitySignalSessionID, value)
+		}
+	}
+
+	if requestMayContainSessionAffinityJSON(r) {
+		bodySignals, valid := extractSessionAffinityJSONSignals(r)
+		if valid {
+			signals.merge(bodySignals)
+		}
+	}
+	return signals.signals()
 }
 
 func requestMayContainSessionAffinityJSON(r *http.Request) bool {
@@ -150,33 +200,298 @@ func requestMayContainSessionAffinityJSON(r *http.Request) bool {
 	return contentType == "" && r.Method != http.MethodGet && r.Method != http.MethodHead
 }
 
-func readBoundedSessionAffinityBody(r *http.Request) []byte {
+func extractSessionAffinityJSONSignals(r *http.Request) (*sessionAffinitySignalAccumulator, bool) {
 	if r == nil || r.Body == nil || r.Body == http.NoBody {
-		return nil
+		return nil, false
 	}
 	original := r.Body
-	prefix, err := io.ReadAll(io.LimitReader(original, maxSessionAffinityBodyBytes+1))
-	readers := []io.Reader{bytes.NewReader(prefix)}
+	replay := &sessionAffinityReplayStore{}
+	source := &sessionAffinitySourceReader{reader: original}
+	decoder := json.NewDecoder(io.TeeReader(source, replay))
+	decoder.UseNumber()
+	signals, valid := parseSessionAffinityJSONObject(decoder)
+	if source.err == nil {
+		_, _ = io.Copy(replay, source)
+	}
+	replayedBody, err := replay.body(original, source.err, source.errorOffset)
 	if err != nil {
-		readers = append(readers, &replayErrorReader{err: err})
+		replayedBody = &replayReadCloser{
+			Reader:  bytes.NewReader(replay.memory.Bytes()),
+			closers: []io.Closer{original, replay},
+		}
 	}
-	readers = append(readers, original)
-	r.Body = &replayReadCloser{
-		Reader: io.MultiReader(readers...),
-		closer: original,
-	}
-	if err != nil || len(prefix) > maxSessionAffinityBodyBytes {
-		return nil
-	}
-	return prefix
+	r.Body = replayedBody
+	return signals, valid && source.err == nil
 }
 
-func addStringSessionAffinitySignal(payload map[string]any, key string, kind string, add func(string, string)) {
-	value, ok := payload[key].(string)
-	if !ok {
-		return
+func parseSessionAffinityJSONObject(decoder *json.Decoder) (*sessionAffinitySignalAccumulator, bool) {
+	signals := newSessionAffinitySignalAccumulator()
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, false
 	}
-	add(kind, value)
+	for decoder.More() {
+		keyToken, errKey := decoder.Token()
+		if errKey != nil {
+			return nil, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false
+		}
+		switch key {
+		case "session_id", "sessionId":
+			if !readSessionAffinityString(decoder, sessionAffinitySignalSessionID, signals) {
+				return nil, false
+			}
+		case "prompt_cache_key":
+			if !readSessionAffinityString(decoder, sessionAffinitySignalPromptCacheKey, signals) {
+				return nil, false
+			}
+		case "conversation_id":
+			if !readSessionAffinityString(decoder, sessionAffinitySignalConversationID, signals) {
+				return nil, false
+			}
+		case "conversation":
+			if !readSessionAffinityConversation(decoder, signals) {
+				return nil, false
+			}
+		default:
+			if err = skipSessionAffinityJSONValue(decoder); err != nil {
+				return nil, false
+			}
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, false
+	}
+	if _, err = decoder.Token(); err != io.EOF {
+		return nil, false
+	}
+	return signals, true
+}
+
+func readSessionAffinityString(
+	decoder *json.Decoder,
+	kind string,
+	signals *sessionAffinitySignalAccumulator,
+) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	if value, ok := token.(string); ok {
+		signals.add(kind, value)
+		return true
+	}
+	if delimiter, ok := token.(json.Delim); ok {
+		return skipOpenedSessionAffinityJSONValue(decoder, delimiter) == nil
+	}
+	return true
+}
+
+func readSessionAffinityConversation(
+	decoder *json.Decoder,
+	signals *sessionAffinitySignalAccumulator,
+) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return true
+	}
+	if delimiter != json.Delim('{') {
+		return skipOpenedSessionAffinityJSONValue(decoder, delimiter) == nil
+	}
+	for decoder.More() {
+		keyToken, errKey := decoder.Token()
+		if errKey != nil {
+			return false
+		}
+		key, okKey := keyToken.(string)
+		if !okKey {
+			return false
+		}
+		if key == "id" {
+			if !readSessionAffinityString(decoder, sessionAffinitySignalConversationID, signals) {
+				return false
+			}
+			continue
+		}
+		if err = skipSessionAffinityJSONValue(decoder); err != nil {
+			return false
+		}
+	}
+	token, err = decoder.Token()
+	return err == nil && token == json.Delim('}')
+}
+
+func skipSessionAffinityJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	return skipOpenedSessionAffinityJSONValue(decoder, delimiter)
+}
+
+func skipOpenedSessionAffinityJSONValue(decoder *json.Decoder, delimiter json.Delim) error {
+	if delimiter != json.Delim('{') && delimiter != json.Delim('[') {
+		return nil
+	}
+	depth := 1
+	for depth > 0 {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		nested, ok := token.(json.Delim)
+		if !ok {
+			continue
+		}
+		switch nested {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+	}
+	return nil
+}
+
+func (r *sessionAffinitySourceReader) Read(p []byte) (int, error) {
+	if r == nil || r.reader == nil {
+		return 0, io.EOF
+	}
+	n, err := r.reader.Read(p)
+	r.bytesRead += int64(n)
+	if err != nil && err != io.EOF && r.err == nil {
+		r.err = err
+		r.errorOffset = r.bytesRead
+	}
+	return n, err
+}
+
+func (s *sessionAffinityReplayStore) Write(p []byte) (int, error) {
+	if s == nil {
+		return len(p), nil
+	}
+	if s.file == nil && (s.spillDisabled || s.memory.Len()+len(p) <= sessionAffinityReplayMemoryBytes) {
+		return s.memory.Write(p)
+	}
+	if s.file == nil {
+		if err := s.spillToFile(); err != nil {
+			s.spillDisabled = true
+			return s.memory.Write(p)
+		}
+	}
+	n, err := s.file.Write(p)
+	if err == nil {
+		return n, nil
+	}
+	if errFallback := s.fallbackToMemory(p[n:]); errFallback != nil {
+		return n, err
+	}
+	return len(p), nil
+}
+
+func (s *sessionAffinityReplayStore) spillToFile() error {
+	file, err := os.CreateTemp("", "codex-oauth-proxy-session-affinity-*")
+	if err != nil {
+		return err
+	}
+	if err = file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return err
+	}
+	if _, err = file.Write(s.memory.Bytes()); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return err
+	}
+	s.memory.Reset()
+	s.file = file
+	s.path = file.Name()
+	if err = os.Remove(s.path); err == nil {
+		s.path = ""
+	}
+	return nil
+}
+
+func (s *sessionAffinityReplayStore) fallbackToMemory(remaining []byte) error {
+	if s == nil || s.file == nil {
+		return nil
+	}
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.Copy(&s.memory, s.file); err != nil {
+		return err
+	}
+	if _, err := s.memory.Write(remaining); err != nil {
+		return err
+	}
+	if err := s.closeFile(); err != nil {
+		return err
+	}
+	s.spillDisabled = true
+	return nil
+}
+
+func (s *sessionAffinityReplayStore) body(
+	original io.Closer,
+	sourceErr error,
+	errorOffset int64,
+) (io.ReadCloser, error) {
+	var reader io.Reader
+	if s.file != nil {
+		if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		reader = s.file
+	} else {
+		reader = bytes.NewReader(s.memory.Bytes())
+	}
+	if sourceErr != nil {
+		reader = io.LimitReader(reader, errorOffset)
+	}
+	readers := []io.Reader{reader}
+	if sourceErr != nil {
+		readers = append(readers, &replayErrorReader{err: sourceErr})
+	}
+	return &replayReadCloser{
+		Reader:  io.MultiReader(readers...),
+		closers: []io.Closer{original, s},
+	}, nil
+}
+
+func (s *sessionAffinityReplayStore) Close() error {
+	if s == nil {
+		return nil
+	}
+	return s.closeFile()
+}
+
+func (s *sessionAffinityReplayStore) closeFile() error {
+	if s == nil || s.file == nil {
+		return nil
+	}
+	errClose := s.file.Close()
+	s.file = nil
+	if s.path != "" {
+		errRemove := os.Remove(s.path)
+		s.path = ""
+		if errClose == nil {
+			errClose = errRemove
+		}
+	}
+	return errClose
 }
 
 func normalizeSessionAffinitySignal(raw string) (string, bool) {
@@ -343,21 +658,6 @@ func (s *UserStore) RebindSessionAffinity(ctx context.Context, binding SessionAf
 		BindingDigest: winner.BindingDigest,
 		AuthID:        winner.AuthID,
 	}, nil
-}
-
-func (s *UserStore) ClearSessionAffinity(ctx context.Context) (int64, error) {
-	if err := s.checkReady(); err != nil {
-		return 0, err
-	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM session_affinity_bindings`)
-	if err != nil {
-		return 0, s.databaseError("clear session affinity", err)
-	}
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		return 0, s.databaseError("read cleared session affinity count", err)
-	}
-	return deleted, nil
 }
 
 func (s *UserStore) DeleteSessionAffinityByAuthIDs(ctx context.Context, authIDs []string) (int64, error) {

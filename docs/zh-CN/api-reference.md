@@ -57,7 +57,8 @@ X-API-Key: <token>
 到的稳定 OAuth 身份隔离。
 
 超过 512 字节的值、空值、无效 UTF-8 和包含控制字符的值不会用于亲和性。JSON
-检查限制为 64 KiB。被忽略或缺失的信号不会导致请求失败；选择会回退到正常
+Body 以 Token Stream 方式检查，不设置亲和性专用的 Body 大小上限，并会在转发
+前原样恢复完整 Body。被忽略或缺失的信号不会导致请求失败；选择会回退到正常
 轮询行为。
 
 ## 错误格式
@@ -287,19 +288,6 @@ Query 参数：
 ```
 
 窗口、Step、分组、Fill 或过滤条件无效时返回 `400`。
-
-### `DELETE /v0/management/session-affinity`
-
-删除所有持久化会话亲和性绑定，不返回 Digest 或原始会话标识符。
-
-响应：
-
-```json
-{"cleared":12}
-```
-
-仅允许回环地址访问的等价端点为
-`DELETE /v0/local-admin/session-affinity`。
 
 ## 用户 API
 

@@ -71,21 +71,39 @@ func TestExtractSessionAffinitySignalsRejectsInvalidValuesWithoutChangingRequest
 	}
 }
 
-func TestExtractSessionAffinitySignalsRestoresOversizedJSONBody(t *testing.T) {
-	body := `{"session_id":"ignored-because-body-is-oversized","input":"` +
-		strings.Repeat("x", maxSessionAffinityBodyBytes) + `"}`
+func TestExtractSessionAffinitySignalsFromLargeJSONBodyAndRestoresIt(t *testing.T) {
+	body := largeSessionAffinityJSON("large-session")
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	if signals := extractSessionAffinitySignals(req); len(signals) != 0 {
-		t.Fatalf("signals = %#v, want none for oversized JSON body", signals)
+	if signals := extractSessionAffinitySignals(req); !slices.Equal(signals, []sessionAffinitySignal{
+		{Kind: sessionAffinitySignalSessionID, Value: "large-session"},
+	}) {
+		t.Fatalf("signals = %#v, want large-session", signals)
+	}
+	replayed, ok := req.Body.(*replayReadCloser)
+	if !ok {
+		t.Fatalf("replayed body type = %T, want *replayReadCloser", req.Body)
+	}
+	replayStore, ok := replayed.closers[1].(*sessionAffinityReplayStore)
+	if !ok || replayStore.file == nil {
+		t.Fatalf("large body replay store = %#v, want temporary-file spill", replayStore)
+	}
+	if replayStore.memory.Len() > sessionAffinityReplayMemoryBytes {
+		t.Fatalf("replay memory = %d, want at most %d", replayStore.memory.Len(), sessionAffinityReplayMemoryBytes)
 	}
 	restored, err := io.ReadAll(req.Body)
 	if err != nil {
-		t.Fatalf("read restored oversized body: %v", err)
+		t.Fatalf("read restored large body: %v", err)
 	}
 	if string(restored) != body {
-		t.Fatalf("restored oversized body length = %d, want %d", len(restored), len(body))
+		t.Fatalf("restored large body length = %d, want %d", len(restored), len(body))
+	}
+	if err = req.Body.Close(); err != nil {
+		t.Fatalf("close restored large body: %v", err)
+	}
+	if replayStore.file != nil || replayStore.path != "" {
+		t.Fatalf("replay store remained open after close: file=%v path=%q", replayStore.file, replayStore.path)
 	}
 }
 
@@ -467,6 +485,21 @@ func readSessionAffinityTimes(t *testing.T, store *UserStore, digest SessionAffi
 
 func quotedJSON(value string) string {
 	return `"` + value + `"`
+}
+
+func largeSessionAffinityJSON(sessionID string) string {
+	var body strings.Builder
+	body.WriteString(`{"input":[`)
+	for i := 0; i < 4096; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`{"type":"input_text","text":"padding"}`)
+	}
+	body.WriteString(`],"session_id":`)
+	body.WriteString(quotedJSON(sessionID))
+	body.WriteByte('}')
+	return body.String()
 }
 
 type singleErrorReadCloser struct {

@@ -827,13 +827,6 @@ func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleManagementPath(w http.ResponseWriter, r *http.Request, path string) {
 	switch {
-	case path == "/session-affinity" && r.Method == http.MethodDelete:
-		cleared, err := s.users.ClearSessionAffinity(r.Context())
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"cleared": cleared})
 	case path == "/usage/timeseries" && r.Method == http.MethodGet:
 		timeseries, err := s.users.GetUsageTimeseries(r.Context(), usageTimeseriesParamsFromRequest(r), s.cfg.Usage)
 		if err != nil {
@@ -1075,6 +1068,7 @@ func requestHasFastServiceTier(r *http.Request) bool {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		_ = r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(nil))
 		return false
 	}
@@ -1105,6 +1099,9 @@ func payloadHasFastServiceTier(payload []byte) bool {
 }
 
 func resetRequestBody(r *http.Request, body []byte) {
+	if r.Body != nil {
+		_ = r.Body.Close()
+	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	r.GetBody = func() (io.ReadCloser, error) {

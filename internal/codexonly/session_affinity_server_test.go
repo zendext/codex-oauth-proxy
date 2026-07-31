@@ -209,7 +209,51 @@ func TestServerConcurrentFirstSessionRequestsUseDatabaseWinner(t *testing.T) {
 	}
 }
 
-func TestServerSessionAffinityDisableReenableRemovalAndClear(t *testing.T) {
+func TestServerSessionAffinityUsesSignalFromLargeJSONBody(t *testing.T) {
+	authDir := t.TempDir()
+	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
+	writeSessionAffinityAuth(t, authDir, "b.json", "acct_b", "access-b", false)
+
+	var mu sync.Mutex
+	var authorizations []string
+	var bodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	server := newSessionAffinityServer(t, authDir, filepath.Join(t.TempDir(), "users.db"), upstream.URL)
+	defer server.Close()
+	user := createManagedUser(t, server, "admin-key", "Alice")
+	body := largeSessionAffinityJSON("large-sticky-session")
+	if len(body) <= sessionAffinityReplayMemoryBytes {
+		t.Fatalf("large body length = %d, want more than %d", len(body), sessionAffinityReplayMemoryBytes)
+	}
+
+	sendResponseRequest(t, server, user.PlaintextAPIKey, "", body)
+	sendResponseRequest(t, server, user.PlaintextAPIKey, "", body)
+
+	mu.Lock()
+	gotAuths := slices.Clone(authorizations)
+	gotBodies := slices.Clone(bodies)
+	mu.Unlock()
+	if len(gotAuths) != 2 || gotAuths[0] != gotAuths[1] {
+		t.Fatalf("large-body authorizations = %v, want one sticky auth", gotAuths)
+	}
+	for i, gotBody := range gotBodies {
+		if gotBody != body {
+			t.Fatalf("upstream body #%d length = %d, want exact %d-byte body", i+1, len(gotBody), len(body))
+		}
+	}
+}
+
+func TestServerSessionAffinityDisableReenableAndRemoval(t *testing.T) {
 	authDir := t.TempDir()
 	writeSessionAffinityAuth(t, authDir, "a.json", "acct_a", "access-a", false)
 	writeSessionAffinityAuth(t, authDir, "b.json", "acct_b", "access-b", false)
@@ -253,18 +297,6 @@ func TestServerSessionAffinityDisableReenableRemovalAndClear(t *testing.T) {
 	}
 	if removedRows != 0 {
 		t.Fatalf("removed auth binding rows = %d, want 0", removedRows)
-	}
-
-	clearResp := doJSONRequest(t, server, http.MethodDelete, "/v0/management/session-affinity", "", "admin-key")
-	if clearResp.Code != http.StatusOK {
-		t.Fatalf("clear status = %d, want 200, body: %s", clearResp.Code, clearResp.Body.String())
-	}
-	var cleared struct {
-		Cleared int64 `json:"cleared"`
-	}
-	decodeResponse(t, clearResp, &cleared)
-	if cleared.Cleared == 0 {
-		t.Fatal("clear response deleted 0 bindings, want at least 1")
 	}
 
 	mu.Lock()
@@ -572,17 +604,6 @@ func sendResponseRequest(t *testing.T, server *Server, apiKey string, sessionID 
 	server.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("response request status = %d, want 200, body: %s", resp.Code, resp.Body.String())
-	}
-}
-
-func TestSessionAffinityManagementClearDoesNotExposeDigests(t *testing.T) {
-	handler := newUserManagementTestHandler(t, &Config{AdminAPIKey: "admin-key"})
-	resp := doJSONRequest(t, handler, http.MethodDelete, "/v0/management/session-affinity", "", "admin-key")
-	if resp.Code != http.StatusOK {
-		t.Fatalf("clear status = %d, want 200, body: %s", resp.Code, resp.Body.String())
-	}
-	if strings.Contains(resp.Body.String(), "digest") || strings.Contains(resp.Body.String(), "session") {
-		t.Fatalf("clear response exposed affinity identifiers: %s", resp.Body.String())
 	}
 }
 

@@ -287,6 +287,7 @@ func captureProxyRequestUsageMetadata(r *http.Request) proxyRequestUsageMetadata
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		_ = r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(nil))
 		return metadata
 	}
