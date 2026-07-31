@@ -136,11 +136,16 @@ The SQLite database stores:
 
 - Users.
 - Generated and rotated user API keys.
+- Tenant-scoped session affinity digests and stable OAuth auth targets.
 - Ten-minute usage buckets.
 
 Generated API keys are stored as SHA-256 hashes. API responses expose key
 metadata and a masked value; plaintext is returned only by user creation and key
 reset operations.
+
+Session affinity has no configuration flag. It is enabled by default and stores
+only SHA-256 digests, stable auth IDs, and timestamps. Raw session identifiers
+are not persisted.
 
 If `database.path` is relative, it is resolved relative to the server process
 working directory. `~` and `~/...` are expanded.

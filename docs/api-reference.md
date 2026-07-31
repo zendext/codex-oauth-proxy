@@ -48,6 +48,26 @@ When both are present, either matching credential can authenticate the request.
 Disabled users receive `403`. Missing, unknown, or rotated managed keys receive
 `401`.
 
+## Session Affinity
+
+For proxied requests, the server accepts `Session-Id` or `Session_id` headers
+and the JSON fields `session_id`, `sessionId`, `prompt_cache_key`,
+`conversation_id`, and `conversation.id`.
+
+Valid signals keep one logical session on the same available OAuth credential
+across model changes, API-key rotation, concurrent first requests, and process
+restarts. Managed bindings are isolated by user. Compatibility-token bindings
+are isolated by the matched stable OAuth identity.
+
+Values over 512 bytes, empty values, invalid UTF-8, unpaired UTF-16 surrogate
+escapes, and values containing control characters are ignored for affinity.
+JSON bodies are inspected as a token stream without an affinity-specific
+body-size cutoff, and the exact body is restored before forwarding. If temporary
+replay storage cannot be created or written, body inspection stops, body-derived
+signals are ignored, and the stored prefix plus untouched request stream are
+forwarded unchanged. Ignored or missing signals do not fail the request;
+selection falls back to normal round-robin behavior.
+
 ## Error Format
 
 Project-owned handlers return:

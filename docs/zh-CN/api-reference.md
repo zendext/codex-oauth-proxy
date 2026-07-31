@@ -46,6 +46,23 @@ X-API-Key: <token>
 
 禁用用户会收到 `403`。缺失、未知或已经轮换的托管 Key 会收到 `401`。
 
+## 会话亲和性
+
+对于代理请求，服务器接受 `Session-Id` 或 `Session_id` Header，以及 JSON 字段
+`session_id`、`sessionId`、`prompt_cache_key`、`conversation_id` 和
+`conversation.id`。
+
+有效信号会让同一个逻辑会话在模型变化、API Key 轮换、并发首次请求和进程重启
+后继续使用同一个可用 OAuth 凭据。托管绑定按用户隔离；兼容 Token 绑定按匹配
+到的稳定 OAuth 身份隔离。
+
+超过 512 字节的值、空值、无效 UTF-8、未配对的 UTF-16 Surrogate Escape 和包含
+控制字符的值不会用于亲和性。JSON Body 以 Token Stream 方式检查，不设置亲和性
+专用的 Body 大小上限，并会在转发前原样恢复完整 Body。如果临时 Replay 存储
+无法创建或写入，Body 检查会停止，Body 派生信号会被忽略，并原样转发已保存的
+前缀与未读取的请求流。被忽略或缺失的信号不会导致请求失败；选择会回退到正常
+轮询行为。
+
 ## 错误格式
 
 项目自有 Handler 返回：

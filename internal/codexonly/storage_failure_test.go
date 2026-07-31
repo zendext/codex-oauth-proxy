@@ -239,6 +239,36 @@ func TestRuntimeSQLiteWriteFailureSignalsFatal(t *testing.T) {
 	assertFatalStorageError(t, server.FatalErrors())
 }
 
+func TestRuntimeSessionAffinitySQLiteFailuresSignalFatal(t *testing.T) {
+	t.Run("read", func(t *testing.T) {
+		server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
+		digests := digestSessionAffinitySignals("user:usr_1", []sessionAffinitySignal{
+			{Kind: sessionAffinitySignalSessionID, Value: "session-1"},
+		})
+		if err := server.users.db.Close(); err != nil {
+			t.Fatalf("close SQLite database: %v", err)
+		}
+		if _, _, err := server.users.LookupSessionAffinity(context.Background(), digests); !errors.Is(err, ErrStorageFailure) {
+			t.Fatalf("LookupSessionAffinity error = %v, want ErrStorageFailure", err)
+		}
+		assertFatalStorageError(t, server.FatalErrors())
+	})
+
+	t.Run("write", func(t *testing.T) {
+		server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
+		digests := digestSessionAffinitySignals("user:usr_1", []sessionAffinitySignal{
+			{Kind: sessionAffinitySignalSessionID, Value: "session-1"},
+		})
+		if err := server.users.db.Close(); err != nil {
+			t.Fatalf("close SQLite database: %v", err)
+		}
+		if _, err := server.users.BindSessionAffinity(context.Background(), digests, "account:acct_a"); !errors.Is(err, ErrStorageFailure) {
+			t.Fatalf("BindSessionAffinity error = %v, want ErrStorageFailure", err)
+		}
+		assertFatalStorageError(t, server.FatalErrors())
+	})
+}
+
 func TestExpectedStoreErrorsDoNotSignalFatal(t *testing.T) {
 	server := newStorageFailureTestServer(t, "http://127.0.0.1:1/backend-api/codex", "http://127.0.0.1:1/backend-api")
 	store := server.users

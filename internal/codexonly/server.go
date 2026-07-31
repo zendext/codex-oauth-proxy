@@ -67,8 +67,28 @@ func (m *AuthManager) Select(ctx context.Context) (*Auth, error) {
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("no active codex auth files found")
 	}
+	auth, err := m.nextAuth(auths)
+	if err != nil {
+		return nil, err
+	}
+	return m.prepareAuth(ctx, auth)
+}
+
+func (m *AuthManager) nextAuth(auths []*Auth) (*Auth, error) {
+	if m == nil {
+		return nil, fmt.Errorf("auth manager is not configured")
+	}
+	if len(auths) == 0 {
+		return nil, fmt.Errorf("no active codex auth files found")
+	}
 	idx := int(m.next.Add(1)-1) % len(auths)
-	auth := auths[idx]
+	return auths[idx], nil
+}
+
+func (m *AuthManager) prepareAuth(ctx context.Context, auth *Auth) (*Auth, error) {
+	if m == nil || auth == nil {
+		return nil, fmt.Errorf("codex auth is not configured")
+	}
 	now := time.Now
 	if m.Now != nil {
 		now = m.Now
@@ -77,7 +97,7 @@ func (m *AuthManager) Select(ctx context.Context) (*Auth, error) {
 		if m.Refresher == nil {
 			return nil, fmt.Errorf("codex auth %s is expired and refresher is not configured", auth.ID)
 		}
-		if err = m.refresh(ctx, auth, auth.AccessToken, false); err != nil {
+		if err := m.refresh(ctx, auth, auth.AccessToken, false); err != nil {
 			return nil, err
 		}
 	}
@@ -181,16 +201,17 @@ func matchingAuth(auths []*Auth, target *Auth) *Auth {
 }
 
 type Server struct {
-	cfg            *Config
-	auths          *AuthManager
-	users          *UserStore
-	httpClient     *http.Client
-	baseURL        *url.URL
-	chatGPTBaseURL *url.URL
-	ctx            context.Context
-	cancel         context.CancelFunc
-	closeOnce      sync.Once
-	closeErr       error
+	cfg                        *Config
+	auths                      *AuthManager
+	users                      *UserStore
+	httpClient                 *http.Client
+	baseURL                    *url.URL
+	chatGPTBaseURL             *url.URL
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	sessionAffinityReplayStore func() *sessionAffinityReplayStore
+	closeOnce                  sync.Once
+	closeErr                   error
 }
 
 type upstreamRoute struct {
@@ -201,7 +222,13 @@ type upstreamRoute struct {
 }
 
 type proxyAuthorization struct {
-	Credential *AuthenticatedAPIKey
+	Credential          *AuthenticatedAPIKey
+	CompatibilityAuthID string
+}
+
+type AuthSelection struct {
+	Auth    *Auth
+	Binding SessionAffinityBinding
 }
 
 type upstreamAuthRefreshError struct {
@@ -266,7 +293,8 @@ func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
 		Store:     NewFileAuthStore(cfg.AuthDir),
 		Refresher: refresher,
 	}
-	if _, err = manager.Store.Load(ctx); err != nil {
+	initialAuths, err := manager.Store.Reconcile(ctx)
+	if err != nil {
 		return nil, err
 	}
 	databasePath, err := ResolveDatabasePath(cfg.Database.Path, cfg.AuthDir)
@@ -278,6 +306,11 @@ func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
 	userStore, err := openUserStore(ctx, cfg.Database.Path, cancel)
 	if err != nil {
 		cancel()
+		return nil, err
+	}
+	if _, err = userStore.DeleteSessionAffinityExceptAuthIDs(ctx, stableAuthIDs(initialAuths.Auths)); err != nil {
+		cancel()
+		_ = userStore.Close()
 		return nil, err
 	}
 	server := &Server{
@@ -447,22 +480,24 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			writeAuthError(w, err)
 			return
 		}
+		signals := s.extractSessionAffinitySignals(r)
 		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
 			writeError(w, http.StatusBadRequest, "fast mode is disabled")
 			return
 		}
-		s.handleChatCompletions(w, r, authorization)
+		s.handleChatCompletions(w, r, authorization, signals)
 	case routeOK:
 		authorization, err := s.authorizeProxy(r, route.allowUpstreamAuth)
 		if err != nil {
 			writeAuthError(w, err)
 			return
 		}
+		signals := s.extractSessionAffinitySignals(r)
 		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
 			writeError(w, http.StatusBadRequest, "fast mode is disabled")
 			return
 		}
-		s.proxyCodex(w, r, route, authorization)
+		s.proxyCodex(w, r, route, authorization, signals)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
@@ -560,14 +595,27 @@ func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) (proxyA
 		)
 		return proxyAuthorization{}, err
 	}
-	if allowUpstreamAuth && s.matchesCurrentCodexAccessToken(r.Context(), tokens) {
-		s.debugf(
-			"proxy auth ok method=%s path=%s auth=upstream_access_token token_sources=%s",
-			r.Method,
-			r.URL.Path,
-			tokenSourceSummary(r),
-		)
-		return proxyAuthorization{}, nil
+	if allowUpstreamAuth {
+		compatibilityAuth, errMatch := s.matchCurrentCodexAccessToken(r.Context(), tokens)
+		if errMatch != nil {
+			s.debugf(
+				"proxy auth failed method=%s path=%s reason=auth_reconciliation token_sources=%s",
+				r.Method,
+				r.URL.Path,
+				tokenSourceSummary(r),
+			)
+			return proxyAuthorization{}, errMatch
+		}
+		if compatibilityAuth != nil {
+			s.debugf(
+				"proxy auth ok method=%s path=%s auth=upstream_access_token auth_id=%s token_sources=%s",
+				r.Method,
+				r.URL.Path,
+				compatibilityAuth.ID,
+				tokenSourceSummary(r),
+			)
+			return proxyAuthorization{CompatibilityAuthID: compatibilityAuth.ID}, nil
+		}
 	}
 	s.debugf(
 		"proxy auth failed method=%s path=%s reason=invalid_api_key allow_upstream_auth=%t token_sources=%s",
@@ -579,15 +627,15 @@ func (s *Server) authorizeProxy(r *http.Request, allowUpstreamAuth bool) (proxyA
 	return proxyAuthorization{}, ErrInvalidAPIKey
 }
 
-func (s *Server) matchesCurrentCodexAccessToken(ctx context.Context, tokens []string) bool {
+func (s *Server) matchCurrentCodexAccessToken(ctx context.Context, tokens []string) (*Auth, error) {
 	if s == nil || s.auths == nil || s.auths.Store == nil || len(tokens) == 0 {
-		return false
+		return nil, nil
 	}
-	auths, err := s.auths.Store.Load(ctx)
+	result, err := s.reconcileAuths(ctx)
 	if err != nil {
-		return false
+		return nil, err
 	}
-	for _, auth := range auths {
+	for _, auth := range result.Active {
 		if auth == nil {
 			continue
 		}
@@ -597,11 +645,153 @@ func (s *Server) matchesCurrentCodexAccessToken(ctx context.Context, tokens []st
 		}
 		for _, token := range tokens {
 			if subtle.ConstantTimeCompare([]byte(token), []byte(accessToken)) == 1 {
-				return true
+				return auth, nil
 			}
 		}
 	}
-	return false
+	return nil, nil
+}
+
+func (s *Server) reconcileAuths(ctx context.Context) (AuthReconcileResult, error) {
+	if s == nil || s.auths == nil || s.auths.Store == nil {
+		return AuthReconcileResult{}, fmt.Errorf("auth manager is not configured")
+	}
+	result, err := s.auths.Store.Reconcile(ctx)
+	if err != nil {
+		return AuthReconcileResult{}, err
+	}
+	var removed []string
+	for _, change := range result.Changes {
+		if change.Kind == AuthRemoved {
+			removed = append(removed, change.ID)
+		}
+	}
+	if len(removed) > 0 {
+		if _, err = s.users.DeleteSessionAffinityByAuthIDs(ctx, removed); err != nil {
+			return AuthReconcileResult{}, err
+		}
+	}
+	return result, nil
+}
+
+func (s *Server) selectProxyAuth(ctx context.Context, authorization proxyAuthorization, signals []sessionAffinitySignal) (AuthSelection, error) {
+	result, err := s.reconcileAuths(ctx)
+	if err != nil {
+		return AuthSelection{}, err
+	}
+	if len(result.Active) == 0 {
+		return AuthSelection{}, fmt.Errorf("no active codex auth files found")
+	}
+	if err = s.users.maybeCleanupExpiredSessionAffinity(ctx); err != nil {
+		return AuthSelection{}, err
+	}
+	digests := sessionAffinityDigestsForRequest(authorization, signals)
+	if len(digests) == 0 {
+		auth, errNext := s.auths.nextAuth(result.Active)
+		if errNext != nil {
+			return AuthSelection{}, errNext
+		}
+		auth, errNext = s.auths.prepareAuth(ctx, auth)
+		return AuthSelection{Auth: auth}, errNext
+	}
+
+	activeByID := authsByStableID(result.Active)
+	binding, found, err := s.users.LookupSessionAffinity(ctx, digests)
+	if err != nil {
+		return AuthSelection{}, err
+	}
+	if found {
+		if auth := activeByID[binding.AuthID]; auth != nil {
+			auth, err = s.auths.prepareAuth(ctx, auth)
+			return AuthSelection{Auth: auth, Binding: binding}, err
+		}
+		candidate, errNext := s.auths.nextAuth(result.Active)
+		if errNext != nil {
+			return AuthSelection{}, errNext
+		}
+		binding, err = s.users.RebindSessionAffinity(ctx, binding, candidate.ID)
+		if err != nil {
+			return AuthSelection{}, err
+		}
+		auth := activeByID[binding.AuthID]
+		if auth == nil {
+			return AuthSelection{}, fmt.Errorf("session-bound codex auth %s is unavailable", binding.AuthID)
+		}
+		auth, err = s.auths.prepareAuth(ctx, auth)
+		return AuthSelection{Auth: auth, Binding: binding}, err
+	}
+
+	candidate, err := s.auths.nextAuth(result.Active)
+	if err != nil {
+		return AuthSelection{}, err
+	}
+	binding, err = s.users.BindSessionAffinity(ctx, digests, candidate.ID)
+	if err != nil {
+		return AuthSelection{}, err
+	}
+	auth := activeByID[binding.AuthID]
+	if auth == nil {
+		binding, err = s.users.RebindSessionAffinity(ctx, binding, candidate.ID)
+		if err != nil {
+			return AuthSelection{}, err
+		}
+		auth = activeByID[binding.AuthID]
+	}
+	if auth == nil {
+		return AuthSelection{}, fmt.Errorf("session-bound codex auth %s is unavailable", binding.AuthID)
+	}
+	auth, err = s.auths.prepareAuth(ctx, auth)
+	return AuthSelection{Auth: auth, Binding: binding}, err
+}
+
+func (s *Server) RebindAuthSelection(ctx context.Context, selection AuthSelection, candidateAuthID string) (AuthSelection, error) {
+	candidateAuthID = strings.TrimSpace(candidateAuthID)
+	if candidateAuthID == "" {
+		return AuthSelection{}, ErrInvalidInput
+	}
+	result, err := s.reconcileAuths(ctx)
+	if err != nil {
+		return AuthSelection{}, err
+	}
+	activeByID := authsByStableID(result.Active)
+	candidate := activeByID[candidateAuthID]
+	if candidate == nil {
+		return AuthSelection{}, fmt.Errorf("candidate codex auth %s is unavailable", candidateAuthID)
+	}
+	if !selection.Binding.valid() {
+		candidate, err = s.auths.prepareAuth(ctx, candidate)
+		return AuthSelection{Auth: candidate}, err
+	}
+	binding, err := s.users.RebindSessionAffinity(ctx, selection.Binding, candidateAuthID)
+	if err != nil {
+		return AuthSelection{}, err
+	}
+	auth := activeByID[binding.AuthID]
+	if auth == nil {
+		return AuthSelection{}, fmt.Errorf("session-bound codex auth %s is unavailable", binding.AuthID)
+	}
+	auth, err = s.auths.prepareAuth(ctx, auth)
+	return AuthSelection{Auth: auth, Binding: binding}, err
+}
+
+func authsByStableID(auths []*Auth) map[string]*Auth {
+	result := make(map[string]*Auth, len(auths))
+	for _, auth := range auths {
+		if auth != nil {
+			result[auth.ID] = auth
+		}
+	}
+	return result
+}
+
+func stableAuthIDs(auths []*Auth) []string {
+	ids := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil {
+			ids = append(ids, auth.ID)
+		}
+	}
+	return ids
 }
 
 func candidateProxyTokens(r *http.Request) []string {
@@ -879,7 +1069,7 @@ func requestHasFastServiceTier(r *http.Request) bool {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		r.Body = io.NopCloser(bytes.NewReader(nil))
+		resetRequestBody(r, nil)
 		return false
 	}
 	resetRequestBody(r, body)
@@ -908,7 +1098,17 @@ func payloadHasFastServiceTier(payload []byte) bool {
 	return ok && isFastServiceTier(serviceTier)
 }
 
+func (s *Server) extractSessionAffinitySignals(r *http.Request) []sessionAffinitySignal {
+	if s != nil && s.sessionAffinityReplayStore != nil {
+		return extractSessionAffinitySignalsWithReplayStore(r, s.sessionAffinityReplayStore())
+	}
+	return extractSessionAffinitySignals(r)
+}
+
 func resetRequestBody(r *http.Request, body []byte) {
+	if r.Body != nil {
+		_ = r.Body.Close()
+	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	r.GetBody = func() (io.ReadCloser, error) {
@@ -916,13 +1116,18 @@ func resetRequestBody(r *http.Request, body []byte) {
 	}
 }
 
-func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization) {
-	auth, err := s.auths.Select(r.Context())
+func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstreamRoute, authorization proxyAuthorization, signals []sessionAffinitySignal) {
+	selection, err := s.selectProxyAuth(r.Context(), authorization, signals)
 	if err != nil {
 		s.debugf("proxy upstream auth unavailable method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
+		if errors.Is(err, ErrStorageFailure) {
+			writeStoreError(w, err)
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "upstream authentication unavailable")
 		return
 	}
+	auth := selection.Auth
 	if route.responsesWebsocket && websocketRequested(r) {
 		s.proxyCodexWebSocket(w, r, route, authorization, auth)
 		return

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -28,9 +29,11 @@ var (
 )
 
 type UserStore struct {
-	db       *sql.DB
-	now      func() time.Time
-	failures *storageFailureState
+	db                    *sql.DB
+	now                   func() time.Time
+	failures              *storageFailureState
+	affinityCleanupMu     sync.Mutex
+	nextAffinityCleanupAt time.Time
 }
 
 type CreateUserParams struct {
@@ -168,6 +171,14 @@ func (s *UserStore) migrate(ctx context.Context) error {
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
 		)`,
+		`CREATE TABLE IF NOT EXISTS session_affinity_bindings (
+			session_digest TEXT PRIMARY KEY,
+			binding_digest TEXT NOT NULL,
+			auth_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
+		)`,
 	}
 	for _, statement := range tableStatements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -187,6 +198,12 @@ func (s *UserStore) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_user_key_time
 			ON usage_buckets(user_id, api_key_id, bucket_start)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_buckets_time ON usage_buckets(bucket_start)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_affinity_auth_id
+			ON session_affinity_bindings(auth_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_affinity_binding_digest
+			ON session_affinity_bindings(binding_digest)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_affinity_expires_at
+			ON session_affinity_bindings(expires_at)`,
 	}
 	for _, statement := range indexStatements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
