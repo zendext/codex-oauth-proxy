@@ -495,6 +495,7 @@ func (s *Server) proxyCodexWebSocket(
 		authorization,
 		signals,
 		metadata.Model,
+		requestClientVersion(r, s.cfg),
 		replayable,
 		func(ctx context.Context, auth *Auth) (*http.Response, error) {
 			header := outboundWebSocketHeader(r, auth, s.cfg, route.responsesWebsocket)

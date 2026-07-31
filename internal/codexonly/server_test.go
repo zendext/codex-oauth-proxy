@@ -643,8 +643,8 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	if got := model["display_name"]; got != "GPT-5.6-Sol" {
 		t.Fatalf("display_name = %#v, want GPT-5.6-Sol", got)
 	}
-	if got := model["max_context_window"]; got != float64(372000) {
-		t.Fatalf("max_context_window = %#v, want 372000", got)
+	if got := model["max_context_window"]; got != float64(272000) {
+		t.Fatalf("max_context_window = %#v, want 272000", got)
 	}
 	if !reasoningLevelsContain(model, "max") {
 		t.Fatalf("supported_reasoning_levels does not include max: %#v", model["supported_reasoning_levels"])
@@ -652,8 +652,8 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	if !reasoningLevelsContain(model, "ultra") {
 		t.Fatalf("supported_reasoning_levels does not include ultra: %#v", model["supported_reasoning_levels"])
 	}
-	if modelHasFastTier(model) {
-		t.Fatalf("gpt-5.6-sol unexpectedly advertises Fast tier: %#v", model)
+	if !modelHasFastTier(model) {
+		t.Fatalf("gpt-5.6-sol Fast tier metadata not found in %#v", model)
 	}
 }
 

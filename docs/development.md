@@ -72,6 +72,7 @@ connections.
 | Admin CLI | `cmd/server/admin_*.go` |
 | Configuration and OAuth | `internal/codexonly/config.go`, `auth.go`, `refresh.go` |
 | Routing and proxy | `internal/codexonly/server.go`, `usage_proxy.go` |
+| Runtime model catalogs | `internal/codexonly/models.go` |
 | Chat compatibility | `internal/codexonly/chat_completions.go` |
 | Users and SQLite | `internal/codexonly/user_store.go` |
 | Usage queries | `internal/codexonly/usage.go` |
@@ -80,6 +81,22 @@ connections.
 
 Tests are kept next to their owning package. HTTP tests use `httptest`; store
 tests use temporary SQLite databases.
+
+## Embedded Catalog Maintenance
+
+The embedded catalog is a final runtime fallback. Its `go:generate` directive
+pins an explicit official `openai/codex` Git ref and never discovers the latest
+release at runtime:
+
+```bash
+go generate ./internal/codexonly
+go run ./cmd/update-model-catalog --ref rust-v0.146.0 --check
+```
+
+When updating it, first verify the latest stable Codex CLI release from the
+official repository. Then update the pinned `--ref`, `DefaultCodexUA`, and the
+vendored JSON together. The updater validates the downloaded catalog and writes
+it atomically.
 
 ## Documentation Policy
 

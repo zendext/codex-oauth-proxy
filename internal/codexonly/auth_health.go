@@ -66,6 +66,7 @@ type authHealthRegistry struct {
 	mu              sync.RWMutex
 	states          map[string]AuthHealthState
 	modelExclusions map[string]map[string]authModelExclusion
+	healthyEpochs   map[string]uint64
 }
 
 func newAuthHealthRegistry(store *UserStore) *authHealthRegistry {
@@ -74,6 +75,7 @@ func newAuthHealthRegistry(store *UserStore) *authHealthRegistry {
 		now:             time.Now,
 		states:          make(map[string]AuthHealthState),
 		modelExclusions: make(map[string]map[string]authModelExclusion),
+		healthyEpochs:   make(map[string]uint64),
 	}
 }
 
@@ -249,6 +251,7 @@ func (r *authHealthRegistry) Restore(ctx context.Context, auths []*Auth) error {
 	r.mu.Lock()
 	r.states = states
 	r.modelExclusions = make(map[string]map[string]authModelExclusion)
+	r.healthyEpochs = make(map[string]uint64)
 	r.mu.Unlock()
 	return nil
 }
@@ -338,6 +341,9 @@ func (r *authHealthRegistry) MarkHealthy(ctx context.Context, auth *Auth, model 
 	}
 	r.mu.Lock()
 	cleared, err := r.markHealthyLocked(ctx, auth, model)
+	if err == nil {
+		r.healthyEpochs[auth.ID]++
+	}
 	r.mu.Unlock()
 	if err != nil {
 		return err
@@ -365,6 +371,7 @@ func (r *authHealthRegistry) MarkCredentialHealthy(ctx context.Context, auth *Au
 		}
 	}
 	delete(r.states, auth.ID)
+	r.healthyEpochs[auth.ID]++
 	r.mu.Unlock()
 	logAuthHealthy(auth, "credential_repaired")
 	return nil
@@ -474,6 +481,7 @@ func (r *authHealthRegistry) Reconcile(ctx context.Context, result AuthReconcile
 			}
 			delete(r.states, change.ID)
 			delete(r.modelExclusions, change.ID)
+			delete(r.healthyEpochs, change.ID)
 		case AuthUpdated:
 			auth := byID[change.ID]
 			if auth == nil {
@@ -500,9 +508,21 @@ func (r *authHealthRegistry) Reconcile(ctx context.Context, result AuthReconcile
 					delete(r.modelExclusions, change.ID)
 				}
 			}
+			if change.CredentialsChanged {
+				r.healthyEpochs[change.ID]++
+			}
 		}
 	}
 	return r.pruneExpiredLocked(ctx)
+}
+
+func (r *authHealthRegistry) HealthyEpoch(authID string) uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.healthyEpochs[strings.TrimSpace(authID)]
 }
 
 func (r *authHealthRegistry) NearestCooldown(auths []*Auth, model string) (time.Time, bool) {

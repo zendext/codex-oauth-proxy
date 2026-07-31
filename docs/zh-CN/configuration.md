@@ -34,7 +34,7 @@ codex-oauth-proxy serve --config /etc/codex-oauth-proxy/config.yaml
 | `max-retry-interval` | `30` | 为开始下一轮而等待最近凭据冷却的最长秒数。`0` 禁用冷却等待。 |
 | `codex-base-url` | `https://chatgpt.com/backend-api/codex` | Codex Responses 兼容路由的上游 Base URL。 |
 | `chatgpt-base-url` | `https://chatgpt.com/backend-api` | 文件、账户和 Hosted MCP 兼容路由的上游 Base URL。 |
-| `codex-user-agent` | 空 | 上游 User-Agent 覆盖值。空值会转发客户端值或使用 Codex CLI 回退值。 |
+| `codex-user-agent` | 空 | 上游 User-Agent 覆盖值。`client_version` 缺失或为空时，`/v1/models` 使用其中的版本；无法解析时回退到内置 Codex CLI 版本。 |
 | `codex-beta-features` | 空 | 客户端未提供时使用的 `x-codex-beta-features` 回退 Header。 |
 | `codex-refresh-token-url` | 空 | OAuth 刷新端点覆盖值。空值使用 `https://auth.openai.com/oauth/token`。 |
 
@@ -150,6 +150,22 @@ Trace Summarization，以及 Upgrade 成功前的 Responses WebSocket Handshake�
 仅因无法重放而被拒绝。符合条件的缓冲请求在模糊网络故障后可能重复执行；这是
 为了可用性而接受的极少量重复生成或重复计费风险。
 
+## 运行时模型目录
+
+运行时同步始终启用，不提供仅静态模式的 Flag。
+`/v1/models?client_version=<version>` 会为每个有效逻辑凭据 Fetch 已认证的
+上游目录。缺少 `client_version` 或值为空时，服务器从 `codex-user-agent`
+派生版本；该设置为空或不包含可解析 Product Version 时，使用内置 Codex CLI
+版本。
+
+客户端版本会去除首尾空白，最大 64 字节，并且只允许安全的字母、数字、`.`、
+`-`、`_` 和 `+`。无效值返回 `400`。服务器在内存中保留成功的按认证 Snapshot
+三小时，并按最近最少使用顺序最多保留 16 个客户端版本。
+
+一个认证失败不会隐藏其他认证的成功目录。过期的按认证数据仍可使用；一个去重
+的后台刷新会使用退避、Jitter 和 `Retry-After` 再尝试三次。如果所有认证都
+没有可用 Snapshot，则返回嵌入式目录。目录 Payload 不会存储到 SQLite。
+
 ## 托管用户与数据库
 
 SQLite 数据库存储：
@@ -251,5 +267,6 @@ Refresh Token、托管明文 API Key 或上游响应 Body。
 `codex-base-url`、`chatgpt-base-url` 和 `codex-refresh-token-url` 主要用于
 受控测试或替代网络路由。值必须包含 URL Scheme 和 Host。
 
-`codex-user-agent` 和 `codex-beta-features` 只在相应配置行为适用时覆盖兼容
-Header；其他情况下会尽可能保留正常客户端 Header。
+`codex-user-agent` 会覆盖兼容 Header，并提供默认模型目录版本。
+`codex-beta-features` 只在已配置时覆盖其兼容 Header。其他客户端 Header 会在
+支持时保留。

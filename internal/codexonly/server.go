@@ -28,6 +28,8 @@ import (
 
 const websocketBetaHeader = "responses_websockets=2026-02-06"
 
+//go:generate go run ../../cmd/update-model-catalog --ref rust-v0.146.0 --output codex_client_models.json
+
 //go:embed codex_client_models.json
 var codexClientModelsJSON []byte
 
@@ -205,6 +207,7 @@ type Server struct {
 	cfg                        *Config
 	auths                      *AuthManager
 	health                     *authHealthRegistry
+	models                     *runtimeModelCatalog
 	users                      *UserStore
 	httpClient                 *http.Client
 	baseURL                    *url.URL
@@ -316,6 +319,7 @@ func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
 		cancel:         cancel,
 		waitRetry:      waitForProxyRetry,
 	}
+	server.models = newRuntimeModelCatalog(serverCtx, server.fetchModelCatalog, health.HealthyEpoch)
 	server.debugf(
 		"debug enabled listen=%s auth_dir=%s database_path=%s codex_base_url=%s chatgpt_base_url=%s",
 		ListenAddr(cfg),
@@ -345,6 +349,9 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closeOnce.Do(func() {
+		if s.models != nil {
+			s.models.Close()
+		}
 		s.Shutdown()
 		if s.users != nil {
 			s.closeErr = s.users.Close()
@@ -670,6 +677,9 @@ func (s *Server) reconcileAuths(ctx context.Context) (AuthReconcileResult, error
 		if err = s.health.Reconcile(ctx, result); err != nil {
 			return AuthReconcileResult{}, err
 		}
+	}
+	if s.models != nil {
+		s.models.Reconcile(result)
 	}
 	return result, nil
 }
@@ -1074,11 +1084,32 @@ func writeStoreError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	if _, ok := r.URL.Query()["client_version"]; ok {
-		writeJSON(w, http.StatusOK, map[string]any{"models": codexClientModels(s.fastModeAllowed())})
+	clientVersion, err := modelsClientVersion(r, s.cfg)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid client_version")
 		return
 	}
-	models := codexClientModels(s.fastModeAllowed())
+	result, err := s.reconcileAuths(r.Context())
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	view, err := s.models.Catalog(r.Context(), clientVersion, result.Active)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if fatalErr := s.users.failures.current(); fatalErr != nil {
+				writeStoreError(w, fatalErr)
+			}
+			return
+		}
+		writeError(w, http.StatusBadGateway, "model catalog unavailable")
+		return
+	}
+	models := filterCodexClientModels(view.Models, s.fastModeAllowed())
+	if _, ok := r.URL.Query()["client_version"]; ok {
+		writeJSON(w, http.StatusOK, map[string]any{"models": models})
+		return
+	}
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
 		id, _ := model["slug"].(string)
@@ -1721,16 +1752,7 @@ func codexClientModels(allowFastMode bool) []map[string]any {
 	if codexClientModelsErr != nil {
 		return fallbackCodexClientModels()
 	}
-	out := make([]map[string]any, 0, len(codexClientModelsList))
-	for _, model := range codexClientModelsList {
-		cloned := cloneCodexClientModelMap(model)
-		if !allowFastMode {
-			delete(cloned, "service_tiers")
-			delete(cloned, "additional_speed_tiers")
-		}
-		out = append(out, cloned)
-	}
-	return out
+	return filterCodexClientModels(codexClientModelsList, allowFastMode)
 }
 
 func fallbackCodexClientModels() []map[string]any {

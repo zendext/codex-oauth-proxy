@@ -47,7 +47,7 @@ codex-base-url: "https://chatgpt.com/backend-api/codex"
 # ChatGPT backend base URL used by Codex file uploads.
 chatgpt-base-url: "https://chatgpt.com/backend-api"
 
-# Optional upstream User-Agent override. Leave empty to forward the Codex CLI UA.
+# Optional upstream User-Agent override. Its version is the default model catalog version.
 codex-user-agent: ""
 
 # Optional x-codex-beta-features fallback.

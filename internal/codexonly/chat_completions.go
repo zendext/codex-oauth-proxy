@@ -106,6 +106,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, a
 		authorization,
 		signals,
 		conversion.Metadata.Model,
+		requestClientVersion(r, s.cfg),
 		replayable,
 		func(ctx context.Context, auth *Auth) (*http.Response, error) {
 			upstreamReq, errRequest := s.newChatCompletionUpstreamRequest(r.WithContext(ctx), payload, auth)
