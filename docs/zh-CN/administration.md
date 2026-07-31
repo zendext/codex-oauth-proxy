@@ -170,6 +170,18 @@ curl http://127.0.0.1:8317/v0/management/users \
 
 请求和响应格式参见 [API 参考](api-reference.md)。
 
+## 会话亲和性操作
+
+管理 CLI 当前没有提供会话亲和性命令。管理员可以通过任一管理入口显式清除全部
+持久化绑定：
+
+```bash
+curl -X DELETE http://127.0.0.1:8317/v0/local-admin/session-affinity
+```
+
+远程等价端点为 `DELETE /v0/management/session-affinity`，并且需要
+`admin-api-key`。响应只包含删除行数，不公开会话 Digest 或原始标识符。
+
 ## 用户自助服务
 
 托管用户 API Key 可以访问：

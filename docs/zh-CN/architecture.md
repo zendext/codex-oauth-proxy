@@ -21,6 +21,7 @@
 | `internal/codexonly/server.go` | 路由、认证、模型目录、Header、HTTP Reverse Proxy 以及管理和用户 Handler。 |
 | `internal/codexonly/chat_completions.go` | Chat Completions 到 Responses 的转换和响应翻译。 |
 | `internal/codexonly/user_store.go` | SQLite Schema、用户、API Key 和认证。 |
+| `internal/codexonly/session_affinity.go` | 有界信号提取、Digest、持久化绑定、续期和 CAS 重绑定。 |
 | `internal/codexonly/usage.go` | 用量存储、聚合、窗口、维度和时间序列。 |
 | `internal/codexonly/usage_proxy.go` | HTTP、SSE 和 WebSocket 用量采集。 |
 | `observability/` | 可选 Grafana Compose 和 Provisioning 资源。 |
@@ -34,7 +35,8 @@
 3. 解析 `auth-dir` 并验证两个上游 Base URL。
 4. 构建上游 Client 和带超时的 OAuth 刷新 Client。
 5. 扫描认证目录以验证可读性。
-6. 解析 SQLite 路径、执行幂等 Schema Migration，并验证初始持久化用户状态。
+6. 解析 SQLite 路径、执行幂等 Schema Migration、验证初始持久化用户状态，并
+   删除指向已不存在认证身份的亲和性目标。
 7. 启动一个 `net/http` 服务器。
 
 服务器将 `ReadHeaderTimeout` 设置为 10 秒。它不会设置可能中断已建立 Stream
@@ -68,7 +70,7 @@ Kubernetes 或其他外部 Supervisor，在修复底层 SQLite 问题后重启�
 2. 从 `account_id`、Token 声明或规范化路径回退值解析稳定身份。
 3. 将同一账户的重复文件合并为一个逻辑凭据。
 4. 按稳定身份排序可选择的逻辑凭据。
-5. 以轮询方式选择下一个逻辑凭据。
+5. 跟随有效的租户范围会话绑定；不存在绑定时，以轮询方式选择下一个逻辑凭据。
 6. 将五分钟内过期的凭据视为已过期。
 7. 按稳定凭据 ID 在进程内协调刷新，使同一凭据的并发调用方共享一次有效刷新。
 8. 当其他调用方已经替换过期或收到 `401` 的 Token 时，仅在相同稳定凭据 ID
@@ -122,6 +124,34 @@ HTTP `408`、`429`、`500`、`502`、`503`、`504` 可以重试；有效的
 这是为了支持已经持有该 Token 的 Codex CLI 行为。这类请求没有托管用户身份，
 不会计入按用户统计。
 
+## 会话亲和性
+
+会话亲和性默认启用，并存储在与托管用户和用量相同的 SQLite 数据库中。
+
+代理只接受以下显式信号：
+
+- `Session-Id` 或 `Session_id` 请求 Header。
+- 顶层 JSON `session_id` 或 `sessionId`。
+- 顶层 JSON `prompt_cache_key`。
+- 顶层 JSON `conversation_id` 或 `conversation.id`。
+
+信号值会去除首尾空白，限制为 512 字节；空值、无效 UTF-8 或包含控制字符的值
+不会用于亲和性。JSON 检查限制为 64 KiB。无效、缺失或超大信号不会拒绝或截断
+代理请求，而是回退到正常轮询选择。
+
+托管请求按稳定用户 ID 划分，因此 API Key 轮换会保留绑定，不同用户不会碰撞。
+OAuth 兼容请求按认证该请求的 Access Token 所属稳定身份划分。模型名称不属于
+亲和性 Key。
+
+数据库只存储由租户范围、信号类型和规范化值派生的 SHA-256 Digest。同一请求中
+观察到的 Prompt Cache、Conversation 和 Session 别名共享一个仅含 Digest 的
+绑定组。首次绑定使用原子插入；并发首次请求跟随数据库获胜者。重绑定使用
+Compare-and-swap，使并发故障转移收敛，而不会覆盖其他请求的获胜结果。
+
+绑定在一小时无活动后过期。活动绑定仅在距上次持久化写入至少 30 分钟后续期，
+过期行以有界批次清理。绑定在进程重启后保留。禁用认证不会删除空闲绑定；禁用
+期间复用会重绑定到有效认证。删除或替换认证身份会使指向旧身份的绑定失效。
+
 ## 路由选择
 
 HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
@@ -145,7 +175,8 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 
 1. 认证传入的托管 Key 或允许的 OAuth 兼容 Token。
 2. Fast 模式禁用时拒绝 Fast Service Tier。
-3. 选择并刷新一个上游 OAuth 凭据。
+3. 解析会话亲和性；没有有效信号时使用轮询选择，然后刷新选中的上游 OAuth
+   凭据。
 4. 将目标 URL 重写到配置的 Codex 或 ChatGPT Base。
 5. 使用选中的 OAuth Access Token 替换 `Authorization`。
 6. 可用时添加 ChatGPT Account ID 和兼容 Header。
@@ -204,6 +235,18 @@ API Key 包含：
 Partial Unique Index 保证每个用户只能有一个启用的 Key。重置 Key 会在同一事务
 中禁用旧有效 Key 并插入替代 Key。
 
+### 会话亲和性绑定
+
+绑定包含：
+
+- 一个或多个租户范围的 SHA-256 会话 Digest。
+- 仅含 Digest 的别名组标识符。
+- 选中的稳定 OAuth 凭据 ID。
+- 创建、续期和过期时间。
+
+绑定表不会存储原始 Session ID、Prompt Cache Key、Conversation ID、托管 API
+Key 或模型名称。
+
 ## 用量数据模型
 
 `usage_buckets` 将托管用户用量聚合到 UTC 10 分钟桶。逻辑桶 Key 包含：
@@ -231,5 +274,7 @@ SQLite。
 
 OAuth 文件会被原地读取和刷新。托管明文 Key 只在创建或重置时返回；持久化时
 只保存 Hash 和脱敏元数据。
+原始会话亲和性信号只在请求内存中使用，不会持久化、由管理 API 返回或写入
+调试日志。
 
 服务器自身提供 HTTP。监听地址选择和传输终止属于部署环境职责。

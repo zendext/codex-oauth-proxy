@@ -57,18 +57,23 @@ type sseEvent struct {
 	Data  string
 }
 
-func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, authorization proxyAuthorization) {
+func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, authorization proxyAuthorization, signals []sessionAffinitySignal) {
 	conversion, err := decodeChatCompletionRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	auth, err := s.auths.Select(r.Context())
+	selection, err := s.selectProxyAuth(r.Context(), authorization, signals)
 	if err != nil {
 		s.debugf("chat completions upstream auth unavailable method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
+		if errors.Is(err, ErrStorageFailure) {
+			writeStoreError(w, err)
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "upstream authentication unavailable")
 		return
 	}
+	auth := selection.Auth
 	payload, err := json.Marshal(conversion.Responses)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid chat completion request")

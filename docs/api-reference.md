@@ -48,6 +48,22 @@ When both are present, either matching credential can authenticate the request.
 Disabled users receive `403`. Missing, unknown, or rotated managed keys receive
 `401`.
 
+## Session Affinity
+
+For proxied requests, the server accepts `Session-Id` or `Session_id` headers
+and the JSON fields `session_id`, `sessionId`, `prompt_cache_key`,
+`conversation_id`, and `conversation.id`.
+
+Valid signals keep one logical session on the same available OAuth credential
+across model changes, API-key rotation, concurrent first requests, and process
+restarts. Managed bindings are isolated by user. Compatibility-token bindings
+are isolated by the matched stable OAuth identity.
+
+Values over 512 bytes, empty values, invalid UTF-8, and values containing
+control characters are ignored for affinity. JSON inspection is limited to
+64 KiB. Ignored or missing signals do not fail the request; selection falls back
+to normal round-robin behavior.
+
 ## Error Format
 
 Project-owned handlers return:
@@ -279,6 +295,20 @@ Response:
 ```
 
 Invalid window, step, grouping, fill, or filter combinations return `400`.
+
+### `DELETE /v0/management/session-affinity`
+
+Deletes all persisted session affinity bindings without returning digests or
+raw session identifiers.
+
+Response:
+
+```json
+{"cleared":12}
+```
+
+The loopback-only equivalent is
+`DELETE /v0/local-admin/session-affinity`.
 
 ## User API
 

@@ -14,6 +14,7 @@ credentials from Codex CLI.
 - Proxies Codex CLI and supported OpenAI-compatible requests.
 - Manages `cop_...` API keys for proxy users.
 - Rotates multiple Codex OAuth credentials and refreshes expired tokens.
+- Persists tenant-scoped session affinity without storing raw session identifiers.
 - Records per-user token usage and provides an optional Grafana dashboard.
 
 ## Quick Start

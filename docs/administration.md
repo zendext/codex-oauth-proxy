@@ -174,6 +174,21 @@ curl http://127.0.0.1:8317/v0/management/users \
 
 See [API Reference](api-reference.md) for request and response shapes.
 
+## Session Affinity Operations
+
+The admin CLI does not currently expose a session-affinity command. An
+administrator can explicitly clear all persisted bindings through either
+management surface:
+
+```bash
+curl -X DELETE http://127.0.0.1:8317/v0/local-admin/session-affinity
+```
+
+The remote equivalent is
+`DELETE /v0/management/session-affinity` and requires `admin-api-key`.
+The response contains only the deleted row count; it does not expose session
+digests or raw identifiers.
+
 ## User Self-Service
 
 A managed user API key can access:

@@ -22,6 +22,7 @@ storage backends.
 | `internal/codexonly/server.go` | Routing, authentication, model catalog, headers, HTTP reverse proxy, and management/user handlers. |
 | `internal/codexonly/chat_completions.go` | Chat Completions to Responses conversion and response translation. |
 | `internal/codexonly/user_store.go` | SQLite schema, users, API keys, and authentication. |
+| `internal/codexonly/session_affinity.go` | Bounded signal extraction, digesting, persistent binding, renewal, and CAS rebind. |
 | `internal/codexonly/usage.go` | Usage storage, aggregation, windows, dimensions, and timeseries. |
 | `internal/codexonly/usage_proxy.go` | HTTP, SSE, and WebSocket usage capture. |
 | `observability/` | Optional Grafana Compose and provisioning assets. |
@@ -35,8 +36,9 @@ Startup performs these steps:
 3. Resolve `auth-dir` and validate the two upstream base URLs.
 4. Build an upstream client and a timeout-limited OAuth refresh client.
 5. Scan the auth directory to verify it is readable.
-6. Resolve the SQLite path, run idempotent schema migrations, and validate the
-   initial persisted user state.
+6. Resolve the SQLite path, run idempotent schema migrations, validate the
+   initial persisted user state, and remove affinity targets for auth identities
+   that are no longer present.
 7. Start one `net/http` server.
 
 The server sets `ReadHeaderTimeout` to 10 seconds. It does not set read or write
@@ -76,7 +78,8 @@ For every upstream request:
    fallback.
 3. Group duplicate files for one account into one logical credential.
 4. Sort selectable logical credentials by stable identity.
-5. Select the next logical credential in round-robin order.
+5. Follow a valid tenant-scoped session binding, or select the next logical
+   credential in round-robin order when no binding exists.
 6. Treat credentials expiring within five minutes as expired.
 7. Coordinate refresh in process by stable credential ID so one effective
    refresh serves concurrent callers for that credential.
@@ -140,6 +143,41 @@ Codex OAuth access token. This exists for Codex CLI behavior that already holds
 that token. Such requests have no managed user identity and are excluded from
 per-user usage accounting.
 
+## Session Affinity
+
+Session affinity is enabled by default and stored in the same SQLite database
+as managed users and usage.
+
+The proxy accepts only these explicit signals:
+
+- `Session-Id` or `Session_id` request headers.
+- Top-level JSON `session_id` or `sessionId`.
+- Top-level JSON `prompt_cache_key`.
+- Top-level JSON `conversation_id` or `conversation.id`.
+
+Signal values are trimmed, limited to 512 bytes, and rejected for affinity when
+empty, invalid UTF-8, or containing control characters. JSON inspection is
+limited to 64 KiB. An invalid, missing, or oversized signal does not reject or
+truncate the proxied request; it uses normal round-robin selection instead.
+
+Managed requests are scoped by stable user ID, so API-key rotation preserves
+bindings and two users cannot collide. OAuth compatibility requests are scoped
+by the stable identity of the access token that authenticated the request.
+Model name is not part of the affinity key.
+
+The database stores only SHA-256 digests derived from tenant scope, signal
+type, and normalized value. Prompt-cache, conversation, and session aliases
+observed together share one digest-only binding group. The first binding is
+inserted atomically; concurrent first requests follow the database winner.
+Rebinding uses compare-and-swap so concurrent failovers converge without
+overwriting another request's winner.
+
+Bindings expire after one hour of inactivity. Active bindings renew only after
+30 minutes since their previous persistence write, and expired rows are removed
+in bounded batches. Bindings survive process restarts. Disabling an auth leaves
+idle bindings intact; reuse while disabled rebinds to an active auth. Removing
+or replacing an auth identity invalidates bindings that target the old identity.
+
 ## Route Selection
 
 The HTTP handler checks project-owned routes before the reverse proxy whitelist.
@@ -164,7 +202,8 @@ For a whitelisted proxy request:
 
 1. Authenticate the incoming managed key or permitted OAuth compatibility token.
 2. Reject Fast service tiers when Fast mode is disabled.
-3. Select and refresh an upstream OAuth credential.
+3. Resolve session affinity, or use round-robin selection when no valid signal
+   is present, then refresh the selected upstream OAuth credential.
 4. Rewrite the target URL to the configured Codex or ChatGPT base.
 5. Replace `Authorization` with the selected OAuth access token.
 6. Add the ChatGPT account ID and compatibility headers when available.
@@ -228,6 +267,18 @@ An API key has:
 A partial unique index permits only one enabled key per user. Resetting a key
 disables the old active key and inserts the replacement in one transaction.
 
+### Session Affinity Bindings
+
+A binding has:
+
+- One or more tenant-scoped SHA-256 session digests.
+- A digest-only alias group identifier.
+- The selected stable OAuth credential ID.
+- Creation, renewal, and expiry timestamps.
+
+No raw session ID, prompt-cache key, conversation ID, managed API key, or model
+name is stored in the binding table.
+
 ## Usage Data Model
 
 `usage_buckets` aggregates managed-user usage into 10-minute UTC buckets. The
@@ -257,6 +308,8 @@ The service handles three distinct secret types:
 
 OAuth files are read and refreshed in place. Managed plaintext keys are returned
 only at creation or reset; only hashes and masked metadata are persisted.
+Raw session affinity signals are used only in request memory and are not
+persisted, returned by management APIs, or written to debug logs.
 
 The server itself provides HTTP. Listen address selection and transport
 termination belong to the deployment environment.
