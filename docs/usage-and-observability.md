@@ -16,7 +16,7 @@ Recorded identity includes:
 
 - User ID.
 - API key ID and masked metadata.
-- Selected OAuth auth file ID.
+- Selected stable OAuth credential ID.
 - Request ID.
 
 Requests accepted only through a currently loaded Codex OAuth access token on
@@ -53,7 +53,7 @@ Usage is separated by:
 - Model.
 - Reasoning effort.
 - Service tier.
-- Selected OAuth auth file.
+- Selected stable OAuth credential.
 
 Blank model, reasoning, or auth values are normalized to `unknown`.
 
@@ -69,7 +69,7 @@ Service tiers are normalized:
 
 Records are aggregated into UTC 10-minute buckets. A bucket key includes the
 identity and model dimensions, so requests in the same period but with different
-models, reasoning effort, service tier, or OAuth files remain separable.
+models, reasoning effort, service tier, or OAuth credentials remain separable.
 
 Bucket data is retained for 30 days. Old buckets are pruned while new usage is
 recorded.

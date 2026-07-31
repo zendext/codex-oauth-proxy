@@ -202,6 +202,8 @@ func TestAuthSavePreservesCodexCLIAuthJSON(t *testing.T) {
 	if err := os.WriteFile(authPath, []byte(`{
 		"OPENAI_API_KEY": "sk-hidden",
 		"last_refresh": "2026-06-11T00:00:00Z",
+		"access_token": "stale-top-level-access",
+		"account_id": "stale-top-level-account",
 		"tokens": {
 			"access_token": "old-access",
 			"refresh_token": "old-refresh",
@@ -240,6 +242,9 @@ func TestAuthSavePreservesCodexCLIAuthJSON(t *testing.T) {
 	}
 	if _, ok := saved["access_token"]; ok {
 		t.Fatal("saved top-level access_token, want Codex CLI tokens shape")
+	}
+	if _, ok := saved["account_id"]; ok {
+		t.Fatal("saved top-level account_id, want Codex CLI tokens shape")
 	}
 	if _, ok := saved["type"]; ok {
 		t.Fatal("saved top-level type, want Codex CLI shape preserved")

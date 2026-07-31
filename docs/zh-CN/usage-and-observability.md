@@ -14,7 +14,7 @@
 
 - 用户 ID。
 - API Key ID 和脱敏元数据。
-- 选中的 OAuth 认证文件 ID。
+- 选中的稳定 OAuth 凭据 ID。
 - 请求 ID。
 
 内部兼容路由上，仅通过当前已加载 Codex OAuth Access Token 接受的请求不会
@@ -48,7 +48,7 @@ Token 计数器从 JSON、SSE 和最终 WebSocket Response Event 中提取。代
 - 模型。
 - Reasoning Effort。
 - Service Tier。
-- 选中的 OAuth 认证文件。
+- 选中的稳定 OAuth 凭据。
 
 空模型、Reasoning 或认证值会规范化为 `unknown`。
 
@@ -63,7 +63,7 @@ Service Tier 规范化规则：
 ## 桶与保留
 
 记录聚合到 UTC 10 分钟桶中。桶 Key 包含身份和模型维度，因此同一时段内使用
-不同模型、Reasoning Effort、Service Tier 或 OAuth 文件的请求仍然可以区分。
+不同模型、Reasoning Effort、Service Tier 或 OAuth 凭据的请求仍然可以区分。
 
 桶数据保留 30 天。记录新用量时会清理旧桶。
 
