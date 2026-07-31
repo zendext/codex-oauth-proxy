@@ -444,7 +444,7 @@ func TestReactiveUnauthorizedRetriesSameAuthBeforeProxyCommit(t *testing.T) {
 	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"hello"}`))
-	req.GetBody = nil
+	resetRequestBody(req, []byte(`{"input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer "+userKey)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
@@ -462,6 +462,149 @@ func TestReactiveUnauthorizedRetriesSameAuthBeforeProxyCommit(t *testing.T) {
 	defer bodiesMu.Unlock()
 	if len(bodies) != 2 || bodies[0] != `{"input":"hello"}` || bodies[1] != bodies[0] {
 		t.Fatalf("upstream bodies = %#v, want identical replay", bodies)
+	}
+}
+
+func TestReactiveUnauthorizedDoesNotReuseReplacementAccountAtSamePath(t *testing.T) {
+	authDir := t.TempDir()
+	authPath := filepath.Join(authDir, "auth.json")
+	writeAuthFile(t, authDir, "auth.json", `{
+		"type": "codex",
+		"account_id": "acct_a",
+		"access_token": "access-a",
+		"refresh_token": "refresh-a",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	var tokenCalls atomic.Int32
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		tokenCalls.Add(1)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"access_token": "refreshed-a",
+			"expires_in":   3600,
+		})
+	}))
+	defer tokenServer.Close()
+
+	var upstreamCalls atomic.Int32
+	var sawReplacementToken atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if r.Header.Get("Authorization") == "Bearer access-b" {
+			sawReplacementToken.Store(true)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+		if err := os.WriteFile(authPath, []byte(`{
+			"type": "codex",
+			"account_id": "acct_b",
+			"access_token": "access-b",
+			"refresh_token": "refresh-b",
+			"expired": "2099-01-01T00:00:00Z"
+		}`), 0o600); err != nil {
+			t.Errorf("replace auth file: %v", err)
+		}
+		http.Error(w, "expired", http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:              authDir,
+		AdminAPIKey:          "admin-key",
+		Database:             DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL:         upstream.URL + "/backend-api/codex",
+		CodexRefreshTokenURL: tokenServer.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = handler.Close() })
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"hello"}`))
+	resetRequestBody(req, []byte(`{"input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer "+userKey)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503, body: %s", resp.Code, resp.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if got := tokenCalls.Load(); got != 0 {
+		t.Fatalf("token calls = %d, want 0", got)
+	}
+	if sawReplacementToken.Load() {
+		t.Fatal("request retried with replacement account token")
+	}
+}
+
+func TestReactiveUnauthorizedForwardsNonReplayableBodyOnce(t *testing.T) {
+	authDir := t.TempDir()
+	writeAuthFile(t, authDir, "auth.json", `{
+		"type": "codex",
+		"account_id": "acct_1",
+		"access_token": "old-access",
+		"refresh_token": "old-refresh",
+		"expired": "2099-01-01T00:00:00Z"
+	}`)
+
+	var tokenCalls atomic.Int32
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		tokenCalls.Add(1)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"access_token": "new-access",
+			"expires_in":   3600,
+		})
+	}))
+	defer tokenServer.Close()
+
+	var upstreamCalls atomic.Int32
+	var sawBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		sawBody = string(body)
+		http.Error(w, "expired", http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	handler, err := NewHandler(context.Background(), &Config{
+		AuthDir:              authDir,
+		AdminAPIKey:          "admin-key",
+		Database:             DatabaseConfig{Path: filepath.Join(t.TempDir(), "users.db")},
+		CodexBaseURL:         upstream.URL + "/backend-api/codex",
+		CodexRefreshTokenURL: tokenServer.URL,
+		AllowFastMode:        true,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = handler.Close() })
+	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Body = io.NopCloser(strings.NewReader("unknown-length-body"))
+	req.ContentLength = -1
+	req.GetBody = nil
+	req.Header.Set("Authorization", "Bearer "+userKey)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body: %s", resp.Code, resp.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if got := tokenCalls.Load(); got != 0 {
+		t.Fatalf("token calls = %d, want 0", got)
+	}
+	if sawBody != "unknown-length-body" {
+		t.Fatalf("upstream body = %q, want unknown-length-body", sawBody)
 	}
 }
 

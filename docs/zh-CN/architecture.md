@@ -71,7 +71,8 @@ Kubernetes 或其他外部 Supervisor，在修复底层 SQLite 问题后重启�
 5. 以轮询方式选择下一个逻辑凭据。
 6. 将五分钟内过期的凭据视为已过期。
 7. 按稳定凭据 ID 在进程内协调刷新，使同一凭据的并发调用方共享一次有效刷新。
-8. 当其他调用方已经替换过期或收到 `401` 的 Token 时，复用较新的 Access Token。
+8. 当其他调用方已经替换过期或收到 `401` 的 Token 时，仅在相同稳定凭据 ID
+   仍然存在的情况下复用较新的 Access Token。
 9. 刷新过期凭据，并重新解析账户和邮箱声明。
 10. 同目录 `0600` 临时文件完成 Sync 后，原子替换选中的源文件。
 11. 使用选中的 Access Token 和 Account ID 转发请求。
@@ -148,15 +149,17 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 4. 将目标 URL 重写到配置的 Codex 或 ChatGPT Base。
 5. 使用选中的 OAuth Access Token 替换 `Authorization`。
 6. 可用时添加 ChatGPT Account ID 和兼容 Header。
-7. 转发前使 HTTP 请求 Body 可重放。
-8. HTTP 上游在客户端响应提交前返回 `401` 时，刷新同一凭据并重试一次。
+7. HTTP 上游在客户端响应提交前返回 `401`，且原始请求 Body 已经可重放时，
+   刷新同一凭据并重试一次。
+8. 不为重试缓冲不可重放的请求，而是仅转发一次。
 9. 转发 HTTP Stream 响应或桥接 WebSocket Frame。
 10. 为托管用户请求采集用量元数据。
 
 正常运行期间，代理会保持已建立的 HTTP Stream。WebSocket 转发使用 Gorilla
 WebSocket，并在上游 Upgrade 路径强制使用 HTTP/1.1 ALPN。服务器关闭或发生
 致命存储故障时，会取消已建立的 Stream 并关闭 WebSocket 两端。OAuth 响应式
-恢复不会切换到其他凭据，也不会在响应提交后重试。
+恢复不会切换到其他凭据，也不会在响应提交后重试。不可重放的请求 Body 会保留
+第一次上游响应，不进行修改。
 
 ## Chat Completions 转换
 

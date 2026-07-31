@@ -81,7 +81,8 @@ For every upstream request:
 7. Coordinate refresh in process by stable credential ID so one effective
    refresh serves concurrent callers for that credential.
 8. Reuse a newer access token when another caller already replaced the token
-   that expired or received `401`.
+   that expired or received `401`, but only while the same stable credential ID
+   still exists.
 9. Refresh an expired credential and reparse account and email claims.
 10. Atomically replace the selected source file after syncing a same-directory
     `0600` temporary file.
@@ -167,9 +168,10 @@ For a whitelisted proxy request:
 4. Rewrite the target URL to the configured Codex or ChatGPT base.
 5. Replace `Authorization` with the selected OAuth access token.
 6. Add the ChatGPT account ID and compatibility headers when available.
-7. Make HTTP request bodies replayable before forwarding.
-8. If an HTTP upstream returns `401` before the client response is committed,
-   refresh the same credential and retry it once.
+7. If an HTTP upstream returns `401` before the client response is committed
+   and the original request body is already replayable, refresh the same
+   credential and retry it once.
+8. Forward non-replayable requests once without buffering them for retry.
 9. Forward HTTP streaming responses or bridge WebSocket frames.
 10. Capture usage metadata for managed user requests.
 
@@ -178,6 +180,7 @@ forwarding uses Gorilla WebSocket and forces HTTP/1.1 ALPN for the upstream
 upgrade path. Server shutdown or a fatal storage failure cancels established
 streams and closes both WebSocket peers. Reactive OAuth recovery does not switch
 to another credential and does not retry after response commitment.
+Non-replayable request bodies keep the first upstream response unchanged.
 
 ## Chat Completions Conversion
 

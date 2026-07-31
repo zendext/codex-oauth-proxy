@@ -18,8 +18,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -179,22 +177,7 @@ func matchingAuth(auths []*Auth, target *Auth) *Auth {
 			return auth
 		}
 	}
-	for _, auth := range auths {
-		if authHasSource(auth, target.Path) {
-			return auth
-		}
-	}
 	return nil
-}
-
-func authHasSource(auth *Auth, path string) bool {
-	if auth == nil || strings.TrimSpace(path) == "" {
-		return false
-	}
-	if auth.Path == path {
-		return true
-	}
-	return slices.Contains(auth.SourcePaths, path)
 }
 
 type Server struct {
@@ -944,13 +927,6 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 		s.proxyCodexWebSocket(w, r, route, authorization, auth)
 		return
 	}
-	cleanupBody, err := ensureReplayableRequestBody(r)
-	if err != nil {
-		s.debugf("proxy request body unavailable for retry method=%s path=%s error=%q", r.Method, r.URL.Path, err.Error())
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	defer cleanupBody()
 	metadata := captureProxyRequestUsageMetadata(r)
 	s.debugf(
 		"proxy upstream request method=%s path=%s target_scheme=%s target_host=%s target_path=%s websocket=%t allow_upstream_auth=%t auth_id=%s account_id_present=%t",
@@ -1044,6 +1020,16 @@ func (s *Server) retryUnauthorizedProxyResponse(resp *http.Response, incoming *h
 	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		return nil
 	}
+	retryReq, err := cloneRequestForRetry(resp.Request)
+	if err != nil {
+		s.debugf(
+			"proxy upstream unauthorized method=%s path=%s auth_id=%s action=skip_retry reason=request_not_replayable",
+			incoming.Method,
+			incoming.URL.Path,
+			auth.ID,
+		)
+		return nil
+	}
 	failedAccessToken := auth.AccessToken
 	refreshCtx := incoming.Context()
 	if resp.Request != nil {
@@ -1058,11 +1044,10 @@ func (s *Server) retryUnauthorizedProxyResponse(resp *http.Response, incoming *h
 	)
 	refreshed := cloneAuth(auth)
 	if err := s.auths.RefreshAfterUnauthorized(refreshCtx, refreshed, failedAccessToken); err != nil {
+		if retryReq.Body != nil {
+			_ = retryReq.Body.Close()
+		}
 		return &upstreamAuthRefreshError{err: err}
-	}
-	retryReq, err := cloneRequestForRetry(resp.Request)
-	if err != nil {
-		return &upstreamAuthRefreshError{err: newOAuthRefreshError("request replay failed", 0, "", err)}
 	}
 	applyCodexProxyHeaders(retryReq, incoming, refreshed, s.cfg, route.responsesWebsocket)
 	retryResp, err := s.httpClient.Transport.RoundTrip(retryReq)
@@ -1072,45 +1057,6 @@ func (s *Server) retryUnauthorizedProxyResponse(resp *http.Response, incoming *h
 	*resp = *retryResp
 	copyAuth(auth, refreshed)
 	return nil
-}
-
-func ensureReplayableRequestBody(r *http.Request) (func(), error) {
-	if r == nil || r.Body == nil || r.Body == http.NoBody || r.GetBody != nil {
-		return func() {}, nil
-	}
-	temp, err := os.CreateTemp("", "codex-oauth-proxy-request-*")
-	if err != nil {
-		return nil, err
-	}
-	tempPath := temp.Name()
-	cleanup := func() {
-		_ = temp.Close()
-		_ = os.Remove(tempPath)
-	}
-	if err = temp.Chmod(0o600); err != nil {
-		cleanup()
-		return nil, err
-	}
-	size, err := io.Copy(temp, r.Body)
-	errCloseBody := r.Body.Close()
-	if err != nil {
-		cleanup()
-		return nil, err
-	}
-	if errCloseBody != nil {
-		cleanup()
-		return nil, errCloseBody
-	}
-	if _, err = temp.Seek(0, io.SeekStart); err != nil {
-		cleanup()
-		return nil, err
-	}
-	r.Body = temp
-	r.ContentLength = size
-	r.GetBody = func() (io.ReadCloser, error) {
-		return os.Open(tempPath)
-	}
-	return cleanup, nil
 }
 
 func cloneRequestForRetry(req *http.Request) (*http.Request, error) {

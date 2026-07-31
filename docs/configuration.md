@@ -116,16 +116,19 @@ reconciliation and excluded.
 A credential expiring within five minutes is refreshed before use. Refreshes
 are coordinated in process by stable credential identity, so concurrent callers
 reuse one completed refresh or a newer token that already replaced their old
-token. Each refresh has a 30-second overall deadline and up to three attempts,
-with retries limited to transient network failures and HTTP `408`, `429`,
-`500`, `502`, `503`, and `504`. Valid `Retry-After` values are bounded by that
-deadline.
+token while that same stable identity still exists. Replacing a source path with
+another account does not attach stale requests to the replacement credential.
+Each refresh has a 30-second overall deadline and up to three attempts, with
+retries limited to transient network failures and HTTP `408`, `429`, `500`,
+`502`, `503`, and `504`. Valid `Retry-After` values are bounded by that deadline.
 
 Updated tokens are written through a same-directory `0600` temporary file,
 synced, and atomically renamed over the selected source file. Account and email
 claims are reparsed before persistence. An HTTP upstream `401` can trigger one
-same-credential refresh and one retry before the client response is committed;
-it does not trigger cross-credential failover.
+same-credential refresh and one retry before the client response is committed
+when the original request is already replayable. Non-replayable request bodies
+are forwarded once without disk buffering. Reactive refresh does not trigger
+cross-credential failover.
 
 ## Managed Users and Database
 
