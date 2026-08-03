@@ -149,12 +149,12 @@ SQLite 只持久化显式配额恢复 Deadline、`invalid_grant` 和刷新后继
 同账户 Token 更新和进程重启后仍然保留。
 
 跨凭据重试只适用于只读 `GET`/`HEAD`、JSON `/v1/chat/completions`、
-Responses、Responses Compact、Alpha Search、JSON Image Generation、
-Trace Summarization，以及 Upgrade 成功前的 Responses WebSocket Handshake。
-可重放 Body 只在内存中缓冲，最大包含 32 MiB。未知长度、更大、Multipart、
-文件、Realtime、具有副作用的 Wham、Hosted MCP 和未知写请求只转发一次，不会
-仅因无法重放而被拒绝。符合条件的缓冲请求在模糊网络故障后可能重复执行；这是
-为了可用性而接受的极少量重复生成或重复计费风险。
+`/v1/zed/edit-predictions`、Responses、Responses Compact、Alpha Search、
+JSON Image Generation、Trace Summarization，以及 Upgrade 成功前的 Responses
+WebSocket Handshake。可重放 Body 只在内存中缓冲，最大包含 32 MiB。未知长度、
+更大、Multipart、文件、Realtime、具有副作用的 Wham、Hosted MCP 和未知写请求
+只转发一次，不会仅因无法重放而被拒绝。符合条件的缓冲请求在模糊网络故障后
+可能重复执行；这是为了可用性而接受的极少量重复生成或重复计费风险。
 
 ## 运行时模型目录
 

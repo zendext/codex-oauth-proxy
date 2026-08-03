@@ -12,6 +12,7 @@ Codex 请求。
 ## 功能
 
 - 代理 Codex CLI 和受支持的 OpenAI 兼容请求。
+- 为 Qwen FIM Prompt 提供专用 Zed Edit Prediction 端点。
 - 为代理用户管理 `cop_...` API Key。
 - 使用健康感知的 Codex OAuth 故障转移、冷却和协调 Token 刷新。
 - 持久化租户范围的会话亲和性，不存储原始会话标识符。

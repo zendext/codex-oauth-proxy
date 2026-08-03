@@ -693,7 +693,7 @@ func requestReplayCandidate(r *http.Request) bool {
 		return false
 	}
 
-	allowed := path == "/v1/chat/completions"
+	allowed := path == "/v1/chat/completions" || path == zedEditPredictionsPath
 	if suffix, ok := codexEndpointSuffix(path); ok {
 		switch suffix {
 		case "/responses", "/responses/compact", "/alpha/search", "/memories/trace_summarize":

@@ -172,14 +172,15 @@ an unexpired explicit quota deadline survives same-account token updates and
 process restarts.
 
 Cross-credential retry is limited to read-only `GET`/`HEAD`, JSON
-`/v1/chat/completions`, Responses, Responses compact, alpha search, JSON image
-generation, trace summarization, and the Responses WebSocket handshake before
-upgrade. Replayable bodies are buffered in memory only, up to and including
-32 MiB. Unknown-length, larger, multipart, file, realtime, side-effecting wham,
-hosted MCP, and unknown write requests are forwarded once without being
-rejected merely because replay is unavailable. Eligible buffered requests may
-be repeated after an ambiguous network failure, which accepts a rare duplicate
-generation or billing risk in favor of availability.
+`/v1/chat/completions`, `/v1/zed/edit-predictions`, Responses, Responses
+compact, alpha search, JSON image generation, trace summarization, and the
+Responses WebSocket handshake before upgrade. Replayable bodies are buffered in
+memory only, up to and including 32 MiB. Unknown-length, larger, multipart,
+file, realtime, side-effecting wham, hosted MCP, and unknown write requests are
+forwarded once without being rejected merely because replay is unavailable.
+Eligible buffered requests may be repeated after an ambiguous network failure,
+which accepts a rare duplicate generation or billing risk in favor of
+availability.
 
 ## Runtime Model Catalogs
 

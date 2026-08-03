@@ -12,6 +12,7 @@ credentials from Codex CLI.
 ## Features
 
 - Proxies Codex CLI and supported OpenAI-compatible requests.
+- Provides a focused Zed Edit Prediction endpoint for Qwen FIM prompts.
 - Manages `cop_...` API keys for proxy users.
 - Uses health-aware Codex OAuth failover, cooldowns, and coordinated token refresh.
 - Persists tenant-scoped session affinity without storing raw session identifiers.
