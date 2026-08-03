@@ -667,7 +667,9 @@ compatibility contract, not a generic `/v1/completions` endpoint.
 
 The request must use `Content-Type: application/json` and include:
 
-- `model`: exactly `gpt-5.6-luna`.
+- `model`: a non-empty model identifier of at most 128 bytes. Surrounding ASCII
+  spaces are removed, and the remaining value may contain letters, digits,
+  `.`, `-`, `_`, `/`, `:`, and `@`.
 - `prompt`: exactly one ordered Qwen FIM sequence:
 
   ```text
@@ -710,6 +712,11 @@ and aggregates the upstream SSE before returning:
   }
 }
 ```
+
+The example uses `gpt-5.6-luna`, but the endpoint does not maintain its own
+model allowlist. Runtime catalog capability filtering, credential selection and
+failover, and upstream failure classification determine whether the normalized
+requested model is available.
 
 `response.completed` returns `finish_reason: "stop"` unless a local output
 budget truncates first. `response.incomplete` maps max-token reasons to

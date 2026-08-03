@@ -389,14 +389,16 @@ translation engine.
 `/v1/zed/edit-predictions` is another focused local conversion:
 
 1. Authenticate only with a managed user API key and require JSON `POST`.
-2. Validate `gpt-5.6-luna`, a positive `max_tokens` from 1 through 4096, and
-   exactly one ordered Qwen
+2. Normalize and validate the requested model with the shared safe model
+   identifier rules, validate a positive `max_tokens` from 1 through 4096, and
+   require exactly one ordered Qwen
    `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>` sequence.
 3. Build a tool-free Responses request with low reasoning effort, `stream:
    true`, `store: false`, and separate prefix and suffix input text.
 4. Use the same health-aware executor, model capability filtering, retry,
    session affinity, active-connection tracking, and managed usage accounting
-   as other replayable Codex requests.
+   as other replayable Codex requests. The endpoint has no model allowlist;
+   runtime catalog support and upstream failures decide availability.
 5. Require one valid `response.completed` or `response.incomplete` terminal,
    reject tool output and malformed or missing terminal state, and aggregate
    text and terminal usage before committing the client response.
@@ -407,6 +409,7 @@ translation engine.
    reasons and local budget truncation use `finish_reason: "length"`;
    content filtering uses `content_filter`.
 
+The getting-started configuration uses `gpt-5.6-luna` as an initial example.
 The local output cap counts Unicode code points. The route does not create a
 generic `/v1/completions` contract and does not alter `/v1/chat/completions`.
 

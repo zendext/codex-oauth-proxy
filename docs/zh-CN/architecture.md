@@ -322,12 +322,14 @@ Upgrade 成功后不会重试。不可重放的请求 Body 会保留第一次上
 `/v1/zed/edit-predictions` 是另一个专用本地转换端点：
 
 1. 只接受托管用户 API Key 认证和 JSON `POST`。
-2. 校验 `gpt-5.6-luna`、1 到 4096 的正整数 `max_tokens`，以及恰好一个有序
-   Qwen `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>` 序列。
+2. 使用共享安全模型标识符规则规范化并校验请求模型，校验 1 到 4096 的正整数
+   `max_tokens`，并要求恰好一个有序 Qwen
+   `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>` 序列。
 3. 构造不带 Tool、使用低 Reasoning Effort、`stream: true`、`store: false`
    且分别包含 Prefix 和 Suffix 文本的 Responses 请求。
 4. 与其他可重放 Codex 请求共用健康感知执行器、模型能力筛选、重试、
-   Session Affinity、活动连接计数和托管用量记录。
+   Session Affinity、活动连接计数和托管用量记录。该端点不维护模型 Allowlist；
+   运行时目录支持和上游失败决定模型是否可用。
 5. 要求一个有效的 `response.completed` 或 `response.incomplete` 终态；拒绝
    Tool Output、畸形 Event 或缺失终态，并在提交客户端响应前聚合文本和终态用量。
 6. 在本地应用 Stop 匹配和输出预算，不向上游转发 Sampling 或 Token Limit 字段。
@@ -336,8 +338,9 @@ Upgrade 成功后不会重试。不可重放的请求 Body 会保留第一次上
    不完整或本地预算截断时使用 `finish_reason: "length"`；内容过滤使用
    `content_filter`。
 
-本地输出上限按 Unicode Code Point 计数。该路由不会建立通用
-`/v1/completions` 契约，也不会改变 `/v1/chat/completions`。
+Getting Started 配置将 `gpt-5.6-luna` 作为初始示例。本地输出上限按 Unicode
+Code Point 计数。该路由不会建立通用 `/v1/completions` 契约，也不会改变
+`/v1/chat/completions`。
 
 ## 托管用户数据模型
 

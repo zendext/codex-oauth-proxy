@@ -632,7 +632,8 @@ Provider 发出的 Completion 请求形状。它是专用兼容契约，不是�
 
 请求必须使用 `Content-Type: application/json`，并包含：
 
-- `model`：必须恰好为 `gpt-5.6-luna`。
+- `model`：非空且最多 128 字节的模型标识符。服务器会移除首尾 ASCII 空格，
+  剩余值只允许字母、数字、`.`、`-`、`_`、`/`、`:` 和 `@`。
 - `prompt`：必须恰好包含一个有序 Qwen FIM 序列：
 
   ```text
@@ -673,6 +674,9 @@ Marker 缺失、重复、顺序错误、前面存在其他文本或后面存在�
   }
 }
 ```
+
+示例使用 `gpt-5.6-luna`，但该端点不维护自己的模型 Allowlist。规范化请求模型
+是否可用，由运行时目录能力筛选、凭据选择和故障转移以及上游失败分类决定。
 
 `response.completed` 返回 `finish_reason: "stop"`，除非本地输出预算先截断。
 `response.incomplete` 将最大 Token 原因映射为 `length`，将内容过滤映射为

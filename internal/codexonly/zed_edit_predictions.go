@@ -14,7 +14,6 @@ import (
 
 const (
 	zedEditPredictionsPath        = "/v1/zed/edit-predictions"
-	zedEditPredictionModel        = "gpt-5.6-luna"
 	defaultZedEditPredictionLimit = 256
 	maxZedEditPredictionLimit     = 4096
 	qwenFIMPrefixMarker           = "<|fim_prefix|>"
@@ -187,12 +186,13 @@ func decodeZedEditPredictionRequest(r *http.Request) (zedEditPredictionConversio
 		return zedEditPredictionConversion{}, fmt.Errorf("invalid JSON request body")
 	}
 
-	model, ok := raw["model"].(string)
-	if !ok || model == "" {
+	modelValue, ok := raw["model"].(string)
+	if !ok {
 		return zedEditPredictionConversion{}, fmt.Errorf("missing or invalid required field: model")
 	}
-	if model != zedEditPredictionModel {
-		return zedEditPredictionConversion{}, fmt.Errorf("unsupported model")
+	model, ok := normalizeModelIdentifier(modelValue)
+	if !ok {
+		return zedEditPredictionConversion{}, fmt.Errorf("missing or invalid required field: model")
 	}
 	prompt, ok := raw["prompt"].(string)
 	if !ok {

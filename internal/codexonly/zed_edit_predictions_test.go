@@ -48,11 +48,12 @@ func TestZedEditPredictionsConvertsAndAggregates(t *testing.T) {
 			`{"type":"response.output_text.delta","delta":"你好"}`,
 			`{"type":"response.output_text.delta","delta":"🙂E"}`,
 			`{"type":"response.output_text.delta","delta":"NDhidden"}`,
-			`{"type":"response.completed","response":{"id":"resp_zed","model":"gpt-5.6-luna","usage":{"input_tokens":5,"output_tokens":4,"total_tokens":9}}}`,
+			`{"type":"response.completed","response":{"id":"resp_zed","model":"gpt-5.4","usage":{"input_tokens":5,"output_tokens":4,"total_tokens":9}}}`,
 		)
 	}, nil)
 
-	body := strings.Replace(validZedEditPredictionBody, `["<|endoftext|>"]`, `"🙂END"`, 1)
+	body := strings.Replace(validZedEditPredictionBody, `"gpt-5.6-luna"`, `"gpt-5.4"`, 1)
+	body = strings.Replace(body, `["<|endoftext|>"]`, `"🙂END"`, 1)
 	resp := doJSONRequest(t, server, http.MethodPost, "/v1/zed/edit-predictions", body, apiKey)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
@@ -62,8 +63,8 @@ func TestZedEditPredictionsConvertsAndAggregates(t *testing.T) {
 	if !strings.HasPrefix(payload.ID, "cmpl_") {
 		t.Fatalf("id = %q, want cmpl_ prefix", payload.ID)
 	}
-	if payload.Object != "text_completion" || payload.Model != "gpt-5.6-luna" {
-		t.Fatalf("response identity = %q/%q, want text_completion/gpt-5.6-luna", payload.Object, payload.Model)
+	if payload.Object != "text_completion" || payload.Model != "gpt-5.4" {
+		t.Fatalf("response identity = %q/%q, want text_completion/gpt-5.4", payload.Object, payload.Model)
 	}
 	if payload.Created <= 0 {
 		t.Fatalf("created = %d, want positive Unix timestamp", payload.Created)
@@ -84,7 +85,7 @@ func TestZedEditPredictionsConvertsAndAggregates(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 1", upstreamCalls.Load())
 	}
 
-	if upstreamRequest["model"] != "gpt-5.6-luna" ||
+	if upstreamRequest["model"] != "gpt-5.4" ||
 		upstreamRequest["stream"] != true ||
 		upstreamRequest["store"] != false {
 		t.Fatalf("upstream request basics = %#v", upstreamRequest)
@@ -110,6 +111,36 @@ func TestZedEditPredictionsConvertsAndAggregates(t *testing.T) {
 	waitForUsageTotal(t, server, apiKey, 9)
 }
 
+func TestZedEditPredictionsNormalizesModelIdentifier(t *testing.T) {
+	var upstreamModel string
+	server, apiKey := newZedEditPredictionTestServer(t, []zedTestAuth{
+		{accountID: "acct_1", accessToken: "access-1"},
+	}, func(w http.ResponseWriter, r *http.Request) {
+		var upstreamRequest map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		upstreamModel, _ = upstreamRequest["model"].(string)
+		writeChatUpstreamSSE(w,
+			`{"type":"response.completed","response":{"id":"resp_normalized","model":"upstream-model"}}`,
+		)
+	}, nil)
+
+	body := strings.Replace(validZedEditPredictionBody, `"gpt-5.6-luna"`, `"  gpt-5.4  "`, 1)
+	resp := doJSONRequest(t, server, http.MethodPost, "/v1/zed/edit-predictions", body, apiKey)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+	}
+	var payload zedEditPredictionTestResponse
+	decodeResponse(t, resp, &payload)
+	if upstreamModel != "gpt-5.4" {
+		t.Fatalf("upstream model = %q, want normalized gpt-5.4", upstreamModel)
+	}
+	if payload.Model != "gpt-5.4" {
+		t.Fatalf("response model = %q, want normalized gpt-5.4", payload.Model)
+	}
+}
+
 func TestZedEditPredictionsRejectsInvalidRequestsBeforeUpstream(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	server, apiKey := newZedEditPredictionTestServer(t, []zedTestAuth{
@@ -129,7 +160,10 @@ func TestZedEditPredictionsRejectsInvalidRequestsBeforeUpstream(t *testing.T) {
 		{name: "trailing JSON", body: validZedEditPredictionBody + `{}`},
 		{name: "missing model", body: `{"prompt":"<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>"}`},
 		{name: "invalid model type", body: `{"model":1,"prompt":"<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>"}`},
-		{name: "unsupported model", body: `{"model":"gpt-5.6","prompt":"<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>"}`},
+		{name: "empty model", body: `{"model":"   ","prompt":"<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>"}`},
+		{name: "control in model", body: `{"model":"gpt-5.4\nsecret","prompt":"<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>"}`},
+		{name: "illegal character in model", body: `{"model":"gpt-5.4?","prompt":"<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>"}`},
+		{name: "oversized model", body: `{"model":"` + strings.Repeat("m", maxModelIdentifierBytes+1) + `","prompt":"<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>"}`},
 		{name: "missing prompt", body: `{"model":"gpt-5.6-luna"}`},
 		{name: "missing prefix", body: `{"model":"gpt-5.6-luna","prompt":"a<|fim_suffix|>b<|fim_middle|>"}`},
 		{name: "missing suffix", body: `{"model":"gpt-5.6-luna","prompt":"<|fim_prefix|>ab<|fim_middle|>"}`},
@@ -174,6 +208,33 @@ func TestZedEditPredictionsRejectsInvalidRequestsBeforeUpstream(t *testing.T) {
 	if upstreamCalls.Load() != 0 {
 		t.Fatalf("upstream calls = %d, want 0 for invalid requests", upstreamCalls.Load())
 	}
+}
+
+func TestZedEditPredictionsDefersUnknownModelSupportToUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	server, apiKey := newZedEditPredictionTestServer(t, []zedTestAuth{
+		{accountID: "acct_1", accessToken: "access-1"},
+	}, func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		writeChatUpstreamSSE(w,
+			`{"type":"response.failed","response":{"error":{"type":"invalid_request_error","code":"model_not_supported","message":"unsupported"}}}`,
+		)
+	}, func(cfg *Config) {
+		cfg.RequestRetry = 0
+		cfg.requestRetrySet = true
+		cfg.MaxRetryInterval = 0
+		cfg.maxRetryIntervalSet = true
+	})
+
+	body := strings.Replace(validZedEditPredictionBody, `"gpt-5.6-luna"`, `"future-codex-model"`, 1)
+	resp := doJSONRequest(t, server, http.MethodPost, "/v1/zed/edit-predictions", body, apiKey)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want upstream model 404, body: %s", resp.Code, resp.Body.String())
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstreamCalls.Load())
+	}
+	assertSafeErrorResponse(t, resp)
 }
 
 func TestZedEditPredictionsRouteScope(t *testing.T) {
