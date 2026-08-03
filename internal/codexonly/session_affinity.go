@@ -42,18 +42,20 @@ type sessionAffinitySignal struct {
 type SessionAffinityDigest string
 
 type SessionAffinityBinding struct {
-	Digests       []SessionAffinityDigest
-	BindingDigest SessionAffinityDigest
-	AuthID        string
+	Digests           []SessionAffinityDigest
+	BindingDigest     SessionAffinityDigest
+	TenantScopeDigest SessionAffinityDigest
+	AuthID            string
 }
 
 type sessionAffinityRow struct {
-	Digest        SessionAffinityDigest
-	BindingDigest SessionAffinityDigest
-	AuthID        string
-	Created       time.Time
-	Updated       time.Time
-	Expires       time.Time
+	Digest            SessionAffinityDigest
+	BindingDigest     SessionAffinityDigest
+	TenantScopeDigest SessionAffinityDigest
+	AuthID            string
+	Created           time.Time
+	Updated           time.Time
+	Expires           time.Time
 }
 
 type replayReadCloser struct {
@@ -740,6 +742,15 @@ func digestSessionAffinitySignals(tenantScope string, signals []sessionAffinityS
 	return digests
 }
 
+func sessionAffinityTenantScopeDigest(tenantScope string) SessionAffinityDigest {
+	tenantScope = strings.TrimSpace(tenantScope)
+	if tenantScope == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(tenantScope))
+	return SessionAffinityDigest(hex.EncodeToString(sum[:]))
+}
+
 func digestSessionAffinitySignal(tenantScope string, signal sessionAffinitySignal) SessionAffinityDigest {
 	tenantScope = strings.TrimSpace(tenantScope)
 	value, ok := normalizeSessionAffinitySignal(signal.Value)
@@ -756,6 +767,22 @@ func digestSessionAffinitySignal(tenantScope string, signal sessionAffinitySigna
 }
 
 func (s *UserStore) LookupSessionAffinity(ctx context.Context, digests []SessionAffinityDigest) (SessionAffinityBinding, bool, error) {
+	return s.lookupSessionAffinity(ctx, "", digests)
+}
+
+func (s *UserStore) LookupScopedSessionAffinity(
+	ctx context.Context,
+	tenantScope string,
+	digests []SessionAffinityDigest,
+) (SessionAffinityBinding, bool, error) {
+	return s.lookupSessionAffinity(ctx, sessionAffinityTenantScopeDigest(tenantScope), digests)
+}
+
+func (s *UserStore) lookupSessionAffinity(
+	ctx context.Context,
+	tenantScopeDigest SessionAffinityDigest,
+	digests []SessionAffinityDigest,
+) (SessionAffinityBinding, bool, error) {
 	if err := s.checkReady(); err != nil {
 		return SessionAffinityBinding{}, false, err
 	}
@@ -772,21 +799,43 @@ func (s *UserStore) LookupSessionAffinity(ctx context.Context, digests []Session
 	if !ok {
 		return SessionAffinityBinding{}, false, nil
 	}
-	if sessionAffinityNeedsWrite(rows, digests, winner, now) {
-		binding, found, errRefresh := s.refreshSessionAffinity(ctx, digests)
+	if winner.TenantScopeDigest == "" && tenantScopeDigest != "" {
+		winner.TenantScopeDigest = tenantScopeDigest
+	}
+	if sessionAffinityNeedsWrite(rows, digests, winner, tenantScopeDigest, now) {
+		binding, found, errRefresh := s.refreshSessionAffinity(ctx, tenantScopeDigest, digests)
 		if errRefresh != nil {
 			return SessionAffinityBinding{}, false, errRefresh
 		}
 		return binding, found, nil
 	}
 	return SessionAffinityBinding{
-		Digests:       sessionAffinityRowDigests(rows, digests),
-		BindingDigest: winner.BindingDigest,
-		AuthID:        winner.AuthID,
+		Digests:           sessionAffinityRowDigests(rows, digests),
+		BindingDigest:     winner.BindingDigest,
+		TenantScopeDigest: winner.TenantScopeDigest,
+		AuthID:            winner.AuthID,
 	}, true, nil
 }
 
 func (s *UserStore) BindSessionAffinity(ctx context.Context, digests []SessionAffinityDigest, candidateAuthID string) (SessionAffinityBinding, error) {
+	return s.bindSessionAffinity(ctx, "", digests, candidateAuthID)
+}
+
+func (s *UserStore) BindScopedSessionAffinity(
+	ctx context.Context,
+	tenantScope string,
+	digests []SessionAffinityDigest,
+	candidateAuthID string,
+) (SessionAffinityBinding, error) {
+	return s.bindSessionAffinity(ctx, sessionAffinityTenantScopeDigest(tenantScope), digests, candidateAuthID)
+}
+
+func (s *UserStore) bindSessionAffinity(
+	ctx context.Context,
+	tenantScopeDigest SessionAffinityDigest,
+	digests []SessionAffinityDigest,
+	candidateAuthID string,
+) (SessionAffinityBinding, error) {
 	if err := s.checkReady(); err != nil {
 		return SessionAffinityBinding{}, err
 	}
@@ -810,12 +859,16 @@ func (s *UserStore) BindSessionAffinity(ctx context.Context, digests []SessionAf
 	winner, ok := chooseSessionAffinityWinner(rows, now)
 	if !ok {
 		winner = sessionAffinityRow{
-			BindingDigest: canonicalSessionAffinityDigest(allDigests),
-			AuthID:        candidateAuthID,
-			Created:       now,
-			Updated:       now,
-			Expires:       now.Add(sessionAffinityExpiry),
+			BindingDigest:     canonicalSessionAffinityDigest(allDigests),
+			TenantScopeDigest: tenantScopeDigest,
+			AuthID:            candidateAuthID,
+			Created:           now,
+			Updated:           now,
+			Expires:           now.Add(sessionAffinityExpiry),
 		}
+	}
+	if winner.TenantScopeDigest == "" && tenantScopeDigest != "" {
+		winner.TenantScopeDigest = tenantScopeDigest
 	}
 	if err = writeSessionAffinityAliases(ctx, tx, allDigests, winner, now); err != nil {
 		return SessionAffinityBinding{}, s.databaseError("write session affinity binding", err)
@@ -824,9 +877,10 @@ func (s *UserStore) BindSessionAffinity(ctx context.Context, digests []SessionAf
 		return SessionAffinityBinding{}, s.databaseError("commit session affinity binding", err)
 	}
 	return SessionAffinityBinding{
-		Digests:       allDigests,
-		BindingDigest: winner.BindingDigest,
-		AuthID:        winner.AuthID,
+		Digests:           allDigests,
+		BindingDigest:     winner.BindingDigest,
+		TenantScopeDigest: winner.TenantScopeDigest,
+		AuthID:            winner.AuthID,
 	}, nil
 }
 
@@ -857,16 +911,20 @@ func (s *UserStore) RebindSessionAffinity(ctx context.Context, binding SessionAf
 	switch {
 	case !ok:
 		winner = sessionAffinityRow{
-			BindingDigest: canonicalSessionAffinityDigest(allDigests),
-			AuthID:        candidateAuthID,
-			Created:       now,
-			Updated:       now,
-			Expires:       now.Add(sessionAffinityExpiry),
+			BindingDigest:     canonicalSessionAffinityDigest(allDigests),
+			TenantScopeDigest: binding.TenantScopeDigest,
+			AuthID:            candidateAuthID,
+			Created:           now,
+			Updated:           now,
+			Expires:           now.Add(sessionAffinityExpiry),
 		}
 	case winner.AuthID == expectedAuthID:
 		winner.AuthID = candidateAuthID
 		winner.Updated = now
 		winner.Expires = now.Add(sessionAffinityExpiry)
+	}
+	if winner.TenantScopeDigest == "" && binding.TenantScopeDigest != "" {
+		winner.TenantScopeDigest = binding.TenantScopeDigest
 	}
 	if err = writeSessionAffinityAliases(ctx, tx, allDigests, winner, now); err != nil {
 		return SessionAffinityBinding{}, s.databaseError("write rebound session affinity", err)
@@ -875,9 +933,10 @@ func (s *UserStore) RebindSessionAffinity(ctx context.Context, binding SessionAf
 		return SessionAffinityBinding{}, s.databaseError("commit rebound session affinity", err)
 	}
 	return SessionAffinityBinding{
-		Digests:       allDigests,
-		BindingDigest: winner.BindingDigest,
-		AuthID:        winner.AuthID,
+		Digests:           allDigests,
+		BindingDigest:     winner.BindingDigest,
+		TenantScopeDigest: winner.TenantScopeDigest,
+		AuthID:            winner.AuthID,
 	}, nil
 }
 
@@ -932,6 +991,150 @@ func (s *UserStore) DeleteSessionAffinityExceptAuthIDs(ctx context.Context, auth
 	return deleted, nil
 }
 
+func (s *UserStore) CountSessionAffinityBindingsByAuthIDs(
+	ctx context.Context,
+	authIDs []string,
+) (map[string]int64, error) {
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
+	authIDs = normalizeStrings(authIDs)
+	counts := make(map[string]int64, len(authIDs))
+	if len(authIDs) == 0 {
+		return counts, nil
+	}
+	args := make([]any, 0, len(authIDs)+1)
+	for _, authID := range authIDs {
+		args = append(args, authID)
+	}
+	args = append(args, formatDBTime(s.storeNow()))
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT auth_id, COUNT(DISTINCT binding_digest)
+		 FROM session_affinity_bindings
+		 WHERE auth_id IN (`+sqlPlaceholders(len(authIDs))+`) AND expires_at > ?
+		 GROUP BY auth_id`,
+		args...,
+	)
+	if err != nil {
+		return nil, s.databaseError("count auth session affinity bindings", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var authID string
+		var count int64
+		if err = rows.Scan(&authID, &count); err != nil {
+			return nil, s.databaseError("scan auth session affinity count", err)
+		}
+		counts[authID] = count
+	}
+	if err = rows.Err(); err != nil {
+		return nil, s.databaseError("read auth session affinity counts", err)
+	}
+	return counts, nil
+}
+
+func (s *UserStore) DeleteSessionAffinityByTenantScope(ctx context.Context, tenantScope string) (int64, error) {
+	tenantScopeDigest := sessionAffinityTenantScopeDigest(tenantScope)
+	if tenantScopeDigest == "" {
+		return 0, ErrInvalidInput
+	}
+	return s.deleteSessionAffinityBindings(
+		ctx,
+		"tenant_scope_digest = ?",
+		[]any{tenantScopeDigest},
+	)
+}
+
+func (s *UserStore) DeleteSessionAffinityByTenantSession(
+	ctx context.Context,
+	tenantScope string,
+	rawSessionKey string,
+) (int64, error) {
+	tenantScopeDigest := sessionAffinityTenantScopeDigest(tenantScope)
+	value, ok := normalizeSessionAffinitySignal(rawSessionKey)
+	if tenantScopeDigest == "" || !ok {
+		return 0, ErrInvalidInput
+	}
+	digests := digestSessionAffinitySignals(tenantScope, []sessionAffinitySignal{
+		{Kind: sessionAffinitySignalSessionID, Value: value},
+		{Kind: sessionAffinitySignalPromptCacheKey, Value: value},
+		{Kind: sessionAffinitySignalConversationID, Value: value},
+	})
+	args := make([]any, 0, len(digests)+1)
+	args = append(args, tenantScopeDigest)
+	for _, digest := range digests {
+		args = append(args, digest)
+	}
+	where := `tenant_scope_digest = ? AND binding_digest IN (
+		SELECT binding_digest
+		FROM session_affinity_bindings
+		WHERE tenant_scope_digest = ? AND session_digest IN (` + sqlPlaceholders(len(digests)) + `)
+	)`
+	deleteArgs := make([]any, 0, len(args)+1)
+	deleteArgs = append(deleteArgs, tenantScopeDigest)
+	deleteArgs = append(deleteArgs, args...)
+	return s.deleteSessionAffinityBindingsWithArgs(
+		ctx,
+		`tenant_scope_digest = ? AND session_digest IN (`+sqlPlaceholders(len(digests))+`)`,
+		args,
+		where,
+		deleteArgs,
+	)
+}
+
+func (s *UserStore) DeleteSessionAffinityByAccountID(ctx context.Context, authID string) (int64, error) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0, ErrInvalidInput
+	}
+	return s.deleteSessionAffinityBindings(ctx, "auth_id = ?", []any{authID})
+}
+
+func (s *UserStore) deleteSessionAffinityBindings(
+	ctx context.Context,
+	where string,
+	args []any,
+) (int64, error) {
+	return s.deleteSessionAffinityBindingsWithArgs(ctx, where, args, where, args)
+}
+
+func (s *UserStore) deleteSessionAffinityBindingsWithArgs(
+	ctx context.Context,
+	countWhere string,
+	countArgs []any,
+	deleteWhere string,
+	deleteArgs []any,
+) (int64, error) {
+	if err := s.checkReady(); err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, s.databaseError("begin clear session affinity", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	var count int64
+	if err = tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(DISTINCT binding_digest) FROM session_affinity_bindings WHERE `+countWhere,
+		countArgs...,
+	).Scan(&count); err != nil {
+		return 0, s.databaseError("count cleared session affinity", err)
+	}
+	if _, err = tx.ExecContext(
+		ctx,
+		`DELETE FROM session_affinity_bindings WHERE `+deleteWhere,
+		deleteArgs...,
+	); err != nil {
+		return 0, s.databaseError("clear session affinity", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, s.databaseError("commit cleared session affinity", err)
+	}
+	return count, nil
+}
+
 func (s *UserStore) CleanupExpiredSessionAffinity(ctx context.Context, limit int) (int64, error) {
 	if err := s.checkReady(); err != nil {
 		return 0, err
@@ -981,7 +1184,11 @@ func (s *UserStore) maybeCleanupExpiredSessionAffinity(ctx context.Context) erro
 	return nil
 }
 
-func (s *UserStore) refreshSessionAffinity(ctx context.Context, digests []SessionAffinityDigest) (SessionAffinityBinding, bool, error) {
+func (s *UserStore) refreshSessionAffinity(
+	ctx context.Context,
+	tenantScopeDigest SessionAffinityDigest,
+	digests []SessionAffinityDigest,
+) (SessionAffinityBinding, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return SessionAffinityBinding{}, false, s.databaseError("begin refresh session affinity", err)
@@ -998,6 +1205,9 @@ func (s *UserStore) refreshSessionAffinity(ctx context.Context, digests []Sessio
 	if !ok {
 		return SessionAffinityBinding{}, false, nil
 	}
+	if winner.TenantScopeDigest == "" && tenantScopeDigest != "" {
+		winner.TenantScopeDigest = tenantScopeDigest
+	}
 	if !winner.Updated.Add(sessionAffinityRenewalThreshold).After(now) {
 		winner.Updated = now
 		winner.Expires = now.Add(sessionAffinityExpiry)
@@ -1009,9 +1219,10 @@ func (s *UserStore) refreshSessionAffinity(ctx context.Context, digests []Sessio
 		return SessionAffinityBinding{}, false, s.databaseError("commit refreshed session affinity", err)
 	}
 	return SessionAffinityBinding{
-		Digests:       allDigests,
-		BindingDigest: winner.BindingDigest,
-		AuthID:        winner.AuthID,
+		Digests:           allDigests,
+		BindingDigest:     winner.BindingDigest,
+		TenantScopeDigest: winner.TenantScopeDigest,
+		AuthID:            winner.AuthID,
 	}, true, nil
 }
 
@@ -1073,7 +1284,7 @@ func readSessionAffinityRows(
 	}
 	rows, err := queryer.QueryContext(
 		ctx,
-		`SELECT session_digest, binding_digest, auth_id, created_at, updated_at, expires_at
+		`SELECT session_digest, binding_digest, tenant_scope_digest, auth_id, created_at, updated_at, expires_at
 		 FROM session_affinity_bindings
 		 WHERE `+column+` IN (`+sqlPlaceholders(len(digests))+`)`,
 		args...,
@@ -1089,7 +1300,15 @@ func readSessionAffinityRows(
 		var createdRaw string
 		var updatedRaw string
 		var expiresRaw string
-		if err = rows.Scan(&row.Digest, &row.BindingDigest, &row.AuthID, &createdRaw, &updatedRaw, &expiresRaw); err != nil {
+		if err = rows.Scan(
+			&row.Digest,
+			&row.BindingDigest,
+			&row.TenantScopeDigest,
+			&row.AuthID,
+			&createdRaw,
+			&updatedRaw,
+			&expiresRaw,
+		); err != nil {
 			return nil, err
 		}
 		if row.Created, err = parseDBTime(createdRaw); err != nil {
@@ -1128,7 +1347,13 @@ func chooseSessionAffinityWinner(rows []sessionAffinityRow, now time.Time) (sess
 	return winner, found
 }
 
-func sessionAffinityNeedsWrite(rows []sessionAffinityRow, digests []SessionAffinityDigest, winner sessionAffinityRow, now time.Time) bool {
+func sessionAffinityNeedsWrite(
+	rows []sessionAffinityRow,
+	digests []SessionAffinityDigest,
+	winner sessionAffinityRow,
+	tenantScopeDigest SessionAffinityDigest,
+	now time.Time,
+) bool {
 	if !winner.Updated.Add(sessionAffinityRenewalThreshold).After(now) {
 		return true
 	}
@@ -1140,7 +1365,8 @@ func sessionAffinityNeedsWrite(rows []sessionAffinityRow, digests []SessionAffin
 	}
 	for _, digest := range digests {
 		row, ok := active[digest]
-		if !ok || row.AuthID != winner.AuthID || row.BindingDigest != winner.BindingDigest {
+		if !ok || row.AuthID != winner.AuthID || row.BindingDigest != winner.BindingDigest ||
+			tenantScopeDigest != "" && row.TenantScopeDigest != tenantScopeDigest {
 			return true
 		}
 	}
@@ -1164,16 +1390,18 @@ func writeSessionAffinityAliases(ctx context.Context, tx *sql.Tx, digests []Sess
 		if _, err := tx.ExecContext(
 			ctx,
 			`INSERT INTO session_affinity_bindings
-				(session_digest, binding_digest, auth_id, created_at, updated_at, expires_at)
-			 VALUES (?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(session_digest) DO UPDATE SET
-				binding_digest = excluded.binding_digest,
-				auth_id = excluded.auth_id,
+					(session_digest, binding_digest, tenant_scope_digest, auth_id, created_at, updated_at, expires_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(session_digest) DO UPDATE SET
+					binding_digest = excluded.binding_digest,
+					tenant_scope_digest = excluded.tenant_scope_digest,
+					auth_id = excluded.auth_id,
 				created_at = excluded.created_at,
 				updated_at = excluded.updated_at,
 				expires_at = excluded.expires_at`,
 			digest,
 			winner.BindingDigest,
+			winner.TenantScopeDigest,
 			winner.AuthID,
 			formatDBTime(winner.Created),
 			formatDBTime(winner.Updated),

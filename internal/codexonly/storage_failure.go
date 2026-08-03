@@ -90,6 +90,17 @@ func (s *UserStore) checkReady() error {
 	return s.failures.current()
 }
 
+func (s *UserStore) CheckHealth(ctx context.Context) error {
+	if err := s.checkReady(); err != nil {
+		return err
+	}
+	var ready int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&ready); err != nil {
+		return s.databaseError("check storage health", err)
+	}
+	return nil
+}
+
 func (s *UserStore) databaseError(operation string, err error) error {
 	if err == nil || expectedStoreError(err) {
 		return err

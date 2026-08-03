@@ -100,7 +100,7 @@ func (m *AuthManager) prepareAuth(ctx context.Context, auth *Auth) (*Auth, error
 		if m.Refresher == nil {
 			return nil, fmt.Errorf("codex auth %s is expired and refresher is not configured", auth.ID)
 		}
-		if err := m.refresh(ctx, auth, auth.AccessToken, false); err != nil {
+		if err := m.refresh(ctx, auth, auth.AccessToken, false, false); err != nil {
 			return nil, err
 		}
 	}
@@ -114,10 +114,19 @@ func (m *AuthManager) RefreshAfterUnauthorized(ctx context.Context, auth *Auth, 
 	if strings.TrimSpace(failedAccessToken) == "" && auth != nil {
 		failedAccessToken = auth.AccessToken
 	}
-	return m.refresh(ctx, auth, failedAccessToken, true)
+	return m.refresh(ctx, auth, failedAccessToken, true, false)
 }
 
-func (m *AuthManager) refresh(ctx context.Context, auth *Auth, failedAccessToken string, reuseChangedToken bool) error {
+func (m *AuthManager) ForceRefresh(ctx context.Context, auth *Auth) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, DefaultOAuthRefreshTimeout)
+	defer cancel()
+	return m.refresh(ctx, auth, "", false, true)
+}
+
+func (m *AuthManager) refresh(ctx context.Context, auth *Auth, failedAccessToken string, reuseChangedToken bool, force bool) error {
 	if m == nil || m.Store == nil || m.Refresher == nil {
 		return newOAuthRefreshError("refresher unavailable", 0, "", nil)
 	}
@@ -153,7 +162,7 @@ func (m *AuthManager) refresh(ctx context.Context, auth *Auth, failedAccessToken
 	m.refreshes[key] = call
 	m.refreshMu.Unlock()
 
-	refreshed, err := m.refreshCurrentAuth(ctx, auth, failedAccessToken, reuseChangedToken)
+	refreshed, err := m.refreshCurrentAuth(ctx, auth, failedAccessToken, reuseChangedToken, force)
 
 	m.refreshMu.Lock()
 	call.auth = cloneAuth(refreshed)
@@ -169,29 +178,45 @@ func (m *AuthManager) refresh(ctx context.Context, auth *Auth, failedAccessToken
 	return nil
 }
 
-func (m *AuthManager) refreshCurrentAuth(ctx context.Context, auth *Auth, failedAccessToken string, reuseChangedToken bool) (*Auth, error) {
-	auths, err := m.Store.Load(ctx)
-	if err != nil {
-		return nil, newOAuthRefreshError("auth reload failed", 0, "", err)
-	}
-	current := matchingAuth(auths, auth)
-	if current == nil {
-		return nil, newOAuthRefreshError("auth is no longer available", 0, "", nil)
-	}
-	if current.AccessToken != "" && current.AccessToken != failedAccessToken {
-		now := time.Now
-		if m.Now != nil {
-			now = m.Now
+func (m *AuthManager) refreshCurrentAuth(
+	ctx context.Context,
+	auth *Auth,
+	failedAccessToken string,
+	reuseChangedToken bool,
+	force bool,
+) (*Auth, error) {
+	var refreshed *Auth
+	err := m.Store.withConsistentFiles(func() error {
+		result, errReconcile := m.Store.reconcile(ctx)
+		if errReconcile != nil {
+			return newOAuthRefreshError("auth reload failed", 0, "", errReconcile)
 		}
-		if reuseChangedToken || !current.Expired(now()) {
-			return current, nil
+		auths := result.Active
+		if force {
+			auths = result.Auths
 		}
-	}
-	candidate := cloneAuth(current)
-	if err = m.Refresher.Refresh(ctx, candidate); err != nil {
-		return nil, err
-	}
-	return candidate, nil
+		current := matchingAuth(auths, auth)
+		if current == nil {
+			return newOAuthRefreshError("auth is no longer available", 0, "", nil)
+		}
+		if !force && current.AccessToken != "" && current.AccessToken != failedAccessToken {
+			now := time.Now
+			if m.Now != nil {
+				now = m.Now
+			}
+			if reuseChangedToken || !current.Expired(now()) {
+				refreshed = current
+				return nil
+			}
+		}
+		candidate := cloneAuth(current)
+		if errRefresh := m.Refresher.Refresh(ctx, candidate); errRefresh != nil {
+			return errRefresh
+		}
+		refreshed = candidate
+		return nil
+	})
+	return refreshed, err
 }
 
 func matchingAuth(auths []*Auth, target *Auth) *Auth {
@@ -216,6 +241,7 @@ type Server struct {
 	cancel                     context.CancelFunc
 	sessionAffinityReplayStore func() *sessionAffinityReplayStore
 	waitRetry                  func(context.Context, time.Duration) error
+	activeAuths                *activeAuthConnections
 	closeOnce                  sync.Once
 	closeErr                   error
 }
@@ -318,6 +344,7 @@ func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
 		ctx:            serverCtx,
 		cancel:         cancel,
 		waitRetry:      waitForProxyRetry,
+		activeAuths:    newActiveAuthConnections(),
 	}
 	server.models = newRuntimeModelCatalog(serverCtx, server.fetchModelCatalog, health.HealthyEpoch)
 	server.debugf(
@@ -411,6 +438,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstreamRoute, routeOK bool) {
+	if strings.HasPrefix(r.URL.Path, "/v0/management/") ||
+		strings.HasPrefix(r.URL.Path, "/v0/local-admin/") {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	switch {
 	case r.URL.Path == "/healthz":
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -751,8 +782,9 @@ func (s *Server) selectProxyAuthCandidate(
 	eligibleByID := authsByStableID(eligible)
 	binding := selection.Binding
 	found := binding.valid()
+	tenantScope := sessionAffinityTenantScope(authorization)
 	if !found {
-		binding, found, err = s.users.LookupSessionAffinity(ctx, digests)
+		binding, found, err = s.users.LookupScopedSessionAffinity(ctx, tenantScope, digests)
 		if err != nil {
 			return AuthSelection{}, err
 		}
@@ -770,7 +802,7 @@ func (s *Server) selectProxyAuthCandidate(
 	if found {
 		binding, err = s.users.RebindSessionAffinity(ctx, binding, candidate.ID)
 	} else {
-		binding, err = s.users.BindSessionAffinity(ctx, digests, candidate.ID)
+		binding, err = s.users.BindScopedSessionAffinity(ctx, tenantScope, digests, candidate.ID)
 	}
 	if err != nil {
 		return AuthSelection{}, err
@@ -889,6 +921,12 @@ func (s *Server) handleManagement(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleManagementPath(w http.ResponseWriter, r *http.Request, path string) {
 	switch {
+	case path == "/auths" && r.Method == http.MethodGet:
+		s.handleManagementAuthStatus(w, r)
+	case strings.HasPrefix(path, "/auths/") && r.Method == http.MethodPost:
+		s.handleManagementAuthAction(w, r, strings.TrimPrefix(path, "/auths/"))
+	case path == "/session-bindings/clear" && r.Method == http.MethodPost:
+		s.handleManagementSessionBindingClear(w, r)
 	case path == "/usage/timeseries" && r.Method == http.MethodGet:
 		timeseries, err := s.users.GetUsageTimeseries(r.Context(), usageTimeseriesParamsFromRequest(r), s.cfg.Usage)
 		if err != nil {
@@ -1242,6 +1280,7 @@ func (s *Server) proxyCodex(w http.ResponseWriter, r *http.Request, route upstre
 			if auth != nil {
 				authID = auth.ID
 			}
+			s.trackAuthResponseBody(resp, authID)
 			s.debugf(
 				"proxy upstream response method=%s path=%s status=%d target_host=%s target_path=%s auth_id=%s",
 				r.Method,

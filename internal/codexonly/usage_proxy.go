@@ -601,6 +601,8 @@ func (s *Server) proxyCodexWebSocket(
 	if upstreamResp != nil && upstreamResp.Body != nil {
 		_ = upstreamResp.Body.Close()
 	}
+	endActiveConnection := s.beginAuthConnection(auth.ID)
+	defer endActiveConnection()
 	defer upstreamConn.Close()
 
 	subprotocols := websocket.Subprotocols(r)

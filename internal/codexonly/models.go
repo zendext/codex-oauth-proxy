@@ -242,6 +242,25 @@ func (c *runtimeModelCatalog) CachedCatalog(
 	return c.aggregate(entry, auths)
 }
 
+func (c *runtimeModelCatalog) KnownModelsForAuth(
+	clientVersion string,
+	auths []*Auth,
+	authID string,
+) ([]string, bool) {
+	view := c.CachedCatalog(clientVersion, auths)
+	if !view.CapabilityKnown {
+		return nil, false
+	}
+	models := make([]string, 0)
+	for model, supportingAuths := range view.SupportingAuths {
+		if slices.Contains(supportingAuths, authID) {
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	return models, true
+}
+
 func (c *runtimeModelCatalog) Reconcile(result AuthReconcileResult) {
 	if c == nil || len(result.Changes) == 0 {
 		return
