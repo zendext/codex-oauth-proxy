@@ -210,8 +210,21 @@ dedicated endpoint:
 }
 ```
 
-Zed must send the managed `cop_...` API key. This compatibility endpoint is
-specific to edit prediction; `/v1/completions` is not implemented.
+Use Zed 0.227 or later. Configure the key separately from `settings.json` using
+either method:
+
+- Open Zed's Edit Prediction provider setup, select **OpenAI Compatible API**,
+  and enter the managed `cop_...` value in **API Key**.
+- Set the environment variable before starting Zed from that environment:
+
+  ```bash
+  export ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY="cop_..."
+  zed
+  ```
+
+Zed sends the configured value as `Authorization: Bearer cop_...`. This
+compatibility endpoint is specific to edit prediction; `/v1/completions` is not
+implemented.
 
 ## Docker Compose
 
