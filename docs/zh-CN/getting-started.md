@@ -178,6 +178,41 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 代理会将 Chat Completions 请求转换为上游 Responses 请求。当客户端已经支持
 Responses Wire Format 时，应直接使用 `/v1/responses`。
 
+## 连接 Zed Edit Prediction
+
+为 Zed 的 `open_ai_compatible_api` Edit Prediction Provider 配置专用端点：
+
+```json
+{
+  "edit_predictions": {
+    "provider": "open_ai_compatible_api",
+    "mode": "eager",
+    "allow_data_collection": "no",
+    "open_ai_compatible_api": {
+      "api_url": "http://127.0.0.1:8317/v1/zed/edit-predictions",
+      "model": "gpt-5.6-luna",
+      "prompt_format": "qwen",
+      "max_output_tokens": 256
+    }
+  }
+}
+```
+
+请使用 Zed 0.227 或更高版本。Key 独立于 `settings.json` 配置，可选择以下
+任一方式：
+
+- 打开 Zed 的 Edit Prediction Provider 设置，选择 **OpenAI Compatible API**，
+  在 **API Key** 中录入托管 `cop_...`。
+- 在同一环境中启动 Zed 前设置环境变量：
+
+  ```bash
+  export ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY="cop_..."
+  zed
+  ```
+
+Zed 会将该值作为 `Authorization: Bearer cop_...` 发送。该兼容端点仅用于 Edit
+Prediction；项目不实现 `/v1/completions`。
+
 ## Docker Compose
 
 根据模板创建 `config.yaml`，并修改绑定地址：

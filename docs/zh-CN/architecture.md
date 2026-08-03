@@ -24,6 +24,7 @@
 | `internal/codexonly/models.go` | 按认证运行时同步模型、版本 LRU、聚合和嵌入式回退。 |
 | `internal/codexonly/server.go` | 路由、认证、Header、HTTP Reverse Proxy 以及管理和用户 Handler。 |
 | `internal/codexonly/chat_completions.go` | Chat Completions 到 Responses 的转换和响应翻译。 |
+| `internal/codexonly/zed_edit_predictions.go` | Zed Qwen FIM 校验、Responses 转换和 Text Completion 聚合。 |
 | `internal/codexonly/user_store.go` | SQLite Schema、用户、API Key 和认证。 |
 | `internal/codexonly/session_affinity.go` | 有界信号提取、Digest、持久化绑定、续期和 CAS 重绑定。 |
 | `internal/codexonly/usage.go` | 用量存储、聚合、窗口、维度和时间序列。 |
@@ -261,6 +262,7 @@ HTTP Handler 会在 Reverse Proxy 白名单之前检查项目自有路由。
 | `/v0/user/*` | 托管用户自助 API |
 | `/v1/models` | 按认证运行时模型聚合和嵌入式回退 |
 | `/v1/chat/completions` | 本地协议转换 |
+| `/v1/zed/edit-predictions` | 本地 Zed Edit Prediction 转换 |
 | 白名单 `/v1/*` | Codex 上游 Reverse Proxy |
 | 部分 `/backend-api/*` | Codex CLI 兼容 Reverse Proxy |
 
@@ -314,6 +316,31 @@ Upgrade 成功后不会重试。不可重放的请求 Body 会保留第一次上
    成功、上游故障或客户端取消结果。
 
 这是专用兼容层，不是通用的 Schema 保留型转换引擎。
+
+## Zed Edit Prediction 转换
+
+`/v1/zed/edit-predictions` 是另一个专用本地转换端点：
+
+1. 只接受托管用户 API Key 认证和 JSON `POST`。
+2. 使用共享安全模型标识符规则规范化并校验请求模型，校验 1 到 4096 的正整数
+   `max_tokens`，并要求恰好一个有序 Qwen
+   `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>` 序列。
+3. 构造不带 Tool、使用低 Reasoning Effort、`stream: true`、`store: false`
+   且分别包含 Prefix 和 Suffix 文本的 Responses 请求。
+4. 与其他可重放 Codex 请求共用健康感知执行器、模型能力筛选、重试、
+   Session Affinity、活动连接计数和托管用量记录。该端点不维护模型 Allowlist；
+   运行时目录支持和上游失败决定模型是否可用。
+5. 要求一个有效的 `response.completed` 或 `response.incomplete` 终态；拒绝
+   Tool Output、畸形 Event 或缺失终态，并在提交客户端响应前聚合文本和终态用量。
+6. 在本地应用 Stop 匹配和输出预算，不向上游转发 Sampling 或 Token Limit 字段。
+   匹配和截断均保证 Unicode 安全，并且应用前会完整读取上游 Stream。
+7. 返回一个 OpenAI Text Completion 形状的 JSON 响应。上游因最大 Token
+   不完整或本地预算截断时使用 `finish_reason: "length"`；内容过滤使用
+   `content_filter`。
+
+Getting Started 配置将 `gpt-5.6-luna` 作为初始示例。本地输出上限按 Unicode
+Code Point 计数。该路由不会建立通用 `/v1/completions` 契约，也不会改变
+`/v1/chat/completions`。
 
 ## 托管用户数据模型
 

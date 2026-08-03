@@ -79,6 +79,7 @@ Cross-credential retry is available only for:
 
 - Read-only `GET` and `HEAD` requests on whitelisted routes.
 - JSON `/v1/chat/completions`.
+- JSON `/v1/zed/edit-predictions`.
 - Responses, Responses compact, alpha search, JSON image generation, and trace
   summarization.
 - A Responses WebSocket handshake before successful upgrade.
@@ -657,6 +658,78 @@ curl http://127.0.0.1:8317/v1/chat/completions \
     "stream_options": {"include_usage": true}
   }'
 ```
+
+### `POST /v1/zed/edit-predictions`
+
+This managed-key-only endpoint accepts the Completion request shape emitted by
+Zed's `open_ai_compatible_api` edit prediction provider. It is a dedicated
+compatibility contract, not a generic `/v1/completions` endpoint.
+
+The request must use `Content-Type: application/json` and include:
+
+- `model`: a non-empty model identifier of at most 128 bytes. Surrounding ASCII
+  spaces are removed, and the remaining value may contain letters, digits,
+  `.`, `-`, `_`, `/`, `:`, and `@`.
+- `prompt`: exactly one ordered Qwen FIM sequence:
+
+  ```text
+  <|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>
+  ```
+
+The prompt is rejected before upstream contact when a marker is missing,
+duplicated, out of order, preceded by other text, or followed by other text.
+
+Optional fields:
+
+- `max_tokens`: an integer from 1 through 4096; default `256`. It is enforced
+  locally as a Unicode code-point output cap and is not forwarded upstream.
+- `temperature`: a JSON number accepted for Zed wire compatibility but not
+  forwarded upstream.
+- `stop`: one non-empty string or a list of non-empty strings. Matching is
+  applied locally and is Unicode-safe.
+
+The proxy extracts the prefix and suffix, sends a tool-free low-reasoning
+Responses request with `stream: true` and `store: false`, and fully validates
+and aggregates the upstream SSE before returning:
+
+```json
+{
+  "id": "cmpl_...",
+  "object": "text_completion",
+  "created": 0,
+  "model": "gpt-5.6-luna",
+  "choices": [
+    {
+      "index": 0,
+      "text": "missing code",
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  }
+}
+```
+
+The example uses `gpt-5.6-luna`, but the endpoint does not maintain its own
+model allowlist. Runtime catalog capability filtering, credential selection and
+failover, and upstream failure classification determine whether the normalized
+requested model is available.
+
+`response.completed` returns `finish_reason: "stop"` unless a local output
+budget truncates first. `response.incomplete` maps max-token reasons to
+`length`, content filtering to `content_filter`, and unknown reasons to
+`length`. A local budget truncation also uses `length`; a local stop match uses
+`stop`.
+
+Stop or budget matches do not cancel the upstream read. The proxy continues
+draining the terminal event and usage first. EOF before a terminal, malformed
+or oversized events, duplicate terminals, data after a terminal, tool output,
+and upstream failure events return deterministic safe errors. Client
+cancellation stops the upstream request without retrying or synthesizing a new
+response body.
 
 ## Responses and Compatibility Routes
 

@@ -500,6 +500,20 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			return
 		}
 		s.handleModels(w, r)
+	case r.URL.Path == zedEditPredictionsPath:
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		authorization, err := s.authorizeProxy(r, false)
+		if err != nil {
+			writeAuthError(w, err)
+			return
+		}
+		replayCandidate := requestReplayCandidate(r)
+		signals := s.extractSessionAffinitySignals(r)
+		s.handleZedEditPredictions(w, r, authorization, signals, replayCandidate)
 	case r.URL.Path == "/v1/chat/completions":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -1396,6 +1410,8 @@ func (s *Server) debugRouteName(r *http.Request, routeOK bool) string {
 		return "user"
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		return "models"
+	case r.URL.Path == zedEditPredictionsPath:
+		return "zed_edit_predictions"
 	case r.URL.Path == "/v1/chat/completions":
 		return "chat_completions"
 	case routeOK:

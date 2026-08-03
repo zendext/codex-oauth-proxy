@@ -73,6 +73,7 @@ Compare-and-swap 故障转移进行重绑定。
 
 - 白名单路由上的只读 `GET` 和 `HEAD` 请求。
 - JSON `/v1/chat/completions`。
+- JSON `/v1/zed/edit-predictions`。
 - Responses、Responses Compact、Alpha Search、JSON Image Generation 和
   Trace Summarization。
 - Upgrade 成功前的 Responses WebSocket Handshake。
@@ -622,6 +623,70 @@ curl http://127.0.0.1:8317/v1/chat/completions \
     "stream_options": {"include_usage": true}
   }'
 ```
+
+### `POST /v1/zed/edit-predictions`
+
+该端点只接受托管 Key，接收 Zed `open_ai_compatible_api` Edit Prediction
+Provider 发出的 Completion 请求形状。它是专用兼容契约，不是通用
+`/v1/completions` 端点。
+
+请求必须使用 `Content-Type: application/json`，并包含：
+
+- `model`：非空且最多 128 字节的模型标识符。服务器会移除首尾 ASCII 空格，
+  剩余值只允许字母、数字、`.`、`-`、`_`、`/`、`:` 和 `@`。
+- `prompt`：必须恰好包含一个有序 Qwen FIM 序列：
+
+  ```text
+  <|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>
+  ```
+
+Marker 缺失、重复、顺序错误、前面存在其他文本或后面存在其他文本时，会在联系
+上游之前拒绝 Prompt。
+
+可选字段：
+
+- `max_tokens`：1 到 4096 的整数，默认 `256`。该值在本地作为 Unicode Code
+  Point 输出上限执行，不会转发到上游。
+- `temperature`：为兼容 Zed Wire Format 接受 JSON Number，但不转发到上游。
+- `stop`：一个非空字符串或非空字符串列表。匹配在本地执行并保证 Unicode
+  安全。
+
+代理会提取 Prefix 和 Suffix，发送不带 Tool、低 Reasoning、`stream: true`、
+`store: false` 的 Responses 请求，并在返回前完整校验和聚合上游 SSE：
+
+```json
+{
+  "id": "cmpl_...",
+  "object": "text_completion",
+  "created": 0,
+  "model": "gpt-5.6-luna",
+  "choices": [
+    {
+      "index": 0,
+      "text": "missing code",
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  }
+}
+```
+
+示例使用 `gpt-5.6-luna`，但该端点不维护自己的模型 Allowlist。规范化请求模型
+是否可用，由运行时目录能力筛选、凭据选择和故障转移以及上游失败分类决定。
+
+`response.completed` 返回 `finish_reason: "stop"`，除非本地输出预算先截断。
+`response.incomplete` 将最大 Token 原因映射为 `length`，将内容过滤映射为
+`content_filter`，未知原因映射为 `length`。本地预算截断也使用 `length`；
+本地 Stop 命中使用 `stop`。
+
+Stop 或预算命中不会取消上游读取。代理会先继续读取终态 Event 和用量。终态前
+EOF、畸形或过大的 Event、重复终态、终态后数据、Tool Output 和上游失败 Event
+都会返回确定且安全的错误。客户端取消会停止上游请求，不重试，也不合成新的
+响应 Body。
 
 ## Responses 与兼容路由
 

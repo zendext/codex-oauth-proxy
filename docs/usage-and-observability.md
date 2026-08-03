@@ -202,9 +202,10 @@ usage:
 ```
 
 Usage diagnostics include safe request IDs, model dimensions, masked key
-metadata, status, request outcome, and token summaries. Chat Completions
-outcomes distinguish `success`, `upstream_failure`, and `client_canceled`.
-Response bodies and plaintext secrets are not intentionally logged.
+metadata, status, request outcome, and token summaries. Local Chat Completions
+and Zed Edit Prediction conversions distinguish `success`, `upstream_failure`,
+and `client_canceled`. Response bodies and plaintext secrets are not
+intentionally logged.
 
 ## Grafana Dashboard
 

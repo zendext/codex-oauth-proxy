@@ -25,6 +25,7 @@ storage backends.
 | `internal/codexonly/models.go` | Per-auth runtime model synchronization, version LRU, aggregation, and embedded fallback. |
 | `internal/codexonly/server.go` | Routing, authentication, headers, HTTP reverse proxy, and management/user handlers. |
 | `internal/codexonly/chat_completions.go` | Chat Completions to Responses conversion and response translation. |
+| `internal/codexonly/zed_edit_predictions.go` | Zed Qwen FIM validation, Responses conversion, and text-completion aggregation. |
 | `internal/codexonly/user_store.go` | SQLite schema, users, API keys, and authentication. |
 | `internal/codexonly/session_affinity.go` | Bounded signal extraction, digesting, persistent binding, renewal, and CAS rebind. |
 | `internal/codexonly/usage.go` | Usage storage, aggregation, windows, dimensions, and timeseries. |
@@ -317,6 +318,7 @@ The HTTP handler checks project-owned routes before the reverse proxy whitelist.
 | `/v0/user/*` | Managed user self-service API |
 | `/v1/models` | Runtime per-auth model aggregation with embedded fallback |
 | `/v1/chat/completions` | Local protocol conversion |
+| `/v1/zed/edit-predictions` | Local Zed Edit Prediction conversion |
 | Whitelisted `/v1/*` | Codex upstream reverse proxy |
 | Selected `/backend-api/*` | Codex CLI compatibility reverse proxy |
 
@@ -381,6 +383,35 @@ upstream response unchanged.
 
 This is a focused compatibility layer, not a generic schema-preserving
 translation engine.
+
+## Zed Edit Prediction Conversion
+
+`/v1/zed/edit-predictions` is another focused local conversion:
+
+1. Authenticate only with a managed user API key and require JSON `POST`.
+2. Normalize and validate the requested model with the shared safe model
+   identifier rules, validate a positive `max_tokens` from 1 through 4096, and
+   require exactly one ordered Qwen
+   `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>` sequence.
+3. Build a tool-free Responses request with low reasoning effort, `stream:
+   true`, `store: false`, and separate prefix and suffix input text.
+4. Use the same health-aware executor, model capability filtering, retry,
+   session affinity, active-connection tracking, and managed usage accounting
+   as other replayable Codex requests. The endpoint has no model allowlist;
+   runtime catalog support and upstream failures decide availability.
+5. Require one valid `response.completed` or `response.incomplete` terminal,
+   reject tool output and malformed or missing terminal state, and aggregate
+   text and terminal usage before committing the client response.
+6. Apply local stop matching and the output budget without forwarding sampling
+   or token-limit fields upstream. Matching and truncation are Unicode-safe,
+   and the upstream stream is fully drained before either is applied.
+7. Return one OpenAI text-completion-shaped JSON response. Incomplete max-token
+   reasons and local budget truncation use `finish_reason: "length"`;
+   content filtering uses `content_filter`.
+
+The getting-started configuration uses `gpt-5.6-luna` as an initial example.
+The local output cap counts Unicode code points. The route does not create a
+generic `/v1/completions` contract and does not alter `/v1/chat/completions`.
 
 ## Managed User Data Model
 

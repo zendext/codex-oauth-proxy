@@ -189,6 +189,43 @@ The proxy translates Chat Completions requests to upstream Responses requests.
 Use `/v1/responses` directly when the client already supports the Responses wire
 format.
 
+## Connect Zed Edit Prediction
+
+Configure Zed's `open_ai_compatible_api` edit prediction provider with the
+dedicated endpoint:
+
+```json
+{
+  "edit_predictions": {
+    "provider": "open_ai_compatible_api",
+    "mode": "eager",
+    "allow_data_collection": "no",
+    "open_ai_compatible_api": {
+      "api_url": "http://127.0.0.1:8317/v1/zed/edit-predictions",
+      "model": "gpt-5.6-luna",
+      "prompt_format": "qwen",
+      "max_output_tokens": 256
+    }
+  }
+}
+```
+
+Use Zed 0.227 or later. Configure the key separately from `settings.json` using
+either method:
+
+- Open Zed's Edit Prediction provider setup, select **OpenAI Compatible API**,
+  and enter the managed `cop_...` value in **API Key**.
+- Set the environment variable before starting Zed from that environment:
+
+  ```bash
+  export ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY="cop_..."
+  zed
+  ```
+
+Zed sends the configured value as `Authorization: Bearer cop_...`. This
+compatibility endpoint is specific to edit prediction; `/v1/completions` is not
+implemented.
+
 ## Docker Compose
 
 Create `config.yaml` from the template and change the bind host:
