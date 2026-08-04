@@ -736,9 +736,34 @@ response body.
 The proxy forwards these whitelisted Codex routes without defining their full
 upstream request schema:
 
-These native Responses HTTP and WebSocket routes remain transparent; the Chat
-Completions terminal validation and error conversion described above do not
-modify their event or frame payloads.
+HTTP `POST /v1/responses` provides stateless Responses Create compatibility.
+The proxy preserves public, unknown, and Codex-private request fields except
+for these explicit adaptations:
+
+- `max_output_tokens` must be a positive JSON integer. It is accepted for
+  client interoperability and removed before forwarding because the private
+  Codex upstream does not support it. The proxy and upstream do not enforce
+  this output limit.
+- `background` and `store`, when present, must be JSON booleans. `true` is
+  rejected with an OpenAI-style error naming the unsupported parameter;
+  `false` is accepted. This proxy does not implement background jobs or
+  response persistence.
+- With downstream `stream: true`, the normalized request remains streaming and
+  successful upstream Responses SSE bytes and event formats pass through
+  unchanged.
+- With downstream `stream: false` or no `stream` field, the upstream request
+  uses `stream: true` and `store: false`. The proxy reads the bounded SSE stream,
+  requires exactly one valid `response.completed` or `response.incomplete`
+  terminal, and returns that terminal event's `response` object as
+  `application/json`. It does not translate the result to Chat Completions.
+
+Local validation failures and private upstream HTTP error bodies are returned
+as OpenAI-style error envelopes while retaining a meaningful upstream HTTP
+status. HTTP `GET /v1/responses`, Responses WebSocket traffic,
+`POST /v1/responses/compact`, and every `/backend-api/codex/responses` request
+remain transparent. The compatibility layer does not add response retrieval,
+persistence, background execution, WebSocket frame normalization, or Compact
+response-shape adaptation.
 
 | Common method | Public path |
 | --- | --- |

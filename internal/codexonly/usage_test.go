@@ -474,7 +474,7 @@ func TestServerRecordsProxyUsageAndExposesAPIs(t *testing.T) {
 	}
 	created := createManagedUser(t, handler, "admin-key", "Alice")
 
-	proxyResp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.3-codex","reasoning":{"effort":"high"},"input":"hello"}`, created.PlaintextAPIKey)
+	proxyResp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.3-codex","stream":true,"reasoning":{"effort":"high"},"input":"hello"}`, created.PlaintextAPIKey)
 	if proxyResp.Code != http.StatusOK {
 		t.Fatalf("proxy status = %d, want 200, body: %s", proxyResp.Code, proxyResp.Body.String())
 	}
@@ -610,7 +610,7 @@ func TestServerExposesManagementUsageTimeseries(t *testing.T) {
 	}
 	created := createManagedUser(t, handler, "admin-key", "Alice")
 
-	proxyResp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.3-codex","service_tier":"standard","input":"hello"}`, created.PlaintextAPIKey)
+	proxyResp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.3-codex","stream":true,"service_tier":"standard","input":"hello"}`, created.PlaintextAPIKey)
 	if proxyResp.Code != http.StatusOK {
 		t.Fatalf("proxy status = %d, want 200, body: %s", proxyResp.Code, proxyResp.Body.String())
 	}
@@ -677,7 +677,7 @@ func TestServerRecordsFastServiceTierUsage(t *testing.T) {
 	}
 	created := createManagedUser(t, handler, "admin-key", "Alice")
 
-	resp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.5","reasoning":{"effort":"xhigh"},"service_tier":"priority","input":"hello"}`, created.PlaintextAPIKey)
+	resp := doJSONRequest(t, handler, http.MethodPost, "/v1/responses", `{"model":"gpt-5.5","stream":true,"reasoning":{"effort":"xhigh"},"service_tier":"priority","input":"hello"}`, created.PlaintextAPIKey)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("proxy status = %d, want 200, body: %s", resp.Code, resp.Body.String())
 	}

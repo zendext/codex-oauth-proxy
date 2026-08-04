@@ -61,7 +61,7 @@ func TestServerProxiesResponsesWithCodexAuthHeaders(t *testing.T) {
 	}
 	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.3-codex","input":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.3-codex","stream":true,"input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer "+userKey)
 	req.Header.Set("User-Agent", "generic-responses-client/1.0")
 	resp := httptest.NewRecorder()
@@ -86,7 +86,7 @@ func TestServerProxiesResponsesWithCodexAuthHeaders(t *testing.T) {
 	if strings.TrimSpace(sawSessionID) == "" {
 		t.Fatalf("upstream Session_id is empty")
 	}
-	if sawBody != `{"model":"gpt-5.3-codex","input":"hello"}` {
+	if sawBody != `{"model":"gpt-5.3-codex","stream":true,"input":"hello"}` {
 		t.Fatalf("upstream body = %q", sawBody)
 	}
 	if got := resp.Header().Get("Content-Type"); got != "application/json" {
@@ -840,7 +840,7 @@ func TestServerAllowsFastServiceTierWhenEnabled(t *testing.T) {
 	}
 	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
-	body := `{"model":"gpt-5.5","service_tier":"priority","input":"hello"}`
+	body := `{"model":"gpt-5.5","stream":true,"service_tier":"priority","input":"hello"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+userKey)
 	resp := httptest.NewRecorder()
@@ -876,7 +876,7 @@ func TestServerRejectsInvalidProxyAPIKey(t *testing.T) {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
 	req.Header.Set("Authorization", "Bearer wrong-key")
 	resp := httptest.NewRecorder()
 
@@ -915,7 +915,7 @@ func TestServerAcceptsUserAPIKeyFromXAPIKeyWithUnrelatedAuthorization(t *testing
 	}
 	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
 	req.Header.Set("Authorization", "Bearer chatgpt-token")
 	req.Header.Set("X-API-Key", userKey)
 	resp := httptest.NewRecorder()
@@ -1137,7 +1137,7 @@ func TestProxyAcceptsStoredUserAPIKeyAndRejectsDisabledUser(t *testing.T) {
 	}
 	created := createManagedUser(t, handler, "admin-key", "Alice")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
 	req.Header.Set("Authorization", "Bearer "+created.PlaintextAPIKey)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
@@ -1168,7 +1168,7 @@ func TestProxyAcceptsStoredUserAPIKeyAndRejectsDisabledUser(t *testing.T) {
 	if enableResp.Code != http.StatusOK {
 		t.Fatalf("enable status = %d, want 200, body: %s", enableResp.Code, enableResp.Body.String())
 	}
-	enabledReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	enabledReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
 	enabledReq.Header.Set("Authorization", "Bearer "+created.PlaintextAPIKey)
 	enabledResp := httptest.NewRecorder()
 	handler.ServeHTTP(enabledResp, enabledReq)
@@ -1203,7 +1203,7 @@ func TestProxyRejectsUnauthenticatedRequests(t *testing.T) {
 		t.Fatalf("NewHandler returned error: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -1244,7 +1244,7 @@ func TestDebugLogsSuccessfulProxyRequestWithoutSecrets(t *testing.T) {
 	}
 	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
 	req.Header.Set("Authorization", "Bearer "+userKey)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)

@@ -180,7 +180,7 @@ func TestServerConcurrentFirstSessionRequestsUseDatabaseWinner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.3-codex","session_id":"race-session","input":"hello"}`))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.3-codex","stream":true,"session_id":"race-session","input":"hello"}`))
 			req.Header.Set("Authorization", "Bearer "+user.PlaintextAPIKey)
 			req.Header.Set("Content-Type", "application/json")
 			resp := httptest.NewRecorder()
@@ -458,7 +458,7 @@ func TestServerInvalidOrMissingSessionSignalsFallBackWithoutBinding(t *testing.T
 
 	sendResponseRequest(t, server, user.PlaintextAPIKey, "", `{"model":"gpt-5.3-codex","input":"missing"}`)
 	sendResponseRequest(t, server, user.PlaintextAPIKey, "", `{"model":"gpt-5.3-codex","session_id":"bad\u0000value","input":"control"}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.3-codex","input":"oversized"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.3-codex","stream":true,"input":"oversized"}`))
 	req.Header.Set("Authorization", "Bearer "+user.PlaintextAPIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Session-Id", strings.Repeat("x", maxSessionAffinitySignalBytes+1))
@@ -519,7 +519,7 @@ func TestServerInvalidBodyUnicodeDoesNotBindAndForwardsExactBytes(t *testing.T) 
 	}
 
 	for _, body := range requestBodies {
-		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+user.PlaintextAPIKey)
 		req.Header.Set("Content-Type", "application/json")
 		resp := httptest.NewRecorder()
@@ -738,7 +738,7 @@ func writeSessionAffinityAuth(t *testing.T, dir string, name string, accountID s
 
 func sendResponseRequest(t *testing.T, server *Server, apiKey string, sessionID string, body string) {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	if sessionID != "" {

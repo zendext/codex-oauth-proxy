@@ -692,8 +692,28 @@ EOF、畸形或过大的 Event、重复终态、终态后数据、Tool Output �
 
 代理转发以下白名单 Codex 路由，但不定义其完整上游请求 Schema：
 
-这些原生 Responses HTTP 和 WebSocket 路由保持透明；上述 Chat Completions
-终态校验和错误转换不会修改其 Event 或 Frame Payload。
+HTTP `POST /v1/responses` 提供无状态 Responses Create 兼容。除以下明确适配外，
+代理会保留公共字段、未知字段和 Codex 私有请求字段：
+
+- `max_output_tokens` 必须是正 JSON 整数。代理为客户端互操作接受该字段，并在
+  转发前将其删除，因为 Codex 私有上游不支持该字段。代理和上游都不会执行该
+  输出上限。
+- `background` 和 `store` 如果存在，必须是 JSON 布尔值。`true` 会收到命名不支持
+  参数的 OpenAI 风格错误；可以使用 `false`。本代理不实现后台任务或 Response
+  持久化。
+- 下游使用 `stream: true` 时，规范化后的请求继续使用流式上游，成功的上游
+  Responses SSE 字节和 Event 格式保持不变地透传。
+- 下游使用 `stream: false` 或省略 `stream` 时，上游请求使用 `stream: true` 和
+  `store: false`。代理读取有界 SSE Stream，要求恰好一个有效的
+  `response.completed` 或 `response.incomplete` 终态，并将该终态 Event 中的
+  `response` 对象作为 `application/json` 返回。结果不会转换为 Chat
+  Completions。
+
+本地校验失败和私有上游 HTTP Error Body 会转换为 OpenAI 风格 Error Envelope，
+并保留有意义的上游 HTTP 状态。HTTP `GET /v1/responses`、Responses WebSocket
+流量、`POST /v1/responses/compact` 以及所有 `/backend-api/codex/responses`
+请求继续保持透明。该兼容层不增加 Response 获取、持久化、后台执行、WebSocket
+Frame 规范化或 Compact Response Shape 适配。
 
 | 常用方法 | 公共路径 |
 | --- | --- |

@@ -196,7 +196,7 @@ func TestServerRuntimeModelsPartialFailureAndEmbeddedFallback(t *testing.T) {
 		proxyReq := httptest.NewRequest(
 			http.MethodPost,
 			"/v1/responses",
-			strings.NewReader(`{"model":"not-in-embedded-catalog","input":"hello"}`),
+			strings.NewReader(`{"model":"not-in-embedded-catalog","stream":true,"input":"hello"}`),
 		)
 		proxyReq.Header.Set("Authorization", "Bearer "+apiKey)
 		proxyReq.Header.Set("Content-Type", "application/json")
@@ -387,7 +387,7 @@ func TestServerModelSupportRebindsWholeSession(t *testing.T) {
 		req := httptest.NewRequest(
 			http.MethodPost,
 			"/v1/responses",
-			strings.NewReader(fmt.Sprintf(`{"model":%q,"input":"hello"}`, model)),
+			strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":true,"input":"hello"}`, model)),
 		)
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Set("Content-Type", "application/json")
@@ -402,7 +402,7 @@ func TestServerModelSupportRebindsWholeSession(t *testing.T) {
 	unsupported := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/responses",
-		strings.NewReader(`{"model":"unsupported","input":"hello"}`),
+		strings.NewReader(`{"model":"unsupported","stream":true,"input":"hello"}`),
 	)
 	unsupported.Header.Set("Authorization", "Bearer "+apiKey)
 	unsupported.Header.Set("Content-Type", "application/json")
