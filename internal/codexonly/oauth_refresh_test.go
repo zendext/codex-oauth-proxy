@@ -495,8 +495,8 @@ func TestReactiveUnauthorizedRetriesSameAuthBeforeProxyCommit(t *testing.T) {
 	t.Cleanup(func() { _ = handler.Close() })
 	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"hello"}`))
-	resetRequestBody(req, []byte(`{"input":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true,"input":"hello"}`))
+	resetRequestBody(req, []byte(`{"stream":true,"input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer "+userKey)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
@@ -512,7 +512,7 @@ func TestReactiveUnauthorizedRetriesSameAuthBeforeProxyCommit(t *testing.T) {
 	}
 	bodiesMu.Lock()
 	defer bodiesMu.Unlock()
-	if len(bodies) != 2 || bodies[0] != `{"input":"hello"}` || bodies[1] != bodies[0] {
+	if len(bodies) != 2 || bodies[0] != `{"stream":true,"input":"hello"}` || bodies[1] != bodies[0] {
 		t.Fatalf("upstream bodies = %#v, want identical replay", bodies)
 	}
 }
@@ -637,7 +637,7 @@ func TestReactiveUnauthorizedForwardsNonReplayableBodyOnce(t *testing.T) {
 	t.Cleanup(func() { _ = handler.Close() })
 	userKey := createManagedUser(t, handler, "admin-key", "Alice").PlaintextAPIKey
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req := httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", nil)
 	req.Body = io.NopCloser(strings.NewReader("unknown-length-body"))
 	req.ContentLength = -1
 	req.GetBody = nil

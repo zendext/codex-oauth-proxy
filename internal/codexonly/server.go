@@ -532,6 +532,19 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 			return
 		}
 		s.handleChatCompletions(w, r, authorization, signals, replayCandidate)
+	case r.Method == http.MethodPost && r.URL.Path == responsesCreatePath && !websocketRequested(r):
+		authorization, err := s.authorizeProxy(r, false)
+		if err != nil {
+			writeAuthError(w, err)
+			return
+		}
+		replayCandidate := requestReplayCandidate(r)
+		signals := s.extractSessionAffinitySignals(r)
+		if !s.fastModeAllowed() && requestHasFastServiceTier(r) {
+			writeError(w, http.StatusBadRequest, "fast mode is disabled")
+			return
+		}
+		s.handleResponsesCreate(w, r, authorization, signals, replayCandidate)
 	case routeOK:
 		authorization, err := s.authorizeProxy(r, route.allowUpstreamAuth)
 		if err != nil {

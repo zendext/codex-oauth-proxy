@@ -281,7 +281,7 @@ func TestServerReplayableResponseBodyReadErrorStillFailsOver(t *testing.T) {
 		}, nil
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
@@ -326,8 +326,8 @@ func TestServerNonReplayableResponseBodyReadErrorPreservesUpstreamResponse(t *te
 		}, nil
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-test","input":"unknown"}`))
+	req := httptest.NewRequest(http.MethodPost, "/backend-api/codex/responses", nil)
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-test","stream":true,"input":"unknown"}`))
 	req.ContentLength = -1
 	req.GetBody = nil
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -377,7 +377,7 @@ func TestServerHealthAwareFailoverRebindsStickySession(t *testing.T) {
 	})
 
 	for range 2 {
-		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"input":"hello"}`))
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Session-Id", "sticky-failover")
@@ -459,7 +459,7 @@ func TestServerAllowlistedUnknownLengthBodyProxiesOnce(t *testing.T) {
 
 	server, apiKey := newFailoverTestServer(t, authDir, upstream.URL, nil)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-test","input":"unknown"}`))
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-test","stream":true,"input":"unknown"}`))
 	req.ContentLength = -1
 	req.GetBody = nil
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -470,10 +470,19 @@ func TestServerAllowlistedUnknownLengthBodyProxiesOnce(t *testing.T) {
 	if resp.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want upstream 503, body: %s", resp.Code, resp.Body.String())
 	}
+	var envelope struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	decodeResponse(t, resp, &envelope)
+	if envelope.Error.Type != "upstream_error" {
+		t.Fatalf("error type = %q, want upstream_error, body: %s", envelope.Error.Type, resp.Body.String())
+	}
 	if calls.Load() != 1 {
 		t.Fatalf("upstream calls = %d, want one-shot allowlisted body", calls.Load())
 	}
-	if gotBody != `{"model":"gpt-test","input":"unknown"}` {
+	if gotBody != `{"model":"gpt-test","stream":true,"input":"unknown"}` {
 		t.Fatalf("upstream body = %q, want original unknown-length body", gotBody)
 	}
 }
@@ -509,7 +518,7 @@ func TestServerBufferedNetworkRetryAcceptsDuplicateExecutionRisk(t *testing.T) {
 	defer upstream.Close()
 
 	server, apiKey := newFailoverTestServer(t, authDir, upstream.URL, nil)
-	payload := `{"model":"gpt-test","input":"duplicate-risk"}`
+	payload := `{"model":"gpt-test","stream":true,"input":"duplicate-risk"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(payload))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -613,7 +622,7 @@ func TestServerDeterministicFinalErrors(t *testing.T) {
 				cfg.requestRetrySet = true
 			})
 			for range 2 {
-				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"input":"hello"}`))
 				req.Header.Set("Authorization", "Bearer "+apiKey)
 				req.Header.Set("Content-Type", "application/json")
 				resp := httptest.NewRecorder()
@@ -716,7 +725,7 @@ func TestServerRetryLayersUseIndependentBudgets(t *testing.T) {
 				return nil
 			}
 
-			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"input":"hello"}`))
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 			req.Header.Set("Content-Type", "application/json")
 			resp := httptest.NewRecorder()
@@ -760,7 +769,7 @@ func TestServerCooldownWaitStopsOnClientCancellationWithoutProxyError(t *testing
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`)).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"input":"hello"}`)).WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
@@ -804,7 +813,7 @@ func TestServerConcurrentStickyFailoverConverges(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"input":"hello"}`))
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Session-Id", "concurrent-failover")
@@ -932,7 +941,7 @@ func TestServerSameAuthUnauthorizedRepairDoesNotConsumeCredentialBudget(t *testi
 		cfg.requestRetrySet = true
 		cfg.MaxRetryCredentials = 1
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
@@ -1153,7 +1162,7 @@ func TestServerModelExclusionIsNotAuthGlobal(t *testing.T) {
 		req := httptest.NewRequest(
 			http.MethodPost,
 			"/v1/responses",
-			strings.NewReader(fmt.Sprintf(`{"model":%q,"input":"hello"}`, test.model)),
+			strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":true,"input":"hello"}`, test.model)),
 		)
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Set("Content-Type", "application/json")
