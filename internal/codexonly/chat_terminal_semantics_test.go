@@ -509,6 +509,42 @@ func TestChatCompletionsReconstructsTerminalOutput(t *testing.T) {
 		}
 	})
 
+	t.Run("stream reconciles parallel tool argument snapshots", func(t *testing.T) {
+		server, apiKey := newChatTerminalTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			writeChatUpstreamSSE(w,
+				`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup"}}`,
+				`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"q\":"}`,
+				`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"codex\""}`,
+				`{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"fetch"}}`,
+				`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"id\":"}`,
+				`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-test","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"codex\"}"},{"id":"fc_2","type":"function_call","call_id":"call_2","name":"fetch","arguments":"{\"id\":42}"}]}}`,
+			)
+		}, nil)
+		resp := doJSONRequest(t, server, http.MethodPost, "/v1/chat/completions", chatTerminalRequestBody(true, "gpt-test"), apiKey)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", resp.Code, resp.Body.String())
+		}
+
+		arguments := []strings.Builder{{}, {}}
+		for _, event := range chatStreamDataLines(resp.Body.String()) {
+			if event == "[DONE]" {
+				continue
+			}
+			chunk := decodeChatStreamChunk(t, event)
+			if len(chunk.Choices) != 1 {
+				continue
+			}
+			for _, call := range chunk.Choices[0].Delta.ToolCalls {
+				arguments[call.Index].WriteString(call.Function.Arguments)
+			}
+		}
+		got := []string{arguments[0].String(), arguments[1].String()}
+		want := []string{`{"q":"codex"}`, `{"id":42}`}
+		if !slices.Equal(got, want) {
+			t.Fatalf("streamed arguments = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("stream rejects non-prefix terminal conflict", func(t *testing.T) {
 		server, apiKey := newChatTerminalTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 			writeChatUpstreamSSE(w,
