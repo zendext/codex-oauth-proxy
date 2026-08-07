@@ -36,7 +36,7 @@ type chatCompletionState struct {
 	model             string
 	created           int64
 	content           strings.Builder
-	toolCalls         []chatToolCallState
+	toolCalls         []*chatToolCallState
 	toolIndexByItem   map[string]int
 	toolIndexByCall   map[string]int
 	toolIndexByOutput map[int]int
@@ -1031,7 +1031,7 @@ func (s *chatCompletionState) ensureToolCall(item map[string]any, outputIndex in
 	if index < 0 {
 		index = len(s.toolCalls)
 		created = true
-		s.toolCalls = append(s.toolCalls, chatToolCallState{
+		s.toolCalls = append(s.toolCalls, &chatToolCallState{
 			ID:          firstNonEmptyString(callID, fmt.Sprintf("call_%d", index)),
 			ItemID:      itemID,
 			Name:        stringFromMap(item, "name"),
