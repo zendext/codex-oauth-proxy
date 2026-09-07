@@ -14,7 +14,7 @@ const (
 	DefaultPort           = 8317
 	DefaultCodexBaseURL   = "https://chatgpt.com/backend-api/codex"
 	DefaultChatGPTBaseURL = "https://chatgpt.com/backend-api"
-	DefaultCodexUA        = "codex_cli_rs/0.146.0"
+	DefaultCodexUA        = "codex_cli_rs/0.153.4"
 )
 
 type Config struct {
