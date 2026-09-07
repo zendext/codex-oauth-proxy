@@ -512,10 +512,10 @@ func TestConfiguredClientVersionFromUserAgent(t *testing.T) {
 		cfg  *Config
 		want string
 	}{
-		{name: "default", cfg: &Config{}, want: "0.146.0"},
+		{name: "default", cfg: &Config{}, want: "0.153.4"},
 		{name: "configured", cfg: &Config{CodexUserAgent: "codex_cli_rs/0.145.0 (Linux)"}, want: "0.145.0"},
 		{name: "configured custom product", cfg: &Config{CodexUserAgent: "custom-client/1.2.3"}, want: "1.2.3"},
-		{name: "invalid configured fallback", cfg: &Config{CodexUserAgent: "custom-client"}, want: "0.146.0"},
+		{name: "invalid configured fallback", cfg: &Config{CodexUserAgent: "custom-client"}, want: "0.153.4"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -535,7 +535,7 @@ func TestRequestClientVersionUsesCodexUserAgentOnly(t *testing.T) {
 	}{
 		{userAgent: "codex_cli_rs/0.144.1 (Linux)", want: "0.144.1"},
 		{userAgent: "codex-tui/0.143.0 (Mac OS)", want: "0.143.0"},
-		{userAgent: "curl/8.10.1", want: "0.146.0"},
+		{userAgent: "curl/8.10.1", want: "0.153.4"},
 	} {
 		req := &http.Request{Header: make(http.Header), URL: &url.URL{}}
 		req.Header.Set("User-Agent", test.userAgent)

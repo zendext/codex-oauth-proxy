@@ -614,6 +614,39 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
+	for _, want := range []struct {
+		slug             string
+		displayName      string
+		visibility       string
+		maxContextWindow float64
+		fastTier         bool
+	}{
+		{"gpt-6-astra", "GPT-6-Astra", "list", 872000, true},
+		{"gpt-daybreak-blue-latest", "Daybreak Blue", "hide", 872000, false},
+		{"gpt-daybreak-red-latest", "Daybreak Red", "hide", 372000, false},
+	} {
+		t.Run(want.slug, func(t *testing.T) {
+			model := findCodexClientModel(payload.Models, want.slug)
+			if model == nil {
+				t.Fatalf("%s model metadata not found", want.slug)
+			}
+			if got := model["display_name"]; got != want.displayName {
+				t.Errorf("display_name = %#v, want %s", got, want.displayName)
+			}
+			if got := model["visibility"]; got != want.visibility {
+				t.Errorf("visibility = %#v, want %s", got, want.visibility)
+			}
+			if got := model["max_context_window"]; got != want.maxContextWindow {
+				t.Errorf("max_context_window = %#v, want %v", got, want.maxContextWindow)
+			}
+			if !reasoningLevelsContain(model, "ultra") {
+				t.Errorf("supported_reasoning_levels does not include ultra: %#v", model["supported_reasoning_levels"])
+			}
+			if got := modelHasFastTier(model); got != want.fastTier {
+				t.Errorf("Fast tier available = %t, want %t", got, want.fastTier)
+			}
+		})
+	}
 	model := findCodexClientModel(payload.Models, "gpt-5.5")
 	if model == nil {
 		t.Fatalf("gpt-5.5 model metadata not found in %#v", payload.Models)
@@ -643,8 +676,8 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 	if got := model["display_name"]; got != "GPT-5.6-Sol" {
 		t.Fatalf("display_name = %#v, want GPT-5.6-Sol", got)
 	}
-	if got := model["max_context_window"]; got != float64(272000) {
-		t.Fatalf("max_context_window = %#v, want 272000", got)
+	if got := model["max_context_window"]; got != float64(872000) {
+		t.Fatalf("max_context_window = %#v, want 872000", got)
 	}
 	if !reasoningLevelsContain(model, "max") {
 		t.Fatalf("supported_reasoning_levels does not include max: %#v", model["supported_reasoning_levels"])
@@ -698,21 +731,21 @@ func TestOpenAIModelsIncludeCodexMetadata(t *testing.T) {
 	if payload.Object != "list" {
 		t.Fatalf("object = %q, want list", payload.Object)
 	}
-	model := findOpenAIModel(payload.Data, "gpt-5.6-sol")
+	model := findOpenAIModel(payload.Data, "gpt-6-astra")
 	if model == nil {
-		t.Fatalf("gpt-5.6-sol model not found in %#v", payload.Data)
+		t.Fatal("gpt-6-astra model not found")
 	}
 	if got := model["object"]; got != "model" {
 		t.Fatalf("object = %#v, want model", got)
 	}
-	if got := model["display_name"]; got != "GPT-5.6-Sol" {
-		t.Fatalf("display_name = %#v, want GPT-5.6-Sol", got)
+	if got := model["display_name"]; got != "GPT-6-Astra" {
+		t.Fatalf("display_name = %#v, want GPT-6-Astra", got)
 	}
 	if !reasoningLevelsContain(model, "ultra") {
 		t.Fatalf("supported_reasoning_levels does not include ultra: %#v", model["supported_reasoning_levels"])
 	}
 	if modelHasFastTier(model) {
-		t.Fatalf("gpt-5.6-sol unexpectedly advertises Fast tier: %#v", model)
+		t.Fatalf("gpt-6-astra unexpectedly advertises Fast tier: %#v", model)
 	}
 }
 
@@ -759,6 +792,13 @@ func TestCodexClientModelsHideFastTierByDefault(t *testing.T) {
 	}
 	if modelHasFastTier(model) {
 		t.Fatalf("gpt-5.5 unexpectedly advertises Fast tier: %#v", model)
+	}
+	model = findCodexClientModel(payload.Models, "gpt-6-astra")
+	if model == nil {
+		t.Fatal("gpt-6-astra model metadata not found")
+	}
+	if modelHasFastTier(model) {
+		t.Fatalf("gpt-6-astra unexpectedly advertises Fast tier: %#v", model)
 	}
 }
 
