@@ -28,7 +28,7 @@ import (
 
 const websocketBetaHeader = "responses_websockets=2026-02-06"
 
-//go:generate go run ../../cmd/update-model-catalog --ref rust-v0.153.4 --output codex_client_models.json
+//go:generate go run ../../cmd/update-model-catalog --ref rust-v0.156.1 --output codex_client_models.json
 
 //go:embed codex_client_models.json
 var codexClientModelsJSON []byte
@@ -1796,6 +1796,8 @@ func writeProxyError(w http.ResponseWriter, err *proxyFinalError) {
 func codexModelIDs() []string {
 	return []string{
 		"gpt-6-astra",
+		"gpt-6-sol",
+		"gpt-6-luna",
 		"gpt-5.6-sol",
 		"gpt-5.6",
 		"gpt-5.6-terra",

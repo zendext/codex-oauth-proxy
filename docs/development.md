@@ -90,7 +90,7 @@ release at runtime:
 
 ```bash
 go generate ./internal/codexonly
-go run ./cmd/update-model-catalog --ref rust-v0.153.4 --check
+go run ./cmd/update-model-catalog --ref rust-v0.156.1 --check
 ```
 
 When updating it, first verify the latest stable Codex CLI release from the

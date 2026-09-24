@@ -619,11 +619,14 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 		displayName      string
 		visibility       string
 		maxContextWindow float64
+		reasoningEffort  string
 		fastTier         bool
 	}{
-		{"gpt-6-astra", "GPT-6-Astra", "list", 872000, true},
-		{"gpt-daybreak-blue-latest", "Daybreak Blue", "hide", 872000, false},
-		{"gpt-daybreak-red-latest", "Daybreak Red", "hide", 372000, false},
+		{"gpt-6-astra", "GPT-6-Astra", "list", 872000, "ultra", true},
+		{"gpt-6-sol", "GPT-6-Sol", "list", 872000, "ultra", true},
+		{"gpt-6-luna", "GPT-6-Luna", "list", 872000, "max", true},
+		{"gpt-daybreak-blue-latest", "Daybreak Blue", "hide", 872000, "ultra", false},
+		{"gpt-daybreak-red-latest", "Daybreak Red", "hide", 372000, "ultra", false},
 	} {
 		t.Run(want.slug, func(t *testing.T) {
 			model := findCodexClientModel(payload.Models, want.slug)
@@ -639,8 +642,8 @@ func TestCodexClientModelsIncludeFullCodexMetadata(t *testing.T) {
 			if got := model["max_context_window"]; got != want.maxContextWindow {
 				t.Errorf("max_context_window = %#v, want %v", got, want.maxContextWindow)
 			}
-			if !reasoningLevelsContain(model, "ultra") {
-				t.Errorf("supported_reasoning_levels does not include ultra: %#v", model["supported_reasoning_levels"])
+			if !reasoningLevelsContain(model, want.reasoningEffort) {
+				t.Errorf("supported_reasoning_levels does not include %s: %#v", want.reasoningEffort, model["supported_reasoning_levels"])
 			}
 			if got := modelHasFastTier(model); got != want.fastTier {
 				t.Errorf("Fast tier available = %t, want %t", got, want.fastTier)
