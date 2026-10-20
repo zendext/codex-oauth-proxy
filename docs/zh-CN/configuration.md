@@ -40,7 +40,7 @@ codex-oauth-proxy serve --config /etc/codex-oauth-proxy/config.yaml
 | `grok.host` | `127.0.0.1` | Grok 入口绑定主机。 |
 | `grok.port` | `8318` | Grok 入口端口。 |
 | `grok.auth-files` | `~/.grok/auth.json` | Grok CLI 登录文件。每次请求都会重新读取。 |
-| `grok.base-url` | `https://cli-chat-proxy.grok.com/v1` | Grok 订阅 API 的 Base URL。 |
+| `grok.base-url` | `https://cli-chat-proxy.grok.com/v1` | Grok 订阅 API 的 Base URL。客户端公开的 `/v1` 前缀会换成这里的路径，因此也可以是 `/gateway/v1` 这样的网关前缀。 |
 | `grok.client-version` | `1.0.46` | 客户端未提供时发给上游的 `x-grok-client-version`。`cli-chat-proxy` 会拒绝缺失或过旧的 CLI 身份。 |
 | `grok.refresh-token-url` | 空 | 可选的 Grok Token 端点覆盖值。空值使用 OIDC Discovery。 |
 

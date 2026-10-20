@@ -40,6 +40,7 @@ type GrokCredential struct {
 	Issuer       string
 	ClientID     string
 	ExpiresAt    time.Time
+	CreateTime   string
 	SourceCount  int
 }
 
@@ -146,15 +147,20 @@ func (s *GrokAuthStore) Refresh(ctx context.Context, id string, client *http.Cli
 	if current.RefreshToken == "" || current.Issuer == "" || current.ClientID == "" {
 		return nil, fmt.Errorf("Grok auth cannot be refreshed")
 	}
+	generation := grokAuthGeneration{
+		accountID:    current.AccountID,
+		accessToken:  current.AccessToken,
+		refreshToken: current.RefreshToken,
+		createTime:   current.CreateTime,
+	}
 	if strings.TrimSpace(tokenURL) == "" {
 		tokenURL, err = discoverGrokTokenURL(ctx, client, current.Issuer)
 		if err != nil {
 			return nil, err
 		}
 	}
-	generation, err := grokAuthGenerationAt(current.Path, current.Scope)
-	if err != nil {
-		return nil, err
+	if latest, err := grokAuthGenerationAt(current.Path, current.Scope); err != nil || latest != generation {
+		return nil, fmt.Errorf("Grok auth changed before refresh completed")
 	}
 	refreshed, err := refreshGrokToken(ctx, client, tokenURL, current)
 	if err != nil {
@@ -428,6 +434,7 @@ func grokCredentialFromRecord(path string, scope string, record map[string]any) 
 		Issuer:       issuer,
 		ClientID:     stringField(record, "oidc_client_id"),
 		ExpiresAt:    grokExpiry(record, accessToken),
+		CreateTime:   strings.TrimSpace(stringField(record, "create_time")),
 		SourceCount:  1,
 	}, true
 }

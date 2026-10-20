@@ -614,6 +614,9 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 }
 
 func (s *Server) serveGrok(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v0/local-admin/") || strings.HasPrefix(r.URL.Path, "/v0/management/") {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	path, local := grokManagementPath(r)
 	if strings.HasPrefix(r.URL.Path, "/v0/local-admin/") && !local {
 		writeError(w, http.StatusNotFound, "not found")
@@ -917,8 +920,9 @@ func grokEndpointURL(base *url.URL, clientPath string) string {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	if basePath != "" && (path == basePath || strings.HasPrefix(path, basePath+"/")) {
-		path = strings.TrimPrefix(path, basePath)
+	const publicPrefix = "/v1"
+	if path == publicPrefix || strings.HasPrefix(path, publicPrefix+"/") {
+		path = strings.TrimPrefix(path, publicPrefix)
 		if path == "" {
 			path = "/"
 		}

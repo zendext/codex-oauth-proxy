@@ -50,7 +50,7 @@ file.
 | `grok.host` | `127.0.0.1` | Bind host for the Grok listener. |
 | `grok.port` | `8318` | Grok listener port. |
 | `grok.auth-files` | `~/.grok/auth.json` | Grok CLI login files. Files are reread per request. |
-| `grok.base-url` | `https://cli-chat-proxy.grok.com/v1` | Grok subscription API base URL. |
+| `grok.base-url` | `https://cli-chat-proxy.grok.com/v1` | Grok subscription API base URL. The client's public `/v1` prefix is replaced by this path, including a gateway prefix such as `/gateway/v1`. |
 | `grok.client-version` | `1.0.46` | `x-grok-client-version` sent upstream when the client omits one. `cli-chat-proxy` rejects a missing or outdated CLI identity. |
 | `grok.refresh-token-url` | empty | Optional Grok token endpoint override. Empty uses OIDC discovery. |
 
