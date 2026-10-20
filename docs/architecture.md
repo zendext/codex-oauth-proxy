@@ -498,7 +498,7 @@ timeseries management API rather than reading SQLite directly.
 
 ## Confirmed boundaries
 
-The Codex-only process boundary is intentional. Remote management stays hidden
+The single-process boundary is intentional. Codex and Grok keep separate listeners and request paths; other providers stay excluded. Remote management stays hidden
 until `admin-api-key` is configured, while loopback administration stays
 available without that key; this is a security boundary, not only a convenience.
 SQLite failure stops the process instead of continuing on unreliable state.

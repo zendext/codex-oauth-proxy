@@ -56,8 +56,8 @@ always a single person or may administer a small shared local deployment.)
 
 ## Principles
 
-- Keep the implementation Codex-specific and small enough to run as one Go
-  process.
+- Keep Codex and Grok on separate listeners in one small Go process. Do not
+  add a generic provider framework.
 - Treat managed API keys, the optional admin key, and Codex OAuth tokens as
   separate credentials.
 - Do not continue proxying after the required SQLite state becomes unreliable.

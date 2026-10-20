@@ -12,7 +12,7 @@ depends-on:
 
 [English](SPEC.md) | [简体中文](SPEC.zh-CN.md)
 
-`internal/codexonly` owns the Codex-specific proxy. It is one module because
+`internal/codexonly` owns the Codex and Grok proxy paths. It is one module because
 routing, credential selection, failover, affinity, and usage share one request
 lifecycle; splitting those files would not create an independently reusable
 boundary.
