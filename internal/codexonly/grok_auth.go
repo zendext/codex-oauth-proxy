@@ -152,11 +152,15 @@ func (s *GrokAuthStore) Refresh(ctx context.Context, id string, client *http.Cli
 			return nil, err
 		}
 	}
+	generation, err := grokAuthGenerationAt(current.Path, current.Scope)
+	if err != nil {
+		return nil, err
+	}
 	refreshed, err := refreshGrokToken(ctx, client, tokenURL, current)
 	if err != nil {
 		return nil, err
 	}
-	if err = updateGrokAuthRecord(current.Path, current.Scope, refreshed, s.now()); err != nil {
+	if err = updateGrokAuthRecord(current.Path, current.Scope, generation, refreshed, s.now()); err != nil {
 		return nil, err
 	}
 	current.AccessToken = refreshed.AccessToken
@@ -221,10 +225,30 @@ func discoverGrokTokenURL(ctx context.Context, client *http.Client, issuer strin
 	if err = json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(payload.TokenEndpoint) == "" {
-		return "", fmt.Errorf("Grok token endpoint is missing")
+	if err = validateDiscoveredGrokTokenURL(payload.TokenEndpoint, issuer); err != nil {
+		return "", err
 	}
 	return payload.TokenEndpoint, nil
+}
+
+func validateDiscoveredGrokTokenURL(raw string, issuer string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	issuerURL, issuerErr := url.Parse(strings.TrimSpace(issuer))
+	if err != nil || issuerErr != nil || parsed.Hostname() == "" || issuerURL.Hostname() == "" {
+		return fmt.Errorf("Grok token endpoint is not allowed")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	sameIssuer := strings.EqualFold(host, issuerURL.Hostname())
+	if !sameIssuer && host != "x.ai" && !strings.HasSuffix(host, ".x.ai") {
+		return fmt.Errorf("Grok token endpoint host is not allowed")
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if sameIssuer && parsed.Scheme == issuerURL.Scheme && (host == "localhost" || host == "127.0.0.1" || host == "::1") {
+		return nil
+	}
+	return fmt.Errorf("Grok token endpoint is not allowed")
 }
 
 func refreshGrokToken(ctx context.Context, client *http.Client, tokenURL string, credential *GrokCredential) (oauthRefreshResponse, error) {
@@ -252,7 +276,47 @@ func refreshGrokToken(ctx context.Context, client *http.Client, tokenURL string,
 	return parsed, nil
 }
 
-func updateGrokAuthRecord(path string, scope string, refreshed oauthRefreshResponse, now time.Time) error {
+type grokAuthGeneration struct {
+	accountID    string
+	accessToken  string
+	refreshToken string
+	createTime   string
+}
+
+func grokAuthGenerationAt(path string, scope string) (grokAuthGeneration, error) {
+	record, err := grokAuthScopeRecord(path, scope)
+	if err != nil {
+		return grokAuthGeneration{}, err
+	}
+	return grokAuthGenerationFromRecord(record), nil
+}
+
+func grokAuthScopeRecord(path string, scope string) (map[string]any, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var scopes map[string]map[string]any
+	if err = json.Unmarshal(raw, &scopes); err != nil {
+		return nil, err
+	}
+	record := scopes[scope]
+	if record == nil {
+		return nil, fmt.Errorf("Grok auth scope not found")
+	}
+	return record, nil
+}
+
+func grokAuthGenerationFromRecord(record map[string]any) grokAuthGeneration {
+	return grokAuthGeneration{
+		accountID:    firstNonEmpty(stringField(record, "principal_id"), stringField(record, "team_id"), stringField(record, "user_id"), stringField(record, "email")),
+		accessToken:  strings.TrimSpace(stringField(record, "key", "access_token")),
+		refreshToken: strings.TrimSpace(stringField(record, "refresh_token")),
+		createTime:   strings.TrimSpace(stringField(record, "create_time")),
+	}
+}
+
+func updateGrokAuthRecord(path string, scope string, expected grokAuthGeneration, refreshed oauthRefreshResponse, now time.Time) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -264,6 +328,9 @@ func updateGrokAuthRecord(path string, scope string, refreshed oauthRefreshRespo
 	record := scopes[scope]
 	if record == nil {
 		return fmt.Errorf("Grok auth scope not found")
+	}
+	if grokAuthGenerationFromRecord(record) != expected {
+		return fmt.Errorf("Grok auth changed before refresh completed")
 	}
 	record["key"] = refreshed.AccessToken
 	if refreshed.RefreshToken != "" {

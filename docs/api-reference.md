@@ -36,7 +36,8 @@ The Grok listener defaults to `http://127.0.0.1:8318`. Its client base URL is
 CLI subscription identity, so the listener supplies `X-XAI-Token-Auth`,
 `x-authenticateresponse`, `x-grok-client-identifier`, `x-grok-client-mode`, and
 `x-grok-client-version` itself. A version sent by the client is preserved.
-It accepts `GET /v1/models`,
+Loopback callers can use `/v0/local-admin/grok/*` without an admin key. Remote
+Grok management still requires `admin-api-key`. It accepts `GET /v1/models`,
 `POST /v1/chat/completions`, and `POST /v1/responses`, plus shared user/key/usage
 management and Grok-specific auth routes. Codex auth actions and session-binding
 operations remain on port 8317.
