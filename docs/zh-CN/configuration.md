@@ -76,6 +76,11 @@ Codex 认证状态和管理操作复用这些现有边界，不提供单独的�
 host: "0.0.0.0"
 port: 8317
 auth-dir: "/root/.codex"
+grok:
+  host: "0.0.0.0"
+  port: 8318
+  auth-files:
+    - "/root/.grok/auth.json"
 
 database:
   path: ""
@@ -87,7 +92,7 @@ database:
 /root/.codex/codex-oauth-proxy.db
 ```
 
-因此该文件会持久化到同一个 `./auths` 挂载目录中。
+因此该文件会持久化到同一个 `./auths` 挂载目录中。原生默认仍绑定回环地址。容器内两个入口必须绑定 `0.0.0.0`，Compose 只把端口发布到宿主机回环地址。Grok CLI 登录目录挂载到 `/root/.grok`，Codex 文件仍在 `/root/.codex`。
 
 ## OAuth 文件加载
 

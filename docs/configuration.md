@@ -87,10 +87,20 @@ The default Compose setup mounts `./auths` at `/root/.codex`:
 host: "0.0.0.0"
 port: 8317
 auth-dir: "/root/.codex"
+grok:
+  host: "0.0.0.0"
+  port: 8318
+  auth-files:
+    - "/root/.grok/auth.json"
 
 database:
   path: ""
 ```
+
+The native defaults stay on loopback. Inside a container both listeners must
+bind `0.0.0.0`, while Compose publishes them only on the host loopback. Mount
+the Grok CLI login directory at `/root/.grok`; Codex files stay under
+`/root/.codex`.
 
 With an empty database path, the SQLite database is stored at:
 
