@@ -19,6 +19,11 @@ OpenAI 兼容客户端 Base URL：
 http://127.0.0.1:8317/v1
 ```
 
+Grok 入口默认是 `http://127.0.0.1:8318`，客户端 Base URL 是
+`http://127.0.0.1:8318/v1`。它接受 `GET /v1/models`、
+`POST /v1/chat/completions` 和 `POST /v1/responses`，以及共用的用户、密钥、
+用量管理和 Grok 登录管理路由。Codex 登录操作和会话绑定操作仍只在 8317。
+
 ## 认证
 
 服务器从以下位置读取候选凭据：

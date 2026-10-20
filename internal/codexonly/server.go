@@ -237,6 +237,8 @@ type Server struct {
 	httpClient                 *http.Client
 	baseURL                    *url.URL
 	chatGPTBaseURL             *url.URL
+	grokBaseURL                *url.URL
+	grokAuths                  *GrokAuthStore
 	ctx                        context.Context
 	cancel                     context.CancelFunc
 	sessionAffinityReplayStore func() *sessionAffinityReplayStore
@@ -291,6 +293,18 @@ func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
 	if chatGPTUpstream.Scheme == "" || chatGPTUpstream.Host == "" {
 		return nil, fmt.Errorf("ChatGPT base URL must include scheme and host")
 	}
+	grokBase, err := url.Parse(strings.TrimRight(cfg.Grok.BaseURL, "/"))
+	if err != nil {
+		return nil, fmt.Errorf("parse Grok base URL: %w", err)
+	}
+	if grokBase.Scheme == "" || grokBase.Host == "" {
+		return nil, fmt.Errorf("Grok base URL must include scheme and host")
+	}
+	grokAuthFiles, err := ResolveGrokAuthFiles(cfg.Grok.AuthFiles)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Grok.AuthFiles = grokAuthFiles
 	client, err := NewHTTPClient(cfg.ProxyURL, 0)
 	if err != nil {
 		return nil, err
@@ -341,6 +355,8 @@ func NewHandler(ctx context.Context, cfg *Config) (*Server, error) {
 		httpClient:     client,
 		baseURL:        upstream,
 		chatGPTBaseURL: chatGPTUpstream,
+		grokBaseURL:    grokBase,
+		grokAuths:      NewGrokAuthStore(grokAuthFiles),
 		ctx:            serverCtx,
 		cancel:         cancel,
 		waitRetry:      waitForProxyRetry,
@@ -363,6 +379,12 @@ func (s *Server) FatalErrors() <-chan error {
 		return nil
 	}
 	return s.users.failures.channel()
+}
+
+func (s *Server) GrokHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.serveGrok(w, r)
+	})
 }
 
 func (s *Server) Shutdown() {
@@ -560,6 +582,238 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, route upstrea
 		s.proxyCodex(w, r, route, authorization, signals, replayCandidate)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *Server) serveGrok(w http.ResponseWriter, r *http.Request) {
+	if s.ctx.Err() != nil {
+		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
+	switch {
+	case r.URL.Path == "/healthz":
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+		s.handleGrokModels(w, r)
+	case r.Method == http.MethodPost && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses"):
+		s.proxyGrok(w, r)
+	case r.URL.Path == "/v0/management/grok/auths" && r.Method == http.MethodGet:
+		s.handleGrokAuthStatus(w, r)
+	case r.URL.Path == "/v0/management/grok/auths/refresh" && r.Method == http.MethodPost:
+		s.handleGrokAuthRefresh(w, r)
+	case r.URL.Path == "/v0/management/grok/usage" && r.Method == http.MethodGet:
+		s.handleGrokSubscriptionUsage(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v0/management/") && s.grokSharedManagement(r.URL.Path):
+		if !s.managementAPIEnabled() {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !s.authorizedAdmin(r) {
+			writeError(w, http.StatusUnauthorized, "invalid admin API key")
+			return
+		}
+		s.handleManagement(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *Server) grokSharedManagement(path string) bool {
+	return path == "/v0/management/users" || strings.HasPrefix(path, "/v0/management/users/") ||
+		path == "/v0/management/usage" || path == "/v0/management/usage/timeseries"
+}
+
+func (s *Server) handleGrokModels(w http.ResponseWriter, r *http.Request) {
+	authorization, err := s.authorizeProxy(r, false)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	credential, err := s.grokAuths.Select(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "no active Grok auth available")
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.grokBaseURL.String()+"/models", nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "Grok upstream unavailable")
+		return
+	}
+	applyGrokProxyHeaders(req, r, credential, s.cfg, "")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "Grok upstream unavailable")
+		return
+	}
+	defer resp.Body.Close()
+	copyUpstreamResponse(w, resp)
+	_ = authorization
+}
+
+func (s *Server) proxyGrok(w http.ResponseWriter, r *http.Request) {
+	authorization, err := s.authorizeProxy(r, false)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxReplayBodyBytes+1))
+	if err != nil || len(body) > maxReplayBodyBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body is too large to replay")
+		return
+	}
+	metadata := proxyRequestUsageMetadata{}
+	if parsed, ok := usageMetadataFromJSON(body); ok {
+		metadata = parsed
+	}
+	excluded := map[string]struct{}{}
+	var lastStatus int
+	for {
+		credential, err := s.grokAuths.Select(r.Context(), excluded)
+		if err != nil {
+			if lastStatus == http.StatusUnauthorized {
+				writeError(w, http.StatusBadGateway, "Grok upstream authentication failed")
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "no active Grok auth available")
+			return
+		}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.grokBaseURL.String()+r.URL.Path, bytes.NewReader(body))
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "Grok upstream unavailable")
+			return
+		}
+		req.ContentLength = int64(len(body))
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		applyGrokProxyHeaders(req, r, credential, s.cfg, metadata.Model)
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			excluded[credential.ID] = struct{}{}
+			continue
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			discardAndCloseResponse(resp)
+			excluded[credential.ID] = struct{}{}
+			lastStatus = resp.StatusCode
+			continue
+		}
+		if s.shouldRecordUsage(authorization) {
+			capture := newUsageCaptureReadCloser(resp.Body, maxUsageCaptureBytes, func(payload []byte, truncated bool, counters UsageCounters, hasUsage bool) {
+				s.recordProxyUsageFromPayload(r.Context(), usageCaptureContext{
+					Authorization:   authorization,
+					AuthID:          credential.ID,
+					Model:           metadata.Model,
+					ReasoningEffort: metadata.ReasoningEffort,
+					ServiceTier:     metadata.ServiceTier,
+					StatusCode:      resp.StatusCode,
+					RequestID:       usageRequestID(r, resp),
+					Truncated:       truncated,
+					Payload:         payload,
+					Counters:        counters,
+					HasUsage:        hasUsage,
+				})
+			})
+			resp.Body = capture
+		}
+		copyUpstreamResponse(w, resp)
+		_ = resp.Body.Close()
+		return
+	}
+}
+
+func applyGrokProxyHeaders(out *http.Request, in *http.Request, credential *GrokCredential, cfg *Config, model string) {
+	out.Header.Set("Authorization", "Bearer "+credential.AccessToken)
+	out.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	out.Header.Set("x-authenticateresponse", "authenticate-response")
+	if override := strings.TrimSpace(in.Header.Get("x-grok-model-override")); override != "" {
+		model = override
+	}
+	if strings.TrimSpace(model) != "" {
+		out.Header.Set("x-grok-model-override", model)
+	}
+	if version := strings.TrimSpace(cfg.Grok.ClientVersion); version != "" {
+		out.Header.Set("x-grok-client-version", version)
+	}
+	if contentType := in.Header.Get("Content-Type"); contentType != "" {
+		out.Header.Set("Content-Type", contentType)
+	}
+	if accept := in.Header.Get("Accept"); accept != "" {
+		out.Header.Set("Accept", accept)
+	}
+}
+
+func copyUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func (s *Server) requireGrokAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if !s.managementAPIEnabled() {
+		writeError(w, http.StatusNotFound, "not found")
+		return false
+	}
+	if !s.authorizedAdmin(r) {
+		writeError(w, http.StatusUnauthorized, "invalid admin API key")
+		return false
+	}
+	return true
+}
+
+func (s *Server) handleGrokAuthStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGrokAdmin(w, r) {
+		return
+	}
+	credentials, err := s.grokAuths.Load(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "Grok auth files are unavailable")
+		return
+	}
+	statuses := make([]GrokAuthStatus, 0, len(credentials))
+	for _, credential := range credentials {
+		statuses = append(statuses, credential.PublicStatus(time.Now()))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"auths": statuses})
+}
+
+func (s *Server) handleGrokAuthRefresh(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGrokAdmin(w, r) {
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSONRequest(w, r, &req) {
+		return
+	}
+	credential, err := s.grokAuths.Refresh(r.Context(), req.ID, s.httpClient, s.cfg.Grok.RefreshTokenURL)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"auth": credential.PublicStatus(time.Now())})
+}
+
+func (s *Server) handleGrokSubscriptionUsage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGrokAdmin(w, r) {
+		return
+	}
+	usage, err := s.grokAuths.SubscriptionUsage(r.Context(), r.URL.Query().Get("id"), s.httpClient, s.grokBaseURL.String())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, usage)
+}
+
+func (c *GrokCredential) PublicStatus(now time.Time) GrokAuthStatus {
+	return GrokAuthStatus{
+		ID: c.ID, AccountID: c.AccountID, Email: c.Email, SourceCount: c.SourceCount,
+		ExpiresAt: c.ExpiresAt, Refreshable: c.RefreshToken != "" && c.Issuer != "" && c.ClientID != "",
+		Expired: c.Expired(now),
 	}
 }
 
@@ -1875,6 +2129,20 @@ func ListenAddr(cfg *Config) string {
 		host = cfg.Host
 		if cfg.Port != 0 {
 			port = cfg.Port
+		}
+	}
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port))
+}
+
+func GrokListenAddr(cfg *Config) string {
+	host := "127.0.0.1"
+	port := DefaultGrokPort
+	if cfg != nil {
+		if strings.TrimSpace(cfg.Grok.Host) != "" {
+			host = cfg.Grok.Host
+		}
+		if cfg.Grok.Port != 0 {
+			port = cfg.Grok.Port
 		}
 	}
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port))

@@ -12,6 +12,9 @@ import (
 const (
 	DefaultAuthDir        = "~/.codex"
 	DefaultPort           = 8317
+	DefaultGrokPort       = 8318
+	DefaultGrokAuthFile   = "~/.grok/auth.json"
+	DefaultGrokBaseURL    = "https://cli-chat-proxy.grok.com/v1"
 	DefaultCodexBaseURL   = "https://chatgpt.com/backend-api/codex"
 	DefaultChatGPTBaseURL = "https://chatgpt.com/backend-api"
 	DefaultCodexUA        = "codex_cli_rs/0.156.1"
@@ -35,12 +38,22 @@ type Config struct {
 	CodexUserAgent       string         `yaml:"codex-user-agent"`
 	CodexBetaFeatures    string         `yaml:"codex-beta-features"`
 	CodexRefreshTokenURL string         `yaml:"codex-refresh-token-url"`
+	Grok                 GrokConfig     `yaml:"grok"`
 	requestRetrySet      bool
 	maxRetryIntervalSet  bool
 }
 
 type DatabaseConfig struct {
 	Path string `yaml:"path"`
+}
+
+type GrokConfig struct {
+	Host            string   `yaml:"host"`
+	Port            int      `yaml:"port"`
+	AuthFiles       []string `yaml:"auth-files"`
+	BaseURL         string   `yaml:"base-url"`
+	ClientVersion   string   `yaml:"client-version"`
+	RefreshTokenURL string   `yaml:"refresh-token-url"`
 }
 
 type UsageConfig struct {
@@ -94,6 +107,15 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.Port == 0 {
 		cfg.Port = DefaultPort
 	}
+	if cfg.Grok.Port == 0 {
+		cfg.Grok.Port = DefaultGrokPort
+	}
+	if len(cfg.Grok.AuthFiles) == 0 {
+		cfg.Grok.AuthFiles = []string{DefaultGrokAuthFile}
+	}
+	if strings.TrimSpace(cfg.Grok.BaseURL) == "" {
+		cfg.Grok.BaseURL = DefaultGrokBaseURL
+	}
 	if strings.TrimSpace(cfg.AuthDir) == "" {
 		cfg.AuthDir = DefaultAuthDir
 	}
@@ -118,6 +140,29 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.MaxRetryInterval < 0 {
 		cfg.MaxRetryInterval = 0
 	}
+}
+
+func ResolveGrokAuthFiles(paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		paths = []string{DefaultGrokAuthFile}
+	}
+	resolved := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		expanded, err := expandHome(path)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(expanded) == "" {
+			continue
+		}
+		if _, ok := seen[expanded]; ok {
+			continue
+		}
+		seen[expanded] = struct{}{}
+		resolved = append(resolved, expanded)
+	}
+	return resolved, nil
 }
 
 func ResolveAuthDir(path string) (string, error) {

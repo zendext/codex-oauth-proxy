@@ -22,10 +22,12 @@ Management responses use `Cache-Control: no-store`.
 
 ## Local Admin CLI
 
-The CLI connects to `http://127.0.0.1:8317` by default:
+The CLI connects to `http://127.0.0.1:8317` by default. Grok commands connect
+to `http://127.0.0.1:8318`:
 
 ```bash
 codex-oauth-proxy admin users list
+codex-oauth-proxy admin grok status
 ```
 
 It calls `/v0/local-admin/*`. The server accepts this route only when the

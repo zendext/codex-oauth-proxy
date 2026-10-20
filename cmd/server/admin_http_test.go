@@ -33,6 +33,23 @@ func TestParseCLIAdminUsesDefaultURL(t *testing.T) {
 	}
 }
 
+func TestGrokAdminCommandsDefaultToGrokListener(t *testing.T) {
+	var sawPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"auths":[]}`))
+	}))
+	defer server.Close()
+	stdout := runAdminTestCommand(t, server.URL, "grok", "status", "--grok-url", server.URL)
+	if sawPath != "/v0/local-admin/grok/auths" {
+		t.Fatalf("path = %q, want Grok local admin path", sawPath)
+	}
+	if !strings.Contains(stdout, "ID") {
+		t.Fatalf("stdout = %q, want Grok auth table", stdout)
+	}
+}
+
 func TestAdminClientUsesLocalAdminPrefix(t *testing.T) {
 	var gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -55,3 +55,13 @@ codex-beta-features: ""
 
 # Optional Codex OAuth refresh token endpoint override.
 codex-refresh-token-url: ""
+
+# Second local listener for Grok Build.
+grok:
+  host: "127.0.0.1"
+  port: 8318
+  auth-files:
+    - "~/.grok/auth.json"
+  base-url: "https://cli-chat-proxy.grok.com/v1"
+  client-version: ""
+  refresh-token-url: ""

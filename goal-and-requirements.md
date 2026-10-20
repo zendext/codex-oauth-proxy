@@ -32,6 +32,7 @@ always a single person or may administer a small shared local deployment.)
 ## Capabilities
 
 - Proxy whitelisted Codex and selected ChatGPT compatibility requests.
+- Proxy Grok Build model requests through a second local listener using existing Grok CLI logins.
 - Authenticate callers with managed `cop_...` API keys.
 - Refresh, select, and fail over Codex OAuth credentials.
 - Keep a session on one healthy credential without storing the raw session
@@ -48,7 +49,7 @@ always a single person or may administer a small shared local deployment.)
 - Generic provider translation, a management UI, SDK embedding, a plugin host,
   and alternate storage backends are excluded. These are product boundaries,
   not unfinished work.
-- The proxy does not implement a Codex OAuth login flow.
+- The proxy does not implement a Codex or Grok OAuth login flow.
 - The process does not terminate TLS. The deployment environment owns listen
   address selection and transport termination.
 - Published release artifacts are Linux amd64 only.

@@ -17,6 +17,7 @@ credentials from Codex CLI.
 - Uses health-aware Codex OAuth failover, cooldowns, and coordinated token refresh.
 - Persists tenant-scoped session affinity without storing raw session identifiers.
 - Records per-user token usage and provides an optional Grafana dashboard.
+- Exposes a second local listener for Grok Build using existing Grok CLI logins.
 
 ## Quick Start
 
@@ -52,6 +53,21 @@ requires_openai_auth = false
 ```bash
 export COP_API_KEY="cop_..."
 codex
+```
+
+Point Grok Build at the second listener with the same managed key:
+
+```toml
+base_url = "http://127.0.0.1:8318/v1"
+env_key = "COP_API_KEY"
+```
+
+Inspect or refresh Grok logins with:
+
+```bash
+codex-oauth-proxy admin grok status
+codex-oauth-proxy admin grok refresh <auth-id>
+codex-oauth-proxy admin grok usage <auth-id>
 ```
 
 The local admin CLI calls a loopback-only endpoint and does not require

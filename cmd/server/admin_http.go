@@ -19,6 +19,7 @@ type adminCommand struct {
 	JSON  bool              `name:"json" help:"Write machine-readable JSON output."`
 	Users adminUsersCommand `cmd:"" help:"Manage users and API keys."`
 	Usage adminUsageCommand `cmd:"" help:"Inspect usage data."`
+	Grok  adminGrokCommand  `cmd:"" help:"Manage the local Grok listener."`
 }
 
 type adminClient struct {

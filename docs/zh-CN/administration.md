@@ -12,10 +12,12 @@
 
 ## 本地管理 CLI
 
-CLI 默认连接 `http://127.0.0.1:8317`：
+CLI 默认连接 `http://127.0.0.1:8317`。Grok 命令连接
+`http://127.0.0.1:8318`：
 
 ```bash
 codex-oauth-proxy admin users list
+codex-oauth-proxy admin grok status
 ```
 
 它调用 `/v0/local-admin/*`。服务器只在请求远端地址为回环 IP
