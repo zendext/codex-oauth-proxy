@@ -1,3 +1,14 @@
+---
+id: api-reference
+type: module-design
+title: Proxy and management API
+status: draft
+parent: architecture
+depends-on:
+  - configuration
+  - administration
+---
+
 # API Reference
 
 [English](api-reference.md) | [简体中文](zh-CN/api-reference.md)

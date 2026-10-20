@@ -1,3 +1,11 @@
+---
+id: configuration
+type: module-design
+title: Runtime configuration
+status: draft
+parent: architecture
+---
+
 # Configuration
 
 [English](configuration.md) | [简体中文](zh-CN/configuration.md)

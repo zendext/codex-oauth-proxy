@@ -1,3 +1,13 @@
+---
+id: administration
+type: module-design
+title: Administration surfaces
+status: draft
+parent: architecture
+depends-on:
+  - configuration
+---
+
 # Administration
 
 [English](administration.md) | [简体中文](zh-CN/administration.md)

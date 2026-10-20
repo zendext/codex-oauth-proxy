@@ -1,3 +1,11 @@
+---
+id: architecture
+type: architecture-design
+title: Codex OAuth proxy architecture
+status: draft
+parent: goal-and-requirements
+---
+
 # Architecture
 
 [English](architecture.md) | [简体中文](zh-CN/architecture.md)
@@ -485,6 +493,18 @@ the 30-day retention window.
 
 Snapshots and timeseries are read from the same table. Grafana consumes the
 timeseries management API rather than reading SQLite directly.
+
+## Confirmed boundaries
+
+The Codex-only process boundary is intentional. Remote management stays hidden
+until `admin-api-key` is configured, while loopback administration stays
+available without that key; this is a security boundary, not only a convenience.
+SQLite failure stops the process instead of continuing on unreliable state.
+
+The implementation stores session-affinity digests rather than raw session
+identifiers. The operational reason for that representation is unconfirmed.
+
+Published release artifacts are Linux amd64 only.
 
 ## Trust and Secret Boundaries
 
