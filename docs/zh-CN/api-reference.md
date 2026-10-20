@@ -20,7 +20,10 @@ http://127.0.0.1:8317/v1
 ```
 
 Grok 入口默认是 `http://127.0.0.1:8318`，客户端 Base URL 是
-`http://127.0.0.1:8318/v1`。它接受 `GET /v1/models`、
+`http://127.0.0.1:8318/v1`。自定义地址不会让 Grok Build 自动补上 CLI 订阅身份，
+所以入口会自行补上 `X-XAI-Token-Auth`、`x-authenticateresponse`、
+`x-grok-client-identifier`、`x-grok-client-mode` 和 `x-grok-client-version`。
+客户端已经带来的版本会被保留。它接受 `GET /v1/models`、
 `POST /v1/chat/completions` 和 `POST /v1/responses`，以及共用的用户、密钥、
 用量管理和 Grok 登录管理路由。Codex 登录操作和会话绑定操作仍只在 8317。
 

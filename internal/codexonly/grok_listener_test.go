@@ -30,11 +30,16 @@ func TestGrokListenerUsesManagedKeyAndStableAuth(t *testing.T) {
 	})
 
 	var sawAuthorization, sawTokenAuth, sawModel, sawClientKey string
+	var sawVersion, sawIdentifier, sawMode, sawUserAgent string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawAuthorization = r.Header.Get("Authorization")
 		sawTokenAuth = r.Header.Get("X-XAI-Token-Auth")
 		sawModel = r.Header.Get("x-grok-model-override")
 		sawClientKey = r.Header.Get("X-API-Key")
+		sawVersion = r.Header.Get("x-grok-client-version")
+		sawIdentifier = r.Header.Get("x-grok-client-identifier")
+		sawMode = r.Header.Get("x-grok-client-mode")
+		sawUserAgent = r.Header.Get("User-Agent")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp_1","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}`))
 	}))
@@ -49,6 +54,9 @@ func TestGrokListenerUsesManagedKeyAndStableAuth(t *testing.T) {
 	}
 	if sawAuthorization != "Bearer grok-access" || sawTokenAuth != "xai-grok-cli" || sawModel != "grok-4.6" {
 		t.Fatalf("upstream auth/model = %q %q %q", sawAuthorization, sawTokenAuth, sawModel)
+	}
+	if sawVersion != "0.2.93" || sawIdentifier != "grok-shell" || sawMode != "headless" || !strings.HasPrefix(sawUserAgent, "grok-shell/") {
+		t.Fatalf("CLI identity = version %q identifier %q mode %q ua %q", sawVersion, sawIdentifier, sawMode, sawUserAgent)
 	}
 	if sawClientKey != "" {
 		t.Fatalf("managed key leaked upstream: %q", sawClientKey)
@@ -84,7 +92,7 @@ func TestGrokListenerRejectsCodexOnlyRoutes(t *testing.T) {
 }
 
 func TestGrokManagementRefreshesLoginAndReadsSubscriptionUsage(t *testing.T) {
-	var sawRefreshClient, sawUsageAuth string
+	var sawRefreshClient, sawUsageAuth, sawUsageVersion string
 	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
@@ -102,6 +110,7 @@ func TestGrokManagementRefreshesLoginAndReadsSubscriptionUsage(t *testing.T) {
 	defer authServer.Close()
 	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawUsageAuth = r.Header.Get("Authorization")
+		sawUsageVersion = r.Header.Get("x-grok-client-version")
 		if r.URL.Path != "/billing" || r.URL.Query().Get("format") != "credits" {
 			t.Fatalf("usage request = %s", r.URL.String())
 		}
@@ -140,8 +149,8 @@ func TestGrokManagementRefreshesLoginAndReadsSubscriptionUsage(t *testing.T) {
 		t.Fatalf("auth file was not safely updated: %v %s", err, raw)
 	}
 	usage := doJSONRequest(t, handler.Grok, http.MethodGet, "/v0/management/grok/usage?id="+listed.Auths[0].ID, "", "admin-key")
-	if usage.Code != http.StatusOK || sawUsageAuth != "Bearer fresh-access" {
-		t.Fatalf("usage = %d auth %q body %s", usage.Code, sawUsageAuth, usage.Body.String())
+	if usage.Code != http.StatusOK || sawUsageAuth != "Bearer fresh-access" || sawUsageVersion == "" {
+		t.Fatalf("usage = %d auth %q version %q body %s", usage.Code, sawUsageAuth, sawUsageVersion, usage.Body.String())
 	}
 }
 

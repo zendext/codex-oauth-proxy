@@ -189,7 +189,7 @@ func (s *GrokAuthStore) SubscriptionUsage(ctx context.Context, id string, client
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+current.AccessToken)
-	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	applyGrokIdentityHeaders(req.Header, "")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

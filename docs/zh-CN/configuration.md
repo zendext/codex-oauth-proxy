@@ -41,7 +41,7 @@ codex-oauth-proxy serve --config /etc/codex-oauth-proxy/config.yaml
 | `grok.port` | `8318` | Grok 入口端口。 |
 | `grok.auth-files` | `~/.grok/auth.json` | Grok CLI 登录文件。每次请求都会重新读取。 |
 | `grok.base-url` | `https://cli-chat-proxy.grok.com/v1` | Grok 订阅 API 的 Base URL。 |
-| `grok.client-version` | 空 | 可选的上游 `x-grok-client-version`。 |
+| `grok.client-version` | `1.0.46` | 客户端未提供时发给上游的 `x-grok-client-version`。`cli-chat-proxy` 会拒绝缺失或过旧的 CLI 身份。 |
 | `grok.refresh-token-url` | 空 | 可选的 Grok Token 端点覆盖值。空值使用 OIDC Discovery。 |
 
 ## 最小原生配置

@@ -10,6 +10,7 @@
 - 加载并刷新 Codex 凭证，然后选择一个健康凭证。
 - 只代理白名单路由。未匹配的路由返回 `404`。
 - 在独立入口服务 Grok，不暴露 Codex 专用路由。
+- 为自定义 Base URL 客户端补上它不会发送的 CLI 订阅身份头，不改写 Grok Build 请求体。
 - 在本地转换 Chat Completions 和 Zed Edit Prediction 请求。
 - 在同一个 SQLite 数据库中保存用户、key 哈希、亲和性摘要、权威认证健康状态和用量。
 - 把运行时第一次意外的 SQLite 失败变成进程级关闭。

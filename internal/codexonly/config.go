@@ -10,14 +10,15 @@ import (
 )
 
 const (
-	DefaultAuthDir        = "~/.codex"
-	DefaultPort           = 8317
-	DefaultGrokPort       = 8318
-	DefaultGrokAuthFile   = "~/.grok/auth.json"
-	DefaultGrokBaseURL    = "https://cli-chat-proxy.grok.com/v1"
-	DefaultCodexBaseURL   = "https://chatgpt.com/backend-api/codex"
-	DefaultChatGPTBaseURL = "https://chatgpt.com/backend-api"
-	DefaultCodexUA        = "codex_cli_rs/0.156.1"
+	DefaultAuthDir           = "~/.codex"
+	DefaultPort              = 8317
+	DefaultGrokPort          = 8318
+	DefaultGrokAuthFile      = "~/.grok/auth.json"
+	DefaultGrokBaseURL       = "https://cli-chat-proxy.grok.com/v1"
+	DefaultGrokClientVersion = "1.0.46"
+	DefaultCodexBaseURL      = "https://chatgpt.com/backend-api/codex"
+	DefaultChatGPTBaseURL    = "https://chatgpt.com/backend-api"
+	DefaultCodexUA           = "codex_cli_rs/0.156.1"
 )
 
 type Config struct {
@@ -115,6 +116,9 @@ func ApplyDefaults(cfg *Config) {
 	}
 	if strings.TrimSpace(cfg.Grok.BaseURL) == "" {
 		cfg.Grok.BaseURL = DefaultGrokBaseURL
+	}
+	if strings.TrimSpace(cfg.Grok.ClientVersion) == "" {
+		cfg.Grok.ClientVersion = DefaultGrokClientVersion
 	}
 	if strings.TrimSpace(cfg.AuthDir) == "" {
 		cfg.AuthDir = DefaultAuthDir

@@ -722,22 +722,61 @@ func (s *Server) proxyGrok(w http.ResponseWriter, r *http.Request) {
 
 func applyGrokProxyHeaders(out *http.Request, in *http.Request, credential *GrokCredential, cfg *Config, model string) {
 	out.Header.Set("Authorization", "Bearer "+credential.AccessToken)
-	out.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
-	out.Header.Set("x-authenticateresponse", "authenticate-response")
+	version := grokClientVersion(cfg)
+	if incoming := strings.TrimSpace(in.Header.Get("x-grok-client-version")); incoming != "" {
+		version = incoming
+	}
+	if incoming := strings.TrimSpace(in.Header.Get("x-grok-client-identifier")); incoming != "" {
+		out.Header.Set("x-grok-client-identifier", incoming)
+	}
+	if incoming := strings.TrimSpace(in.Header.Get("x-grok-client-mode")); incoming != "" {
+		out.Header.Set("x-grok-client-mode", incoming)
+	}
+	if ua := strings.TrimSpace(in.Header.Get("User-Agent")); ua != "" && !strings.HasPrefix(ua, "Go-http-client/") {
+		out.Header.Set("User-Agent", ua)
+	}
+	applyGrokIdentityHeaders(out.Header, version)
 	if override := strings.TrimSpace(in.Header.Get("x-grok-model-override")); override != "" {
 		model = override
 	}
 	if strings.TrimSpace(model) != "" {
 		out.Header.Set("x-grok-model-override", model)
 	}
-	if version := strings.TrimSpace(cfg.Grok.ClientVersion); version != "" {
-		out.Header.Set("x-grok-client-version", version)
-	}
 	if contentType := in.Header.Get("Content-Type"); contentType != "" {
 		out.Header.Set("Content-Type", contentType)
 	}
 	if accept := in.Header.Get("Accept"); accept != "" {
 		out.Header.Set("Accept", accept)
+	}
+}
+
+func grokClientVersion(cfg *Config) string {
+	if cfg != nil {
+		if version := strings.TrimSpace(cfg.Grok.ClientVersion); version != "" {
+			return version
+		}
+	}
+	return DefaultGrokClientVersion
+}
+
+func applyGrokIdentityHeaders(header http.Header, version string) {
+	if header == nil {
+		return
+	}
+	if strings.TrimSpace(version) == "" {
+		version = DefaultGrokClientVersion
+	}
+	header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	header.Set("x-authenticateresponse", "authenticate-response")
+	header.Set("x-grok-client-version", version)
+	if strings.TrimSpace(header.Get("x-grok-client-identifier")) == "" {
+		header.Set("x-grok-client-identifier", "grok-shell")
+	}
+	if strings.TrimSpace(header.Get("x-grok-client-mode")) == "" {
+		header.Set("x-grok-client-mode", "headless")
+	}
+	if ua := strings.TrimSpace(header.Get("User-Agent")); ua == "" || strings.HasPrefix(ua, "Go-http-client/") {
+		header.Set("User-Agent", "grok-shell/"+version)
 	}
 }
 

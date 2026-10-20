@@ -23,6 +23,7 @@ boundary.
 - Load and refresh Codex credentials, then select a healthy credential.
 - Proxy only whitelisted routes. Unmatched routes return `404`.
 - Serve Grok on an independent listener without exposing Codex-only routes.
+- Supply the CLI subscription identity headers that a custom base URL client omits. Do not rewrite Grok Build request bodies.
 - Convert Chat Completions and Zed Edit Prediction requests locally.
 - Persist users, key hashes, affinity digests, authoritative auth health, and
   usage in one SQLite database.

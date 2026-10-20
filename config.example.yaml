@@ -63,5 +63,5 @@ grok:
   auth-files:
     - "~/.grok/auth.json"
   base-url: "https://cli-chat-proxy.grok.com/v1"
-  client-version: ""
+  client-version: "1.0.46"
   refresh-token-url: ""
