@@ -272,7 +272,7 @@ func TestWaitForServerReturnsFatalStorageError(t *testing.T) {
 
 	err := waitForServer(
 		&commandRuntime{ctx: context.Background(), stdout: io.Discard},
-		&http.Server{},
+		[]*http.Server{{}},
 		lifecycle,
 		make(chan error),
 		make(chan os.Signal),

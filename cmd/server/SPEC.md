@@ -18,8 +18,8 @@ belongs to `codex-proxy`.
 ## Responsibility
 
 - Parse `serve` and `admin` commands. Omitting a command runs the server.
-- Load configuration, construct the proxy handler, and listen with a 10-second
-  header timeout and no body read/write timeout.
+- Load configuration, construct the proxy handler, and listen on the Codex and
+  Grok addresses with a 10-second header timeout and no body read/write timeout.
 - Stop on interrupt, `SIGTERM`, handler context cancellation, or a fatal
   storage error. Allow 10 seconds for graceful HTTP shutdown, then force-close
   remaining connections.

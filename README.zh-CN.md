@@ -17,6 +17,7 @@ Codex 请求。
 - 使用健康感知的 Codex OAuth 故障转移、冷却和协调 Token 刷新。
 - 持久化租户范围的会话亲和性，不存储原始会话标识符。
 - 记录按用户划分的 Token 用量，并提供可选 Grafana 仪表盘。
+- 使用本机已有的 Grok CLI 登录，为 Grok Build 提供第二个本地入口。
 
 ## 快速开始
 
@@ -52,6 +53,21 @@ requires_openai_auth = false
 ```bash
 export COP_API_KEY="cop_..."
 codex
+```
+
+Grok Build 使用同一个托管密钥，并把 Base URL 指向第二个入口：
+
+```toml
+base_url = "http://127.0.0.1:8318/v1"
+env_key = "COP_API_KEY"
+```
+
+查看或刷新 Grok 登录：
+
+```bash
+codex-oauth-proxy admin grok status
+codex-oauth-proxy admin grok refresh <auth-id>
+codex-oauth-proxy admin grok usage <auth-id>
 ```
 
 本地管理 CLI 调用仅允许回环地址访问的端点，不需要 `admin-api-key`。

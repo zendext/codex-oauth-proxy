@@ -15,9 +15,9 @@ parent: goal-and-requirements
 - `serve` starts the HTTP proxy and project APIs.
 - `admin` calls the running server's loopback-only administration route.
 
-The project intentionally keeps one Codex-specific implementation. It does not
-include provider translation, a management UI, plugin hosting, or alternate
-storage backends.
+The project keeps separate Codex and Grok request paths in one process. It does
+not include generic provider translation, a management UI, plugin hosting, or
+alternate storage backends.
 
 ## Source Layout
 
@@ -26,6 +26,7 @@ storage backends.
 | `cmd/server/` | Process entrypoint, server lifecycle, admin CLI, HTTP client, and CLI formatting. |
 | `internal/codexonly/config.go` | YAML loading and path/default resolution. |
 | `internal/codexonly/auth.go` | OAuth file discovery, parsing, filtering, and persistence. |
+| `internal/codexonly/grok_auth.go` | Read-only Grok CLI login discovery, stable identity selection, refresh, and subscription usage lookup. |
 | `internal/codexonly/auth_management.go` | Safe auth status, bounded management actions, binding clearing, and active-connection counts. |
 | `internal/codexonly/auth_health.go` | Global credential health, model exclusions, cooldown reconciliation, and authoritative-state persistence. |
 | `internal/codexonly/refresh.go` | OAuth refresh and outbound HTTP transport construction. |
@@ -53,7 +54,8 @@ Startup performs these steps:
    initial persisted user state, ensure tenant-scope digest metadata for
    affinity management, remove targets for auth identities that are no longer
    present, and restore unexpired authoritative auth health.
-7. Start one `net/http` server.
+7. Start two `net/http` servers: Codex on `host:port` and Grok on
+   `grok.host:grok.port`.
 
 The server sets `ReadHeaderTimeout` to 10 seconds. It does not set read or write
 timeouts that would terminate established streaming or WebSocket traffic.
@@ -496,7 +498,7 @@ timeseries management API rather than reading SQLite directly.
 
 ## Confirmed boundaries
 
-The Codex-only process boundary is intentional. Remote management stays hidden
+The single-process boundary is intentional. Codex and Grok keep separate listeners and request paths; other providers stay excluded. Remote management stays hidden
 until `admin-api-key` is configured, while loopback administration stays
 available without that key; this is a security boundary, not only a convenience.
 SQLite failure stops the process instead of continuing on unreliable state.

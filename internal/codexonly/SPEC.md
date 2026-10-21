@@ -12,7 +12,7 @@ depends-on:
 
 [English](SPEC.md) | [简体中文](SPEC.zh-CN.md)
 
-`internal/codexonly` owns the Codex-specific proxy. It is one module because
+`internal/codexonly` owns the Codex and Grok proxy paths. It is one module because
 routing, credential selection, failover, affinity, and usage share one request
 lifecycle; splitting those files would not create an independently reusable
 boundary.
@@ -22,6 +22,8 @@ boundary.
 - Authenticate managed callers and selected OAuth-compatibility routes.
 - Load and refresh Codex credentials, then select a healthy credential.
 - Proxy only whitelisted routes. Unmatched routes return `404`.
+- Serve Grok on an independent listener without exposing Codex-only routes.
+- Supply the CLI subscription identity headers that a custom base URL client omits. Do not rewrite Grok Build request bodies.
 - Convert Chat Completions and Zed Edit Prediction requests locally.
 - Persist users, key hashes, affinity digests, authoritative auth health, and
   usage in one SQLite database.

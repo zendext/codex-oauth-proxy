@@ -37,6 +37,12 @@ codex-oauth-proxy serve --config /etc/codex-oauth-proxy/config.yaml
 | `codex-user-agent` | 空 | 上游 User-Agent 覆盖值。`client_version` 缺失或为空时，`/v1/models` 使用其中的版本；无法解析时回退到内置 Codex CLI 版本。 |
 | `codex-beta-features` | 空 | 客户端未提供时使用的 `x-codex-beta-features` 回退 Header。 |
 | `codex-refresh-token-url` | 空 | OAuth 刷新端点覆盖值。空值使用 `https://auth.openai.com/oauth/token`。 |
+| `grok.host` | `127.0.0.1` | Grok 入口绑定主机。 |
+| `grok.port` | `8318` | Grok 入口端口。 |
+| `grok.auth-files` | `~/.grok/auth.json` | Grok CLI 登录文件。每次请求都会重新读取。 |
+| `grok.base-url` | `https://cli-chat-proxy.grok.com/v1` | Grok 订阅 API 的 Base URL。客户端公开的 `/v1` 前缀会换成这里的路径，因此也可以是 `/gateway/v1` 这样的网关前缀。 |
+| `grok.client-version` | `1.0.46` | 客户端未提供时发给上游的 `x-grok-client-version`。`cli-chat-proxy` 会拒绝缺失或过旧的 CLI 身份。 |
+| `grok.refresh-token-url` | 空 | 可选的 Grok Token 端点覆盖值。空值使用 OIDC Discovery。 |
 
 ## 最小原生配置
 
@@ -44,6 +50,11 @@ codex-oauth-proxy serve --config /etc/codex-oauth-proxy/config.yaml
 host: "127.0.0.1"
 port: 8317
 auth-dir: "~/.codex"
+grok:
+  host: "127.0.0.1"
+  port: 8318
+  auth-files:
+    - "~/.grok/auth.json"
 ```
 
 本地管理 CLI 不需要 `admin-api-key`。只有远程管理 API 或 Grafana 需要时才添加
@@ -65,6 +76,11 @@ Codex 认证状态和管理操作复用这些现有边界，不提供单独的�
 host: "0.0.0.0"
 port: 8317
 auth-dir: "/root/.codex"
+grok:
+  host: "0.0.0.0"
+  port: 8318
+  auth-files:
+    - "/root/.grok/auth.json"
 
 database:
   path: ""
@@ -76,7 +92,7 @@ database:
 /root/.codex/codex-oauth-proxy.db
 ```
 
-因此该文件会持久化到同一个 `./auths` 挂载目录中。
+因此该文件会持久化到同一个 `./auths` 挂载目录中。原生默认仍绑定回环地址。容器内两个入口必须绑定 `0.0.0.0`，Compose 只把端口发布到宿主机回环地址。Grok CLI 登录目录挂载到 `/root/.grok`，Codex 文件仍在 `/root/.codex`。
 
 ## OAuth 文件加载
 

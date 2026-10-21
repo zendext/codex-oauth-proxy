@@ -47,6 +47,12 @@ file.
 | `codex-user-agent` | empty | Upstream User-Agent override. Its version is used by `/v1/models` when `client_version` is absent or empty; an unparseable value falls back to the bundled Codex CLI version. |
 | `codex-beta-features` | empty | Fallback `x-codex-beta-features` header when the client did not provide one. |
 | `codex-refresh-token-url` | empty | OAuth refresh endpoint override. Empty uses `https://auth.openai.com/oauth/token`. |
+| `grok.host` | `127.0.0.1` | Bind host for the Grok listener. |
+| `grok.port` | `8318` | Grok listener port. |
+| `grok.auth-files` | `~/.grok/auth.json` | Grok CLI login files. Files are reread per request. |
+| `grok.base-url` | `https://cli-chat-proxy.grok.com/v1` | Grok subscription API base URL. The client's public `/v1` prefix is replaced by this path, including a gateway prefix such as `/gateway/v1`. |
+| `grok.client-version` | `1.0.46` | `x-grok-client-version` sent upstream when the client omits one. `cli-chat-proxy` rejects a missing or outdated CLI identity. |
+| `grok.refresh-token-url` | empty | Optional Grok token endpoint override. Empty uses OIDC discovery. |
 
 ## Minimal Native Configuration
 
@@ -54,6 +60,11 @@ file.
 host: "127.0.0.1"
 port: 8317
 auth-dir: "~/.codex"
+grok:
+  host: "127.0.0.1"
+  port: 8318
+  auth-files:
+    - "~/.grok/auth.json"
 ```
 
 The local admin CLI works without `admin-api-key`. Add an admin key only for the
@@ -76,10 +87,20 @@ The default Compose setup mounts `./auths` at `/root/.codex`:
 host: "0.0.0.0"
 port: 8317
 auth-dir: "/root/.codex"
+grok:
+  host: "0.0.0.0"
+  port: 8318
+  auth-files:
+    - "/root/.grok/auth.json"
 
 database:
   path: ""
 ```
+
+The native defaults stay on loopback. Inside a container both listeners must
+bind `0.0.0.0`, while Compose publishes them only on the host loopback. Mount
+the Grok CLI login directory at `/root/.grok`; Codex files stay under
+`/root/.codex`.
 
 With an empty database path, the SQLite database is stored at:
 

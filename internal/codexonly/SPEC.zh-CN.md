@@ -2,13 +2,15 @@
 
 [English](SPEC.md) | [简体中文](SPEC.zh-CN.md)
 
-`internal/codexonly` 负责 Codex 专用代理。它是一个模块，因为路由、凭证选择、故障转移、亲和性和用量共享同一次请求生命周期；把这些文件拆开不会形成可以独立复用的边界。
+`internal/codexonly` 负责 Codex 和 Grok 代理路径。它是一个模块，因为路由、凭证选择、故障转移、亲和性和用量共享同一次请求生命周期；把这些文件拆开不会形成可以独立复用的边界。
 
 ## 职责
 
 - 认证托管调用方和选定的 OAuth 兼容路由。
 - 加载并刷新 Codex 凭证，然后选择一个健康凭证。
 - 只代理白名单路由。未匹配的路由返回 `404`。
+- 在独立入口服务 Grok，不暴露 Codex 专用路由。
+- 为自定义 Base URL 客户端补上它不会发送的 CLI 订阅身份头，不改写 Grok Build 请求体。
 - 在本地转换 Chat Completions 和 Zed Edit Prediction 请求。
 - 在同一个 SQLite 数据库中保存用户、key 哈希、亲和性摘要、权威认证健康状态和用量。
 - 把运行时第一次意外的 SQLite 失败变成进程级关闭。

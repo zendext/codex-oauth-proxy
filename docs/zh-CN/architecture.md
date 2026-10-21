@@ -7,8 +7,8 @@
 - `serve` 启动 HTTP 代理和项目 API。
 - `admin` 调用运行中服务器仅允许回环地址访问的管理路由。
 
-项目有意保持单一的 Codex 专用实现，不包含提供商转换、管理 UI、Plugin Host
-或替代存储后端。
+项目在同一个进程中保持独立的 Codex 和 Grok 请求路径，不包含通用提供商转换、
+管理 UI、Plugin Host 或替代存储后端。
 
 ## 源码布局
 
@@ -17,6 +17,7 @@
 | `cmd/server/` | 进程入口、服务器生命周期、管理 CLI、HTTP Client 和 CLI 格式化。 |
 | `internal/codexonly/config.go` | YAML 加载和路径、默认值解析。 |
 | `internal/codexonly/auth.go` | OAuth 文件发现、解析、过滤和持久化。 |
+| `internal/codexonly/grok_auth.go` | 读取 Grok CLI 登录、按稳定身份选择、刷新和查询订阅用量。 |
 | `internal/codexonly/auth_management.go` | 安全认证状态、有界管理操作、绑定清理和活动连接计数。 |
 | `internal/codexonly/auth_health.go` | 全局凭据健康、模型排除、冷却协调和权威状态持久化。 |
 | `internal/codexonly/refresh.go` | OAuth 刷新和出站 HTTP Transport 构建。 |
@@ -43,7 +44,8 @@
 6. 解析 SQLite 路径、执行幂等 Schema Migration、验证初始持久化用户状态，
    确保亲和性管理所需的租户范围 Digest 元数据，删除指向已不存在认证身份的
    目标，并恢复未过期的权威认证健康状态。
-7. 启动一个 `net/http` 服务器。
+7. 启动两个 `net/http` 服务器：Codex 使用 `host:port`，Grok 使用
+   `grok.host:grok.port`。
 
 服务器将 `ReadHeaderTimeout` 设置为 10 秒。它不会设置可能中断已建立 Stream
 或 WebSocket 流量的 Read/Write Timeout。优雅关闭超时为 10 秒；超过该期限后，
@@ -414,7 +416,7 @@ SQLite。
 
 ## 已确认的边界
 
-只做 Codex 的进程边界是有意的。远程管理在配置 `admin-api-key` 之前保持隐藏，回环管理不需要这把密钥；这是安全边界，不只是使用便利。SQLite 失败后进程停止，而不是在不可靠状态上继续服务。
+单进程边界是有意的。Codex 和 Grok 保持各自的监听入口和请求路径，其他提供商仍然排除。远程管理在配置 `admin-api-key` 之前保持隐藏，回环管理不需要这把密钥；这是安全边界，不只是使用便利。SQLite 失败后进程停止，而不是在不可靠状态上继续服务。
 
 实现会将会话亲和性存成摘要，不存原始会话标识。选择这种表示的运行原因尚未确认。
 

@@ -42,7 +42,7 @@ COPY config.example.yaml /codex-oauth-proxy/config.example.yaml
 
 WORKDIR /codex-oauth-proxy
 
-EXPOSE 8317
+EXPOSE 8317 8318
 
 ENV TZ=Asia/Shanghai
 

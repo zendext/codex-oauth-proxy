@@ -13,8 +13,10 @@ services:
         BUILD_DATE: ${BUILD_DATE:-unknown}
     container_name: codex-oauth-proxy
     ports:
-      - "8317:8317"
+      - "127.0.0.1:8317:8317"
+      - "127.0.0.1:8318:8318"
     volumes:
       - ${CODEX_OAUTH_PROXY_CONFIG_PATH:-./config.yaml}:/codex-oauth-proxy/config.yaml
       - ${CODEX_OAUTH_PROXY_AUTH_PATH:-./auths}:/root/.codex
+      - ${CODEX_OAUTH_PROXY_GROK_AUTH_DIR:-./grok-auths}:/root/.grok
     restart: unless-stopped
