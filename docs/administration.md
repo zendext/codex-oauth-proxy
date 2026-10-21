@@ -41,7 +41,15 @@ codex-oauth-proxy admin users list \
   --url http://127.0.0.1:8318
 ```
 
-Use `--json` with any admin command for machine-readable output:
+Grok commands use `--grok-url` instead; global `--url` does not change their
+destination. Omitting the Grok subcommand is equivalent to `grok status`:
+
+```bash
+codex-oauth-proxy admin grok status \
+  --grok-url http://127.0.0.1:9318
+```
+
+Use `--json` with any admin command for a single machine-readable JSON document:
 
 ```bash
 codex-oauth-proxy admin users list --json

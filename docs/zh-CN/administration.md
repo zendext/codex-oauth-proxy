@@ -31,7 +31,15 @@ codex-oauth-proxy admin users list \
   --url http://127.0.0.1:8318
 ```
 
-任意管理命令都可以使用 `--json` 输出机器可读数据：
+Grok 命令改用 `--grok-url`；全局 `--url` 不会改变其目标地址。
+省略 Grok 子命令等同于 `grok status`：
+
+```bash
+codex-oauth-proxy admin grok status \
+  --grok-url http://127.0.0.1:9318
+```
+
+任意管理命令都可以使用 `--json` 输出单个机器可读 JSON 文档：
 
 ```bash
 codex-oauth-proxy admin users list --json
