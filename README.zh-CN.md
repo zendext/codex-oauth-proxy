@@ -4,6 +4,10 @@
 
 > 本项目由 AI 编写，使用风险自负。
 
+`v1` 开发分支的版本为 **v1.0.0-beta.1**（未发布），尚未发布 Beta 标签、
+GitHub Release 或 Docker 镜像。版本号仍通过构建参数注入，未指定版本号的
+本地构建显示为 `dev`。
+
 ---
 
 `codex-oauth-proxy` 使用 Codex CLI 的 OAuth 凭据，通过托管 API Key 转发

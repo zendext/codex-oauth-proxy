@@ -4,6 +4,10 @@
 
 > This project was written by AI. Use it at your own risk.
 
+The `v1` development branch is **v1.0.0-beta.1** (unreleased). No beta tag,
+GitHub Release, or Docker image has been published. Version metadata is still
+injected at build time; unversioned local builds report `dev`.
+
 ---
 
 `codex-oauth-proxy` forwards Codex requests through managed API keys using OAuth
