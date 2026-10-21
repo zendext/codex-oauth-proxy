@@ -28,7 +28,7 @@ import (
 
 const websocketBetaHeader = "responses_websockets=2026-02-06"
 
-//go:generate go run ../../cmd/update-model-catalog --ref rust-v0.156.1 --output codex_client_models.json
+//go:generate go run ../../cmd/update-model-catalog --ref rust-v0.163.0 --output codex_client_models.json
 
 //go:embed codex_client_models.json
 var codexClientModelsJSON []byte

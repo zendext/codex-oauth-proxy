@@ -18,7 +18,7 @@ const (
 	DefaultGrokClientVersion = "1.0.46"
 	DefaultCodexBaseURL      = "https://chatgpt.com/backend-api/codex"
 	DefaultChatGPTBaseURL    = "https://chatgpt.com/backend-api"
-	DefaultCodexUA           = "codex_cli_rs/0.156.1"
+	DefaultCodexUA           = "codex_cli_rs/0.163.0"
 )
 
 type Config struct {
