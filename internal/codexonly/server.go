@@ -774,21 +774,41 @@ func (s *Server) grokDo(ctx context.Context, in *http.Request, method string, ta
 	if err != nil {
 		return nil, nil, err
 	}
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+	if credential.Expired(s.grokAuths.now()) {
+		refreshed, errRefresh := s.grokAuths.refresh(ctx, credential.ID, credential, s.grokHTTP, s.cfg.Grok.RefreshTokenURL)
+		if errRefresh != nil {
+			return credential, nil, errRefresh
+		}
+		credential = refreshed
 	}
-	req, err := http.NewRequestWithContext(ctx, method, target, reader)
-	if err != nil {
-		return credential, nil, err
+	for attempt := 0; ; attempt++ {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, errRequest := http.NewRequestWithContext(ctx, method, target, reader)
+		if errRequest != nil {
+			return credential, nil, errRequest
+		}
+		if body != nil {
+			req.ContentLength = int64(len(body))
+			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		}
+		applyGrokProxyHeaders(req, in, credential, s.cfg, model)
+		resp, errDo := s.grokHTTP.Do(req)
+		if errDo != nil || resp == nil {
+			return credential, resp, errDo
+		}
+		if resp.StatusCode != http.StatusUnauthorized || attempt != 0 || !credential.canRefresh() {
+			return credential, resp, nil
+		}
+		_ = resp.Body.Close()
+		refreshed, errRefresh := s.grokAuths.refresh(ctx, credential.ID, credential, s.grokHTTP, s.cfg.Grok.RefreshTokenURL)
+		if errRefresh != nil {
+			return credential, nil, errRefresh
+		}
+		credential = refreshed
 	}
-	if body != nil {
-		req.ContentLength = int64(len(body))
-		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	}
-	applyGrokProxyHeaders(req, in, credential, s.cfg, model)
-	resp, err := s.grokHTTP.Do(req)
-	return credential, resp, err
 }
 
 func (s *Server) grokStorageFailed(w http.ResponseWriter) bool {
@@ -1026,7 +1046,7 @@ func (s *Server) handleGrokSubscriptionUsage(w http.ResponseWriter, r *http.Requ
 func (c *GrokCredential) PublicStatus(now time.Time) GrokAuthStatus {
 	return GrokAuthStatus{
 		ID: c.ID, AccountID: c.AccountID, Email: c.Email, SourceCount: c.SourceCount,
-		ExpiresAt: c.ExpiresAt, Refreshable: c.RefreshToken != "" && c.Issuer != "" && c.ClientID != "",
+		ExpiresAt: c.ExpiresAt, Refreshable: c.canRefresh(),
 		Expired: c.Expired(now),
 	}
 }

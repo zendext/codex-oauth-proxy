@@ -48,11 +48,23 @@ func (c *GrokCredential) Expired(now time.Time) bool {
 	return c == nil || (!c.ExpiresAt.IsZero() && !c.ExpiresAt.After(now.Add(5*time.Minute)))
 }
 
+func (c *GrokCredential) canRefresh() bool {
+	return c != nil && c.RefreshToken != "" && c.Issuer != "" && c.ClientID != ""
+}
+
 type GrokAuthStore struct {
-	paths []string
-	next  atomic.Uint64
-	now   func() time.Time
-	mu    sync.Mutex
+	paths     []string
+	next      atomic.Uint64
+	now       func() time.Time
+	mu        sync.Mutex
+	refreshes map[string]*grokRefreshCall
+	writeMu   sync.Mutex
+}
+
+type grokRefreshCall struct {
+	done       chan struct{}
+	credential *GrokCredential
+	err        error
 }
 
 func NewGrokAuthStore(paths []string) *GrokAuthStore {
@@ -66,7 +78,7 @@ func (s *GrokAuthStore) Select(ctx context.Context, excluded map[string]struct{}
 	}
 	eligible := make([]*GrokCredential, 0, len(credentials))
 	for _, credential := range credentials {
-		if _, skip := excluded[credential.ID]; skip || credential.Expired(s.now()) || credential.AccessToken == "" {
+		if _, skip := excluded[credential.ID]; skip || credential.AccessToken == "" || (credential.Expired(s.now()) && !credential.canRefresh()) {
 			continue
 		}
 		eligible = append(eligible, credential)
@@ -124,12 +136,50 @@ func (s *GrokAuthStore) Load(ctx context.Context) ([]*GrokCredential, error) {
 }
 
 func (s *GrokAuthStore) Refresh(ctx context.Context, id string, client *http.Client, tokenURL string) (*GrokCredential, error) {
+	return s.refresh(ctx, id, nil, client, tokenURL)
+}
+
+func (s *GrokAuthStore) refresh(ctx context.Context, id string, expected *GrokCredential, client *http.Client, tokenURL string) (*GrokCredential, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil, fmt.Errorf("Grok auth id is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, DefaultOAuthRefreshTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if call := s.refreshes[id]; call != nil {
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-call.done:
+			return call.credential, call.err
+		}
+	}
+	if s.refreshes == nil {
+		s.refreshes = make(map[string]*grokRefreshCall)
+	}
+	call := &grokRefreshCall{done: make(chan struct{})}
+	s.refreshes[id] = call
+	s.mu.Unlock()
+
+	credential, err := s.refreshCurrent(ctx, id, expected, client, tokenURL)
+	s.mu.Lock()
+	call.credential = credential
+	call.err = err
+	delete(s.refreshes, id)
+	close(call.done)
+	s.mu.Unlock()
+	return credential, err
+}
+
+func (s *GrokAuthStore) refreshCurrent(ctx context.Context, id string, expected *GrokCredential, client *http.Client, tokenURL string) (*GrokCredential, error) {
 	credentials, err := s.Load(ctx)
 	if err != nil {
 		return nil, err
@@ -144,15 +194,17 @@ func (s *GrokAuthStore) Refresh(ctx context.Context, id string, client *http.Cli
 	if current == nil {
 		return nil, fmt.Errorf("Grok auth not found")
 	}
-	if current.RefreshToken == "" || current.Issuer == "" || current.ClientID == "" {
+	if expected != nil {
+		changed := current.generation() != expected.generation() || !current.ExpiresAt.Equal(expected.ExpiresAt) ||
+			current.Path != expected.Path || current.Scope != expected.Scope
+		if changed {
+			return current, nil
+		}
+	}
+	if !current.canRefresh() {
 		return nil, fmt.Errorf("Grok auth cannot be refreshed")
 	}
-	generation := grokAuthGeneration{
-		accountID:    current.AccountID,
-		accessToken:  current.AccessToken,
-		refreshToken: current.RefreshToken,
-		createTime:   current.CreateTime,
-	}
+	generation := current.generation()
 	if strings.TrimSpace(tokenURL) == "" {
 		tokenURL, err = discoverGrokTokenURL(ctx, client, current.Issuer)
 		if err != nil {
@@ -166,7 +218,11 @@ func (s *GrokAuthStore) Refresh(ctx context.Context, id string, client *http.Cli
 	if err != nil {
 		return nil, err
 	}
-	if err = updateGrokAuthRecord(current.Path, current.Scope, generation, refreshed, s.now()); err != nil {
+	now := s.now().UTC().Truncate(time.Second)
+	s.writeMu.Lock()
+	err = updateGrokAuthRecord(current.Path, current.Scope, generation, refreshed, now)
+	s.writeMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
 	current.AccessToken = refreshed.AccessToken
@@ -174,7 +230,7 @@ func (s *GrokAuthStore) Refresh(ctx context.Context, id string, client *http.Cli
 		current.RefreshToken = refreshed.RefreshToken
 	}
 	if refreshed.ExpiresIn > 0 {
-		current.ExpiresAt = s.now().Add(time.Duration(refreshed.ExpiresIn) * time.Second)
+		current.ExpiresAt = now.Add(time.Duration(refreshed.ExpiresIn) * time.Second)
 	}
 	return current, nil
 }
@@ -287,6 +343,15 @@ type grokAuthGeneration struct {
 	accessToken  string
 	refreshToken string
 	createTime   string
+}
+
+func (c *GrokCredential) generation() grokAuthGeneration {
+	return grokAuthGeneration{
+		accountID:    c.AccountID,
+		accessToken:  c.AccessToken,
+		refreshToken: c.RefreshToken,
+		createTime:   c.CreateTime,
+	}
 }
 
 func grokAuthGenerationAt(path string, scope string) (grokAuthGeneration, error) {

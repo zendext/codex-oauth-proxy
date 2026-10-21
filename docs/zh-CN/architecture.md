@@ -17,7 +17,7 @@
 | `cmd/server/` | 进程入口、服务器生命周期、管理 CLI、HTTP Client 和 CLI 格式化。 |
 | `internal/codexonly/config.go` | YAML 加载和路径、默认值解析。 |
 | `internal/codexonly/auth.go` | OAuth 文件发现、解析、过滤和持久化。 |
-| `internal/codexonly/grok_auth.go` | 读取 Grok CLI 登录、按稳定身份选择、刷新和查询订阅用量。 |
+| `internal/codexonly/grok_auth.go` | 读取 Grok 登录、按稳定身份选择、协调请求与管理刷新、查询订阅用量。 |
 | `internal/codexonly/auth_management.go` | 安全认证状态、有界管理操作、绑定清理和活动连接计数。 |
 | `internal/codexonly/auth_health.go` | 全局凭据健康、模型排除、冷却协调和权威状态持久化。 |
 | `internal/codexonly/refresh.go` | OAuth 刷新和出站 HTTP Transport 构建。 |

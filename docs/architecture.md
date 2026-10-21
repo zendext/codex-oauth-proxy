@@ -26,7 +26,7 @@ alternate storage backends.
 | `cmd/server/` | Process entrypoint, server lifecycle, admin CLI, HTTP client, and CLI formatting. |
 | `internal/codexonly/config.go` | YAML loading and path/default resolution. |
 | `internal/codexonly/auth.go` | OAuth file discovery, parsing, filtering, and persistence. |
-| `internal/codexonly/grok_auth.go` | Read-only Grok CLI login discovery, stable identity selection, refresh, and subscription usage lookup. |
+| `internal/codexonly/grok_auth.go` | Grok login discovery, stable identity selection, coordinated request/admin refresh, and subscription usage lookup. |
 | `internal/codexonly/auth_management.go` | Safe auth status, bounded management actions, binding clearing, and active-connection counts. |
 | `internal/codexonly/auth_health.go` | Global credential health, model exclusions, cooldown reconciliation, and authoritative-state persistence. |
 | `internal/codexonly/refresh.go` | OAuth refresh and outbound HTTP transport construction. |

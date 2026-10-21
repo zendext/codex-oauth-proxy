@@ -110,6 +110,32 @@ With an empty database path, the SQLite database is stored at:
 
 That file therefore persists in the same mounted `./auths` directory.
 
+## Grok Credential Lifecycle
+
+A Grok CLI login file can be moved into a proxy-owned directory and listed in
+`grok.auth-files`. The CLI does not need to remain signed in. A later CLI login
+creates a separate session and requires another explicit import; the proxy does
+not synchronize the two copies.
+
+Before inference or model discovery, a credential expiring within five minutes
+is refreshed when its refresh token, OIDC issuer and client ID are available.
+An upstream `401` allows one same-credential refresh and retry before the client
+response is committed, then uses the existing credential failover path. Expired
+credentials without refresh material require re-login and import. Manual
+`admin grok refresh` remains available.
+
+Concurrent automatic and manual refreshes share one in-flight operation per
+stable Grok identity. Late callers reuse a newer file generation instead of
+refreshing the old token again. Each OAuth operation has a 30-second deadline;
+that deadline is not applied to inference streams. There is no background
+scheduler.
+
+Refresh checks the file generation before writing, preserves other accounts in
+the same file, and atomically replaces the selected record through a `0600`
+temporary file. The containing directory must be writable by the proxy. Mount
+the directory rather than one file in Docker; file hard links do not follow an
+atomic replacement.
+
 ## OAuth File Loading
 
 The loader recursively checks JSON files below `auth-dir`.
