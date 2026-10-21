@@ -33,17 +33,13 @@ type grokAuthStatusResponse struct {
 	Auths []codexonly.GrokAuthStatus `json:"auths"`
 }
 
-func (c *adminGrokCommand) Run(runtime *commandRuntime, admin *adminCommand) error {
-	client, err := newAdminClient(firstNonEmpty(c.URL, defaultGrokAdminBaseURL))
+func (c *adminGrokStatusCommand) Run(runtime *commandRuntime, parent *adminGrokCommand, admin *adminCommand) error {
+	client, err := newAdminClient(firstNonEmpty(parent.URL, defaultGrokAdminBaseURL))
 	if err != nil {
 		return err
 	}
-	return c.Status.Run(runtime, client, admin)
-}
-
-func (c *adminGrokStatusCommand) Run(runtime *commandRuntime, client *adminClient, admin *adminCommand) error {
 	var payload grokAuthStatusResponse
-	if err := client.doJSON(runtime.ctx, http.MethodGet, "/grok/auths", nil, nil, &payload); err != nil {
+	if err = client.doJSON(runtime.ctx, http.MethodGet, "/grok/auths", nil, nil, &payload); err != nil {
 		return err
 	}
 	if admin.JSON {

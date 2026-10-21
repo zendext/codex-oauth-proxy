@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/zendext/codex-oauth-proxy/internal/codexonly"
@@ -34,6 +35,16 @@ func TestParseCLIAdminUsesDefaultURL(t *testing.T) {
 	}
 	if parsed.app.Admin.URL != defaultAdminBaseURL {
 		t.Fatalf("url = %q, want %q", parsed.app.Admin.URL, defaultAdminBaseURL)
+	}
+}
+
+func TestParseCLIGrokUsesSeparateDefaultURL(t *testing.T) {
+	parsed, err := parseCLI([]string{"admin", "grok", "status"}, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("parseCLI returned error: %v", err)
+	}
+	if parsed.app.Admin.URL != defaultAdminBaseURL || parsed.app.Admin.Grok.URL != defaultGrokAdminBaseURL {
+		t.Fatalf("admin URLs = %q, %q, want separate Codex and Grok defaults", parsed.app.Admin.URL, parsed.app.Admin.Grok.URL)
 	}
 }
 
@@ -62,20 +73,69 @@ func TestAdminGrokStatusReachesLoopbackHandler(t *testing.T) {
 	}
 }
 
-func TestGrokAdminCommandsDefaultToGrokListener(t *testing.T) {
-	var sawPath string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawPath = r.URL.Path
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"auths":[]}`))
-	}))
-	defer server.Close()
-	stdout := runAdminTestCommand(t, server.URL, "grok", "status", "--grok-url", server.URL)
-	if sawPath != "/v0/local-admin/grok/auths" {
-		t.Fatalf("path = %q, want Grok local admin path", sawPath)
-	}
-	if !strings.Contains(stdout, "ID") {
-		t.Fatalf("stdout = %q, want Grok auth table", stdout)
+func TestGrokAdminCommandsUseOwnURLExactlyOnce(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+		key  string
+	}{
+		{name: "default status", want: "GET /base/v0/local-admin/grok/auths", key: "auths"},
+		{name: "status", args: []string{"status"}, want: "GET /base/v0/local-admin/grok/auths", key: "auths"},
+		{name: "refresh", args: []string{"refresh", "synthetic-auth"}, want: "POST /base/v0/local-admin/grok/auths/refresh", key: "auth"},
+		{name: "usage", args: []string{"usage", "synthetic-auth"}, want: "GET /base/v0/local-admin/grok/usage?id=synthetic-auth", key: "total_tokens"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var codexRequests atomic.Int32
+			codex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				codexRequests.Add(1)
+				http.NotFound(w, r)
+			}))
+			defer codex.Close()
+			requests := make(chan string, 4)
+			grok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- r.Method + " " + r.URL.RequestURI()
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/base/v0/local-admin/grok/auths":
+					_, _ = io.WriteString(w, `{"auths":[]}`)
+				case "/base/v0/local-admin/grok/auths/refresh":
+					_, _ = io.WriteString(w, `{"auth":{"id":"synthetic-auth"}}`)
+				case "/base/v0/local-admin/grok/usage":
+					_, _ = io.WriteString(w, `{"total_tokens":3}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer grok.Close()
+			args := append([]string{"--json", "grok", "--grok-url", grok.URL + "/base"}, test.args...)
+			stdout := runAdminTestCommand(t, codex.URL, args...)
+			if got := codexRequests.Load(); got != 0 {
+				t.Errorf("Codex requests = %d, want 0", got)
+			}
+			if got := len(requests); got != 1 {
+				t.Errorf("Grok requests = %d, want 1", got)
+			}
+			select {
+			case got := <-requests:
+				if got != test.want {
+					t.Errorf("request = %q, want %q", got, test.want)
+				}
+			default:
+				t.Error("Grok received no request")
+			}
+			decoder := json.NewDecoder(strings.NewReader(stdout))
+			var payload map[string]any
+			if err := decoder.Decode(&payload); err != nil {
+				t.Fatalf("decode JSON: %v", err)
+			}
+			if _, ok := payload[test.key]; !ok {
+				t.Errorf("JSON lacks expected %q field", test.key)
+			}
+			if err := decoder.Decode(&payload); err != io.EOF {
+				t.Errorf("trailing JSON decode = %v, want EOF after one document", err)
+			}
+		})
 	}
 }
 
