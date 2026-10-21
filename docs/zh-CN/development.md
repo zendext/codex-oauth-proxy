@@ -88,7 +88,7 @@ SQLite 数据库。
 
 ```bash
 go generate ./internal/codexonly
-go run ./cmd/update-model-catalog --ref rust-v0.156.1 --check
+go run ./cmd/update-model-catalog --ref rust-v0.163.0 --check
 ```
 
 更新前必须先从官方仓库确认最新稳定 Codex CLI Release，然后同时更新固定的
